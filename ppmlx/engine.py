@@ -153,13 +153,18 @@ class TextEngine:
         lm = self._get_or_load(repo_id)
         prompt = self._apply_chat_template(lm, messages)
 
+        try:
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(temp=temperature, top_p=top_p)
+        except Exception:
+            sampler = None
         kwargs: dict[str, Any] = {
             "prompt": prompt,
             "max_tokens": max_tokens,
             "verbose": False,
-            "temperature": temperature,
-            "top_p": top_p,
         }
+        if sampler is not None:
+            kwargs["sampler"] = sampler
         if seed is not None:
             kwargs["seed"] = seed
 
@@ -201,12 +206,17 @@ class TextEngine:
         lm = self._get_or_load(repo_id)
         prompt = self._apply_chat_template(lm, messages)
 
+        try:
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(temp=temperature, top_p=top_p)
+        except Exception:
+            sampler = None
         kwargs: dict[str, Any] = {
             "prompt": prompt,
             "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
         }
+        if sampler is not None:
+            kwargs["sampler"] = sampler
         if seed is not None:
             kwargs["seed"] = seed
 
