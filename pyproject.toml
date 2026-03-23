@@ -11,7 +11,7 @@ dependencies = [
     "mlx-embeddings>=0.0.5 ; sys_platform == 'darwin'",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "typer[all]>=0.12",
+    "typer>=0.12",
     "rich>=13.0",
     "huggingface-hub>=0.24",
     "pydantic>=2.0",
