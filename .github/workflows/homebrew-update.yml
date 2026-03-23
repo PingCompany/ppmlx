@@ -1,0 +1,16 @@
+name: Update Homebrew Formula
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+jobs:
+  update-formula:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Homebrew tap update
+        run: |
+          echo "TODO: Update homebrew-pp-llm tap formula with new version"
+          echo "Steps: download sdist, run brew update-python-resources, update formula sha256"
