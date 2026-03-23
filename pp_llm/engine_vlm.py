@@ -1,0 +1,129 @@
+from __future__ import annotations
+import base64
+import tempfile
+import threading
+from typing import Any
+
+
+def _resolve_model_path(repo_id: str) -> str:
+    """Resolve alias to local path if available."""
+    try:
+        from pp_llm.models import get_model_path
+        local = get_model_path(repo_id)
+        if local:
+            return str(local)
+    except ImportError:
+        pass
+    return repo_id
+
+
+class VisionEngine:
+    """Wraps mlx-vlm for multimodal (image+text) generation."""
+
+    def __init__(self):
+        self._models: dict[str, tuple[Any, Any]] = {}  # repo_id → (model, processor)
+        self._lock = threading.Lock()
+
+    def load(self, repo_id: str) -> None:
+        """Load a vision model using mlx_vlm.load()."""
+        if repo_id in self._models:
+            return
+        path = _resolve_model_path(repo_id)
+        from mlx_vlm import load as vlm_load
+        with self._lock:
+            if repo_id not in self._models:
+                model, processor = vlm_load(path)
+                self._models[repo_id] = (model, processor)
+
+    def _extract_images(self, messages: list[dict]) -> list[str | bytes]:
+        """
+        Extract image references from message content.
+        Returns list of: local file paths (str), URLs (str), or decoded bytes.
+        """
+        images = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        image_url = part.get("image_url", {})
+                        url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+                        if url.startswith("data:image/"):
+                            # base64 data URI → decode to bytes, save to temp file
+                            try:
+                                header, data = url.split(",", 1)
+                                img_bytes = base64.b64decode(data)
+                                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                                tmp.write(img_bytes)
+                                tmp.close()
+                                images.append(tmp.name)
+                            except Exception:
+                                pass
+                        elif url:
+                            images.append(url)
+        return images
+
+    def generate(
+        self,
+        repo_id: str,
+        messages: list[dict],
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> tuple[str, int, int]:
+        """
+        Generate a response for a vision request.
+        Returns (text, prompt_tokens, completion_tokens).
+        """
+        from mlx_vlm import generate as vlm_generate
+
+        self.load(repo_id)
+        model, processor = self._models[repo_id]
+
+        images = self._extract_images(messages)
+
+        text_parts = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+        prompt = "\n".join(text_parts)
+
+        output = vlm_generate(
+            model,
+            processor,
+            prompt=prompt,
+            image=images[0] if images else None,
+            max_tokens=max_tokens,
+            temp=temperature,
+            verbose=False,
+        )
+
+        prompt_tokens = len(prompt.split())
+        completion_tokens = len(str(output).split())
+
+        return str(output), prompt_tokens, completion_tokens
+
+    def list_loaded(self) -> list[str]:
+        return list(self._models.keys())
+
+    def unload_all(self) -> None:
+        with self._lock:
+            self._models.clear()
+
+
+_vlm_engine: VisionEngine | None = None
+_vlm_lock = threading.Lock()
+
+
+def get_vision_engine() -> VisionEngine:
+    global _vlm_engine
+    if _vlm_engine is None:
+        with _vlm_lock:
+            if _vlm_engine is None:
+                _vlm_engine = VisionEngine()
+    return _vlm_engine
