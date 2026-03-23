@@ -146,7 +146,7 @@ def run(
     if system:
         messages.append({"role": "system", "content": system})
 
-    console.print(f"[green]Chatting with [bold]{model}[/bold]. Type /bye to exit.[/green]")
+    console.print(f"[green]Chatting with [bold]{model}[/bold]. Type /help or /? for commands, /bye to exit.[/green]")
 
     while True:
         try:
@@ -161,6 +161,14 @@ def run(
         if user_input in ("/bye", "/exit", "/quit"):
             console.print("[dim]Goodbye![/dim]")
             break
+        elif user_input in ("/help", "/?"):
+            console.print("[bold]REPL commands:[/bold]")
+            console.print("  [cyan]/help[/cyan] or [cyan]/?[/cyan]        Show this help")
+            console.print("  [cyan]/clear[/cyan]            Clear conversation history")
+            console.print("  [cyan]/system <prompt>[/cyan]  Set a new system prompt")
+            console.print("  [cyan]/model <name>[/cyan]     Switch to a different model")
+            console.print("  [cyan]/bye[/cyan]              Exit")
+            continue
         elif user_input.startswith("/system "):
             new_system = user_input[8:].strip()
             messages = [m for m in messages if m["role"] != "system"]
