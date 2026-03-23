@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64
 import tempfile
 import threading
+from pathlib import Path
 from typing import Any
 
 
@@ -59,8 +60,12 @@ class VisionEngine:
                                 images.append(tmp.name)
                             except Exception:
                                 pass
+                        elif url.startswith("file://"):
+                            images.append(url[7:])  # strip scheme → absolute path
+                        elif url and (url.startswith("/") or url.startswith("~")):
+                            images.append(str(Path(url).expanduser()))
                         elif url:
-                            images.append(url)
+                            images.append(url)  # HTTP URL — pass through to mlx-vlm
         return images
 
     def generate(

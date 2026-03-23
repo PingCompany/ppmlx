@@ -614,10 +614,12 @@ dependencies = [
     { name = "mlx-embeddings", marker = "sys_platform == 'darwin'" },
     { name = "mlx-lm", marker = "sys_platform == 'darwin'" },
     { name = "mlx-vlm", marker = "sys_platform == 'darwin'" },
+    { name = "prompt-toolkit" },
     { name = "pydantic" },
     { name = "questionary" },
     { name = "rich" },
     { name = "sse-starlette" },
+    { name = "tomli-w" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -639,10 +641,12 @@ requires-dist = [
     { name = "mlx-embeddings", marker = "sys_platform == 'darwin'", specifier = ">=0.0.5" },
     { name = "mlx-lm", marker = "sys_platform == 'darwin'", specifier = ">=0.22" },
     { name = "mlx-vlm", marker = "sys_platform == 'darwin'", specifier = ">=0.1.18" },
+    { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "questionary", specifier = ">=2.0" },
     { name = "rich", specifier = ">=13.0" },
     { name = "sse-starlette", specifier = ">=2.0" },
+    { name = "tomli-w", specifier = ">=1.0" },
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
@@ -1015,6 +1019,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/73/6f/f80cfef4a312e1fb3
 wheels = [
     { url = "https://files.pythonhosted.org/packages/92/97/5dbfabf04c7e348e655e907ed27913e03db0923abb5dfdd120d7b25630e1/tokenizers-0.22.2-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:544dd704ae7238755d790de45ba8da072e9af3eea688f698b137915ae959281c", size = 3100275, upload-time = "2026-01-05T10:41:02.158Z" },
     { url = "https://files.pythonhosted.org/packages/2e/47/174dca0502ef88b28f1c9e06b73ce33500eedfac7a7692108aec220464e7/tokenizers-0.22.2-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:1e418a55456beedca4621dbab65a318981467a2b188e982a23e117f115ce5001", size = 2981472, upload-time = "2026-01-05T10:41:00.276Z" },
+]
+
+[[package]]
+name = "tomli-w"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/75/241269d1da26b624c0d5e110e8149093c759b7a286138f4efd61a60e75fe/tomli_w-1.2.0.tar.gz", hash = "sha256:2dd14fac5a47c27be9cd4c976af5a12d87fb1f0b4512f81d69cce3b35ae25021", size = 7184, upload-time = "2025-01-15T12:07:24.262Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/18/c86eb8e0202e32dd3df50d43d7ff9854f8e0603945ff398974c1d91ac1ef/tomli_w-1.2.0-py3-none-any.whl", hash = "sha256:188306098d013b691fcadc011abd66727d3c414c571bb01b1a174ba8c983cf90", size = 6675, upload-time = "2025-01-15T12:07:22.074Z" },
 ]
 
 [[package]]

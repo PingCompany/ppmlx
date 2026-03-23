@@ -2,7 +2,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +9,7 @@ from typing import Any
 # ── Built-in alias map (exact HuggingFace repo IDs from spec) ──────────
 
 DEFAULT_ALIASES: dict[str, str] = {
-    # Qwen 3.5 (Feb-Mar 2026)
+    # Qwen 3.5 — released Feb 2026
     "qwen3.5:0.8b":       "mlx-community/Qwen3.5-0.8B-OptiQ-4bit",
     "qwen3.5:2b":         "mlx-community/Qwen3.5-2B-MLX-4bit",
     "qwen3.5:4b":         "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -18,40 +17,13 @@ DEFAULT_ALIASES: dict[str, str] = {
     "qwen3.5:27b":        "mlx-community/Qwen3.5-27B-4bit",
     "qwen3.5:35b-a3b":    "mlx-community/Qwen3.5-35B-A3B-4bit",
     "qwen3.5:122b-a10b":  "mlx-community/Qwen3.5-122B-A10B-4bit",
-    # Qwen 3
-    "qwen3:4b":           "mlx-community/Qwen3-4B-Instruct-2507-4bit",
-    "qwen3:8b":           "mlx-community/Qwen3-8B-4bit",
-    "qwen3:14b":          "mlx-community/Qwen3-14B-4bit",
-    "qwen3:32b":          "mlx-community/Qwen3-32B-4bit",
-    "qwen3:30b-a3b":      "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-    "qwen3-coder:80b-a3b":"mlx-community/Qwen3-Coder-Next-80B-A3B-4bit",
-    # Gemma 3
-    "gemma3:4b":          "mlx-community/gemma-3-4b-it-4bit",
-    "gemma3:4b-text":     "mlx-community/gemma-3-text-4b-it-4bit",
-    "gemma3:12b":         "mlx-community/gemma-3-12b-it-4bit",
-    "gemma3:27b":         "mlx-community/gemma-3-27b-it-qat-4bit",
-    # GPT-OSS
+    # GPT-OSS (OpenAI open weights) — released Aug 2025
     "gpt-oss:20b":        "mlx-community/gpt-oss-20b-4bit",
     "gpt-oss:120b":       "mlx-community/gpt-oss-120b-4bit",
-    # DeepSeek R1
-    "deepseek-r1:8b":     "mlx-community/DeepSeek-R1-Distill-Qwen-7B-8bit",
-    "deepseek-r1:14b":    "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit",
-    "deepseek-r1:32b":    "mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit",
-    # Mistral
-    "mistral:7b":         "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
-    "mistral-small:24b":  "mlx-community/Mistral-Small-3.1-Text-24B-Instruct-2503-8bit",
-    "devstral:24b":       "mlx-community/Devstral-Small-24B-4bit",
-    # Phi-4
-    "phi4:mini":          "mlx-community/Phi-4-mini-instruct-4bit",
-    # Embedding models
-    "embed:all-minilm":   "mlx-community/all-MiniLM-L6-v2-4bit",
-    "embed:qwen3-0.6b":   "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
-    "embed:qwen3-4b":     "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
-    "embed:qwen3-8b":     "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
 }
 
 # Patterns for routing
-_VISION_INDICATORS = ["-VL-", "-vlm", "Qwen3.5-", "gemma-3-"]
+_VISION_INDICATORS = ["-VL-", "-vlm", "Qwen3.5-"]
 _TEXT_ONLY_INDICATORS = ["-text-", "-Text-", "OptiQ"]
 _EMBED_PREFIXES = ("embed:",)
 
@@ -180,16 +152,34 @@ def _get_repo_size(repo_id: str, token: str | None = None) -> int | None:
         return None
 
 
+def _get_hf_token(explicit: str | None = None) -> str | None:
+    """Return HF token: explicit arg > config.toml > HF_TOKEN env var."""
+    if explicit:
+        return explicit
+    try:
+        import tomllib
+        cfg_path = _get_ppmlx_dir() / "config.toml"
+        if cfg_path.exists():
+            with open(cfg_path, "rb") as f:
+                data = tomllib.load(f)
+            tok = data.get("auth", {}).get("hf_token")
+            if tok:
+                return tok
+    except Exception:
+        pass
+    return os.environ.get("HF_TOKEN") or None
+
+
 def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     """
     Download a model from HuggingFace Hub with a uv-style Rich progress bar.
     Returns local path.
     """
     from rich.progress import (
-        Progress, BarColumn, DownloadColumn,
-        TransferSpeedColumn, TimeRemainingColumn, TextColumn,
+        Progress, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, TextColumn,
     )
 
+    token = _get_hf_token(token)
     repo_id = resolve_alias(alias_or_repo)
     local_name = repo_to_local_name(repo_id)
     local_path = _get_models_dir() / local_name
@@ -200,7 +190,11 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     local_path.mkdir(parents=True, exist_ok=True)
     total = _get_repo_size(repo_id, token)
 
-    stop = threading.Event()
+    from huggingface_hub import snapshot_download
+    try:
+        from huggingface_hub.file_download import base_tqdm as _tqdm_base
+    except ImportError:
+        from tqdm import tqdm as _tqdm_base  # type: ignore[assignment]
 
     with Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -208,44 +202,33 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
         DownloadColumn(),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
-        refresh_per_second=1,
+        refresh_per_second=10,
         transient=False,
     ) as progress:
         task = progress.add_task(f"↓ {alias_or_repo}", total=total)
 
-        def _monitor() -> None:
-            while not stop.is_set():
-                try:
-                    sz = sum(f.stat().st_size for f in local_path.rglob("*") if f.is_file())
-                    progress.update(task, completed=sz)
-                except Exception:
-                    pass
-                stop.wait(1.0)
+        class _RichTqdm(_tqdm_base):  # type: ignore[valid-type]
+            """Forwards byte-level updates to the Rich progress bar."""
+            def display(self, *args, **kwargs) -> None:
+                pass  # suppress tqdm's own output
 
-        t = threading.Thread(target=_monitor, daemon=True)
-        t.start()
+            def update(self, n: int = 1) -> None:
+                super().update(n)
+                if n and n > 0:
+                    progress.update(task, advance=int(n))
 
-        # Suppress huggingface_hub's own tqdm bars while our progress bar is active
-        prev_tqdm = os.environ.get("TQDM_DISABLE")
-        os.environ["TQDM_DISABLE"] = "1"
         try:
-            from huggingface_hub import snapshot_download
             snapshot_download(
                 repo_id=repo_id,
                 local_dir=str(local_path),
                 token=token,
                 ignore_patterns=["*.md", "*.txt", "original/*"],
+                tqdm_class=_RichTqdm,
             )
         except Exception as e:
             shutil.rmtree(local_path, ignore_errors=True)
             raise ModelNotFoundError(f"Failed to download '{repo_id}': {e}") from e
         finally:
-            if prev_tqdm is None:
-                os.environ.pop("TQDM_DISABLE", None)
-            else:
-                os.environ["TQDM_DISABLE"] = prev_tqdm
-            stop.set()
-            t.join(timeout=2)
             if total:
                 progress.update(task, completed=total)
 

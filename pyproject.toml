@@ -18,11 +18,12 @@ dependencies = [
     "sse-starlette>=2.0",
     "httpx>=0.27",
     "questionary>=2.0",
+    "prompt-toolkit>=3.0",
+    "tomli-w>=1.0",
 ]
 
 [project.scripts]
 ppmlx = "ppmlx.cli:app"
-pp-llm = "ppmlx.cli:app"
 
 [build-system]
 requires = ["hatchling"]

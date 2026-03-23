@@ -107,15 +107,26 @@ class TextEngine:
         except Exception:
             pass
 
-    def _apply_chat_template(self, lm: LoadedModel, messages: list[dict]) -> str:
+    def _apply_chat_template(
+        self, lm: LoadedModel, messages: list[dict], enable_thinking: bool = True
+    ) -> str:
         """Apply the model's chat template to produce a prompt string."""
         tokenizer = lm.tokenizer
         if hasattr(tokenizer, "apply_chat_template"):
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            kwargs: dict[str, Any] = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if not enable_thinking:
+                # Supported by Qwen3 and some other thinking models.
+                # Ignored (TypeError) by models that don't recognise the kwarg.
+                try:
+                    return tokenizer.apply_chat_template(
+                        messages, **kwargs, enable_thinking=False
+                    )
+                except TypeError:
+                    pass  # model doesn't support the flag — fall through
+            return tokenizer.apply_chat_template(messages, **kwargs)
         # Fallback: simple concatenation
         parts = []
         for msg in messages:
@@ -140,6 +151,7 @@ class TextEngine:
         seed: int | None = None,
         repetition_penalty: float | None = None,
         strip_thinking: bool = True,
+        enable_thinking: bool = True,
     ) -> tuple[str, str | None, int, int]:
         """
         Generate a response.
@@ -147,11 +159,12 @@ class TextEngine:
 
         reasoning_text is populated for <think>...</think> models.
         prompt_tokens and completion_tokens are estimates (token count from encode).
+        enable_thinking=False suppresses the thinking phase for models that support it (e.g. Qwen3).
         """
         from mlx_lm import generate as mlx_generate
 
         lm = self._get_or_load(repo_id)
-        prompt = self._apply_chat_template(lm, messages)
+        prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking)
 
         try:
             from mlx_lm.sample_utils import make_sampler
@@ -195,16 +208,18 @@ class TextEngine:
         stop: list[str] | None = None,
         seed: int | None = None,
         repetition_penalty: float | None = None,
+        enable_thinking: bool = True,
     ) -> Iterator[str]:
         """
         Stream token-by-token generation.
         Yields text chunks. Handles <think> tags by yielding them transparently
         (caller can strip if needed).
+        enable_thinking=False suppresses the thinking phase for models that support it (e.g. Qwen3).
         """
         from mlx_lm import stream_generate as mlx_stream
 
         lm = self._get_or_load(repo_id)
-        prompt = self._apply_chat_template(lm, messages)
+        prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking)
 
         try:
             from mlx_lm.sample_utils import make_sampler

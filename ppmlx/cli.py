@@ -1,5 +1,10 @@
 from __future__ import annotations
+import json
+import os
+import shutil
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +20,497 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+
+@dataclass
+class _LaunchItem:
+    key: str    # "run" | "claude" | "codex" | "opencode" | "pi"
+    label: str
+    desc: str
+    cmd: str    # executable to check with shutil.which; "" = always installed
+
+
+@dataclass
+class _PickerRow:
+    alias: str
+    size_gb: float | None
+    downloaded: bool
+    section_header: str | None  # non-None → non-selectable section label
+
+
+_LAUNCH_ITEMS: list[_LaunchItem] = [
+    _LaunchItem("run",      "Run a model",        "Start an interactive chat with a model",       ""),
+    _LaunchItem("claude",   "Launch Claude Code", "Agentic coding across large codebases",        "claude"),
+    _LaunchItem("codex",    "Launch Codex",       "OpenAI's open-source coding agent",            "codex"),
+    _LaunchItem("opencode", "Launch Opencode",    "Anomaly's open-source coding agent",           "opencode"),
+    _LaunchItem("pi",       "Launch Pi",          "Minimal AI agent toolkit with plugin support", "pi"),
+]
+
+
+def _build_picker_rows(local_models: list, available_aliases: dict) -> list[_PickerRow]:
+    rows: list[_PickerRow] = []
+    local_alias_set = {m["alias"] for m in local_models}
+
+    downloaded = [m for m in local_models if not m["alias"].startswith("embed:")]
+    if downloaded:
+        rows.append(_PickerRow("", None, True, "Downloaded"))
+        for m in sorted(downloaded, key=lambda x: x["alias"]):
+            rows.append(_PickerRow(m["alias"], m["size_gb"], True, None))
+
+    available = [
+        (alias, repo)
+        for alias, repo in available_aliases.items()
+        if not alias.startswith("embed:") and alias not in local_alias_set
+    ]
+    if available:
+        rows.append(_PickerRow("", None, False, "Available"))
+        for alias, _ in sorted(available, key=lambda x: x[0]):
+            rows.append(_PickerRow(alias, None, False, None))
+
+    return rows
+
+
+def _visible_rows(rows: list[_PickerRow], ft: str) -> list[_PickerRow]:
+    if not ft:
+        return rows
+    result: list[_PickerRow] = []
+    pending_header: _PickerRow | None = None
+    for row in rows:
+        if row.section_header is not None:
+            pending_header = row
+            continue
+        if ft.lower() in row.alias.lower():
+            if pending_header is not None:
+                result.append(pending_header)
+                pending_header = None
+            result.append(row)
+    return result
+
+
+def _launch_tui(local_models: list, available_aliases: dict) -> tuple[str | None, str | None]:
+    """Two-screen Ollama-style TUI. Returns (action_key, model_alias) or (None, None)."""
+    import curses
+    from ppmlx import __version__
+
+    installed = [bool(not item.cmd or shutil.which(item.cmd)) for item in _LAUNCH_ITEMS]
+    all_rows = _build_picker_rows(local_models, available_aliases)
+
+    # Mutable state via single-element lists (closure mutation pattern)
+    screen = ["main"]
+    model: list[str | None] = [None]
+    filter_text = [""]
+    picker_idx = [0]
+    action: list[str | None] = [None]
+
+    # Start main_idx on first installed item
+    main_idx = [next((i for i, inst in enumerate(installed) if inst), 0)]
+
+    def _first_selectable(visible: list[_PickerRow]) -> int:
+        return next((i for i, r in enumerate(visible) if r.section_header is None), 0)
+
+    def _sel_indices(visible: list[_PickerRow]) -> list[int]:
+        return [i for i, r in enumerate(visible) if r.section_header is None]
+
+    def _draw_main(stdscr: "curses.window") -> None:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        if h < 8 or w < 30:
+            try:
+                stdscr.addstr(0, 0, "Terminal too small")
+            except curses.error:
+                pass
+            return
+
+        try:
+            stdscr.addstr(0, 0, f"ppmlx {__version__}", curses.A_BOLD)
+        except curses.error:
+            pass
+
+        row = 2
+        for i, item in enumerate(_LAUNCH_ITEMS):
+            if row >= h - 2:
+                break
+            is_sel = i == main_idx[0]
+            is_inst = installed[i]
+            prefix = "\u25b6 " if is_sel else "  "
+
+            if not is_inst:
+                right_tag = "(not installed)"
+            elif model[0]:
+                right_tag = f"({model[0]})"
+            else:
+                right_tag = ""
+
+            label_attr = (
+                curses.A_BOLD if (is_sel and is_inst)
+                else curses.A_DIM if not is_inst
+                else curses.A_NORMAL
+            )
+            try:
+                stdscr.addstr(row, 0, prefix + item.label, label_attr)
+                if right_tag:
+                    col = w - len(right_tag) - 1
+                    if col > len(prefix + item.label) + 1:
+                        stdscr.addstr(row, col, right_tag, curses.A_DIM)
+            except curses.error:
+                pass
+
+            row += 1
+            if row < h - 2:
+                try:
+                    stdscr.addstr(row, 2, item.desc[: w - 3], curses.A_DIM)
+                except curses.error:
+                    pass
+            row += 2
+
+        status = "\u2191/\u2193 navigate  \u2022  enter launch  \u2022  \u2192 change model  \u2022  esc quit"
+        try:
+            stdscr.addstr(h - 1, 0, status[: w - 1], curses.A_DIM)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    def _draw_picker(stdscr: "curses.window", visible: list[_PickerRow]) -> None:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        ft = filter_text[0]
+        try:
+            stdscr.addstr(0, 0, "Select model: ", curses.A_BOLD)
+            stdscr.addstr(0, 14, (ft + "\u258c")[: w - 15])
+        except curses.error:
+            pass
+
+        row = 2
+        for i, r in enumerate(visible):
+            if row >= h - 2:
+                break
+            if r.section_header is not None:
+                try:
+                    stdscr.addstr(row, 2, r.section_header, curses.A_DIM | curses.A_BOLD)
+                except curses.error:
+                    pass
+                row += 1
+                continue
+
+            is_sel = i == picker_idx[0]
+            prefix = "\u25b6 " if is_sel else "  "
+            attr = curses.A_BOLD if is_sel else curses.A_NORMAL
+            try:
+                stdscr.addstr(row, 0, prefix + r.alias, attr)
+                if r.size_gb is not None:
+                    size_str = f"{r.size_gb:.1f} GB"
+                    col = w - len(size_str) - 1
+                    if col > len(prefix + r.alias) + 1:
+                        stdscr.addstr(row, col, size_str, curses.A_DIM)
+            except curses.error:
+                pass
+            row += 1
+
+        if not any(r.section_header is None for r in visible):
+            try:
+                stdscr.addstr(row, 2, "No models match.", curses.A_DIM)
+            except curses.error:
+                pass
+
+        status = "\u2191/\u2193 navigate  \u2022  enter select  \u2022  \u2190 back"
+        try:
+            stdscr.addstr(h - 1, 0, status[: w - 1], curses.A_DIM)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    def _curses_main(stdscr: "curses.window") -> None:
+        curses.curs_set(0)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+
+        while action[0] is None:
+            if screen[0] == "main":
+                curses.curs_set(0)
+                _draw_main(stdscr)
+                key = stdscr.getch()
+
+                if key == curses.KEY_UP:
+                    idx = main_idx[0] - 1
+                    while idx >= 0 and not installed[idx]:
+                        idx -= 1
+                    if idx >= 0:
+                        main_idx[0] = idx
+                elif key == curses.KEY_DOWN:
+                    idx = main_idx[0] + 1
+                    while idx < len(_LAUNCH_ITEMS) and not installed[idx]:
+                        idx += 1
+                    if idx < len(_LAUNCH_ITEMS):
+                        main_idx[0] = idx
+                elif key == curses.KEY_RIGHT:
+                    screen[0] = "picker"
+                    filter_text[0] = ""
+                    visible = _visible_rows(all_rows, "")
+                    picker_idx[0] = _first_selectable(visible)
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    if installed[main_idx[0]]:
+                        action[0] = _LAUNCH_ITEMS[main_idx[0]].key
+                elif key in (27, ord("q"), ord("Q")):
+                    action[0] = "cancelled"
+
+            else:  # picker
+                curses.curs_set(1)
+                visible = _visible_rows(all_rows, filter_text[0])
+                _draw_picker(stdscr, visible)
+                key = stdscr.getch()
+
+                sel = _sel_indices(visible)
+
+                if key == curses.KEY_UP:
+                    if picker_idx[0] in sel:
+                        pos = sel.index(picker_idx[0])
+                        if pos > 0:
+                            picker_idx[0] = sel[pos - 1]
+                    elif sel:
+                        picker_idx[0] = sel[0]
+                elif key == curses.KEY_DOWN:
+                    if picker_idx[0] in sel:
+                        pos = sel.index(picker_idx[0])
+                        if pos < len(sel) - 1:
+                            picker_idx[0] = sel[pos + 1]
+                    elif sel:
+                        picker_idx[0] = sel[0]
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    if sel and picker_idx[0] in sel:
+                        model[0] = visible[picker_idx[0]].alias
+                    screen[0] = "main"
+                elif key in (curses.KEY_LEFT, 27):
+                    screen[0] = "main"
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    filter_text[0] = filter_text[0][:-1]
+                    new_vis = _visible_rows(all_rows, filter_text[0])
+                    new_sel = _sel_indices(new_vis)
+                    if new_sel and picker_idx[0] not in new_sel:
+                        picker_idx[0] = new_sel[0]
+                elif 32 <= key <= 126:
+                    filter_text[0] += chr(key)
+                    new_vis = _visible_rows(all_rows, filter_text[0])
+                    new_sel = _sel_indices(new_vis)
+                    if new_sel:
+                        picker_idx[0] = new_sel[0]
+
+    curses.wrapper(_curses_main)
+    if action[0] is None or action[0] == "cancelled":
+        return None, None
+    return action[0], model[0]
+
+
+def _start_server_bg(model: str, host: str, port: int) -> subprocess.Popen:
+    ppmlx_exe = shutil.which("ppmlx") or shutil.which("pp-llm")
+    if ppmlx_exe:
+        cmd = [ppmlx_exe, "serve", "--host", host, "--port", str(port)]
+    else:
+        cmd = [sys.executable, "-m", "ppmlx.cli", "serve", "--host", host, "--port", str(port)]
+    if model:
+        cmd += ["--model", model]
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _wait_server_ready(host: str, port: int, proc: subprocess.Popen, timeout: int = 30) -> bool:
+    import httpx
+    import time
+    url = f"http://{host}:{port}/health"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            if httpx.get(url, timeout=1.0).status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _launch_coding_tool(action: str, model: str, host: str, port: int) -> None:
+    proc = _start_server_bg(model, host, port)
+    console.print(f"[dim]Starting ppmlx server on {host}:{port}...[/dim]")
+
+    if not _wait_server_ready(host, port, proc):
+        proc.terminate()
+        console.print("[red]Server failed to start within 30 seconds.[/red]")
+        raise typer.Exit(1)
+
+    base_url = f"http://{host}:{port}/v1"
+    env = os.environ.copy()
+
+    if action == "claude":
+        cmd = ["claude"]
+        env["ANTHROPIC_BASE_URL"] = base_url
+        env["ANTHROPIC_API_KEY"] = "local"
+    elif action == "codex":
+        cmd = ["codex"]
+        env["OPENAI_API_BASE"] = base_url
+        env["OPENAI_API_KEY"] = "local"
+        env["OPENAI_MODEL"] = model
+    elif action == "opencode":
+        cmd = ["opencode"]
+        env["OPENAI_API_KEY"] = "local"
+        env["OPENAI_BASE_URL"] = base_url
+    elif action == "pi":
+        models_file = Path.home() / ".pi" / "agent" / "models.json"
+        models_file.parent.mkdir(parents=True, exist_ok=True)
+        existing: list = json.loads(models_file.read_text()) if models_file.exists() else []
+        entries = [e for e in existing if e.get("id") != "ppmlx"]
+        entries.append({
+            "id": "ppmlx",
+            "name": f"ppmlx ({model})",
+            "baseUrl": base_url,
+            "api": "openai-completions",
+            "apiKey": "local",
+        })
+        models_file.write_text(json.dumps(entries, indent=2))
+        cmd = ["pi", "--model", "ppmlx"]
+    else:
+        proc.terminate()
+        return
+
+    try:
+        subprocess.run(cmd, env=env)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _model_selector_tui(local_models: list) -> str | None:
+    """Ollama-style interactive model selector. Returns alias, None (lazy load), or 'CANCELLED'."""
+    import curses
+    from ppmlx import __version__
+
+    items = [{"alias": None, "title": "(none)", "desc": "Lazy-load on first request"}] + [
+        {
+            "alias": m["alias"],
+            "title": m["alias"],
+            "desc": f"{m['size_gb']:.1f} GB  •  {m['repo_id']}",
+        }
+        for m in local_models
+    ]
+
+    result: list[str | None] = [None]
+    cancelled = [False]
+
+    def run(stdscr: curses.window) -> None:
+        curses.curs_set(0)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+
+        idx = 0
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            # Header
+            try:
+                stdscr.addstr(0, 0, f"ppmlx {__version__}", curses.A_BOLD)
+            except curses.error:
+                pass
+
+            row = 2
+            for i, item in enumerate(items):
+                if row >= h - 2:
+                    break
+                is_sel = i == idx
+                prefix = "\u25b6 " if is_sel else "  "
+                title_attr = curses.A_BOLD if is_sel else curses.A_NORMAL
+                try:
+                    stdscr.addstr(row, 0, prefix + item["title"], title_attr)
+                    row += 1
+                    if row < h - 2:
+                        stdscr.addstr(row, 2, item["desc"], curses.A_DIM)
+                    row += 2
+                except curses.error:
+                    pass
+
+            # Status bar
+            status = "\u2191/\u2193 navigate  \u2022  enter select  \u2022  esc quit"
+            try:
+                stdscr.addstr(h - 1, 0, status[: w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == curses.KEY_UP:
+                idx = max(0, idx - 1)
+            elif key == curses.KEY_DOWN:
+                idx = min(len(items) - 1, idx + 1)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                result[0] = items[idx]["alias"]
+                break
+            elif key in (27, ord("q"), ord("Q")):
+                cancelled[0] = True
+                break
+
+    curses.wrapper(run)
+    if cancelled[0]:
+        return "CANCELLED"
+    return result[0]
+
+
+def _pick_model(local_only: bool = False, multi: bool = False) -> "str | list[str]":
+    """Questionary-based model picker matching the pull command style.
+
+    Returns a single alias string (multi=False) or list of aliases (multi=True).
+    Raises typer.Exit if cancelled or nothing selected.
+    """
+    import questionary
+    from ppmlx.models import list_local_models, DEFAULT_ALIASES, all_aliases
+
+    local_models = list_local_models()
+    local_aliases = {m["alias"] for m in local_models}
+    local_repos   = {m["repo_id"] for m in local_models}
+
+    choices = []
+    if local_only:
+        if not local_models:
+            console.print("[yellow]No local models found. Run: ppmlx pull <model>[/yellow]")
+            raise typer.Exit(1)
+        for m in sorted(local_models, key=lambda x: x["alias"]):
+            label = f"{m['alias']:<24} {m['size_gb']:.1f} GB"
+            choices.append(questionary.Choice(label, value=m["alias"]))
+    else:
+        # Downloaded first, then available-but-not-local
+        for m in sorted(local_models, key=lambda x: x["alias"]):
+            label = f"{m['alias']:<24} {m['size_gb']:.1f} GB  ✓"
+            choices.append(questionary.Choice(label, value=m["alias"]))
+        for alias, repo in DEFAULT_ALIASES.items():
+            if alias.startswith("embed:") or alias in local_aliases:
+                continue
+            label = f"{alias:<24} {repo}"
+            choices.append(questionary.Choice(label, value=alias))
+
+    if not choices:
+        console.print("[yellow]No models available.[/yellow]")
+        raise typer.Exit(1)
+
+    if multi:
+        selected = questionary.checkbox(
+            "Select models  (Space=toggle, Enter=confirm, Ctrl-C=cancel):",
+            choices=choices,
+        ).ask()
+        if not selected:
+            raise typer.Exit()
+        return selected
+    else:
+        selected = questionary.select(
+            "Select a model  (↑/↓ navigate, Enter=confirm, Ctrl-C=cancel):",
+            choices=choices,
+        ).ask()
+        if not selected:
+            raise typer.Exit()
+        return selected
 
 
 def _version_callback(value: bool):
@@ -60,17 +556,12 @@ def serve(
 
     # Interactive model selection
     if interactive and model is None:
-        import questionary
         from ppmlx.models import list_local_models
         local = list_local_models()
-        if local:
-            choices = [questionary.Choice("(none — lazy load on first request)", value=None)]
-            for m in local:
-                label = f"{m['alias']:<22} {m['size_gb']:.1f} GB"
-                choices.append(questionary.Choice(label, value=m["alias"]))
-            model = questionary.select("Select model to pre-load:", choices=choices).ask()
-        else:
-            console.print("[dim]No local models found. Download one first: ppmlx pull[/dim]")
+        selected = _model_selector_tui(local)
+        if selected == "CANCELLED":
+            raise typer.Exit()
+        model = selected
 
     console.print(Panel(
         f"[bold green]ppmlx server v{__version__}[/bold green]\n"
@@ -110,14 +601,47 @@ def serve(
 
 
 @app.command()
+def launch(
+    host: Optional[str] = typer.Option(None, help="Bind host"),
+    port: Optional[int] = typer.Option(None, help="Bind port (default: 6767)"),
+    no_cors: bool = typer.Option(False, "--no-cors", help="Disable CORS"),
+):
+    """Interactively select an action and model, then launch."""
+    from ppmlx.models import list_local_models, DEFAULT_ALIASES
+    from ppmlx.config import load_config
+
+    overrides = {k: v for k, v in [("host", host), ("port", port)] if v}
+    cfg = load_config(cli_overrides=overrides)
+    effective_host = host or cfg.server.host
+    effective_port = port or cfg.server.port
+
+    local_models = list_local_models()
+    action, model = _launch_tui(local_models, DEFAULT_ALIASES)
+
+    if not action:
+        raise typer.Exit()
+
+    if not model:
+        console.print("[yellow]No model selected. Press \u2192 in the menu to pick one.[/yellow]")
+        raise typer.Exit(1)
+
+    if action == "run":
+        run(model=model, system=None, max_kv_size=None, temperature=None, max_tokens=None)
+    else:
+        _launch_coding_tool(action, model, effective_host, effective_port)
+
+
+@app.command()
 def run(
-    model: str = typer.Argument(..., help="Model name or alias"),
+    model: Optional[str] = typer.Argument(None, help="Model name or alias"),
     system: Optional[str] = typer.Option(None, "--system", "-s", help="System prompt"),
     max_kv_size: Optional[int] = typer.Option(None, "--max-kv-size", help="Max KV cache tokens"),
     temperature: Optional[float] = typer.Option(None, "--temperature", "-t"),
     max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
 ):
     """Start an interactive chat REPL with a model."""
+    if not model:
+        model = _pick_model()
     from ppmlx.models import get_model_path, download_model, resolve_alias, ModelNotFoundError
     from ppmlx.engine import get_engine
     from ppmlx.memory import check_memory_warning
@@ -146,11 +670,82 @@ def run(
     if system:
         messages.append({"role": "system", "content": system})
 
+    # Session state
+    history_enabled = True
+    wordwrap = True
+    verbose = False
+    format_json = False
+    think = False
+
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.filters import emacs_insert_mode
+
+    _kb = KeyBindings()
+
+    @_kb.add("c-left")   # Ctrl+Left  — jump word left
+    @_kb.add("escape", "b")  # Alt/Option+B
+    def _word_left(event):
+        event.current_buffer.cursor_left(count=len(
+            event.current_buffer.document.get_word_before_cursor(WORD=True) or " "
+        ))
+
+    @_kb.add("c-right")  # Ctrl+Right — jump word right
+    @_kb.add("escape", "f")  # Alt/Option+F
+    def _word_right(event):
+        event.current_buffer.cursor_right(count=len(
+            event.current_buffer.document.get_word_after_cursor(WORD=True) or " "
+        ))
+
+    @_kb.add("s-left")   # Shift+Left  — extend selection left (move + select)
+    def _sel_left(event):
+        buf = event.current_buffer
+        if buf.selection_state is None:
+            buf.start_selection()
+        buf.cursor_left()
+
+    @_kb.add("s-right")  # Shift+Right — extend selection right
+    def _sel_right(event):
+        buf = event.current_buffer
+        if buf.selection_state is None:
+            buf.start_selection()
+        buf.cursor_right()
+
+    @_kb.add("c-a")      # Ctrl+A — beginning of line (also Cmd+Left in most macOS terminals)
+    def _bol(event):
+        event.current_buffer.cursor_position = 0
+
+    @_kb.add("c-e")      # Ctrl+E — end of line (also Cmd+Right)
+    def _eol(event):
+        event.current_buffer.cursor_position = len(event.current_buffer.text)
+
+    @_kb.add("c-k")      # Ctrl+K — delete to end of line
+    def _kill_eol(event):
+        buf = event.current_buffer
+        buf.delete(count=len(buf.document.get_text_after_cursor()))
+
+    @_kb.add("c-u")      # Ctrl+U — delete to beginning of line
+    def _kill_bol(event):
+        buf = event.current_buffer
+        deleted = buf.cursor_position
+        buf.cursor_position = 0
+        buf.delete(count=deleted)
+
+    _session: PromptSession = PromptSession(
+        history=InMemoryHistory(),
+        key_bindings=_kb,
+        mouse_support=False,
+        enable_open_in_editor=False,
+    )
+    _prompt = ANSI("\033[1;34mYou\033[0m: ")
+
     console.print(f"[green]Chatting with [bold]{model}[/bold]. Type /help or /? for commands, /bye to exit.[/green]")
 
     while True:
         try:
-            user_input = console.input("[bold blue]You:[/bold blue] ").strip()
+            user_input = _session.prompt(_prompt).strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye![/dim]")
             break
@@ -161,52 +756,361 @@ def run(
         if user_input in ("/bye", "/exit", "/quit"):
             console.print("[dim]Goodbye![/dim]")
             break
+
         elif user_input in ("/help", "/?"):
             console.print("[bold]REPL commands:[/bold]")
-            console.print("  [cyan]/help[/cyan] or [cyan]/?[/cyan]        Show this help")
-            console.print("  [cyan]/clear[/cyan]            Clear conversation history")
-            console.print("  [cyan]/system <prompt>[/cyan]  Set a new system prompt")
-            console.print("  [cyan]/model <name>[/cyan]     Switch to a different model")
-            console.print("  [cyan]/bye[/cyan]              Exit")
-            continue
-        elif user_input.startswith("/system "):
-            new_system = user_input[8:].strip()
-            messages = [m for m in messages if m["role"] != "system"]
-            messages.insert(0, {"role": "system", "content": new_system})
-            console.print(f"[dim]System prompt updated.[/dim]")
-            continue
+            console.print("  [cyan]/set parameter <key> <val>[/cyan]  Set a parameter (temperature, max_tokens)")
+            console.print("  [cyan]/set system <string>[/cyan]        Set system message")
+            console.print("  [cyan]/set history[/cyan]                Enable history")
+            console.print("  [cyan]/set nohistory[/cyan]              Disable history")
+            console.print("  [cyan]/set wordwrap[/cyan]               Enable word wrap")
+            console.print("  [cyan]/set nowordwrap[/cyan]             Disable word wrap")
+            console.print("  [cyan]/set format json[/cyan]            Enable JSON mode")
+            console.print("  [cyan]/set noformat[/cyan]               Disable formatting")
+            console.print("  [cyan]/set verbose[/cyan]                Show LLM stats after each reply")
+            console.print("  [cyan]/set quiet[/cyan]                  Disable LLM stats")
+            console.print("  [cyan]/set think[/cyan]                  Show thinking blocks")
+            console.print("  [cyan]/set nothink[/cyan]                Hide thinking blocks")
+            console.print("  [cyan]/show info[/cyan]                  Show model details")
+            console.print("  [cyan]/show license[/cyan]               Show model license")
+            console.print("  [cyan]/show modelfile[/cyan]             Show model config")
+            console.print("  [cyan]/show parameters[/cyan]            Show generation parameters")
+            console.print("  [cyan]/show system[/cyan]                Show system message")
+            console.print("  [cyan]/show template[/cyan]              Show chat template")
+            console.print("  [cyan]/clear[/cyan]                      Clear conversation history")
+            console.print("  [cyan]/model <name>[/cyan]               Switch to a different model")
+            console.print("  [cyan]/bye[/cyan]                        Exit")
+
+        elif user_input.startswith("/set"):
+            arg = user_input[4:].strip()
+            parts = arg.split(None, 2)
+            sub = parts[0] if parts else ""
+
+            def _set_help() -> None:
+                console.print("[bold]/set options:[/bold]")
+                console.print("  [cyan]system <string>[/cyan]         Set system message")
+                console.print("  [cyan]parameter <key> <value>[/cyan] Set a generation parameter")
+                console.print("  [cyan]history[/cyan]                 Enable history")
+                console.print("  [cyan]nohistory[/cyan]               Disable history")
+                console.print("  [cyan]wordwrap[/cyan]                Enable word wrap")
+                console.print("  [cyan]nowordwrap[/cyan]              Disable word wrap")
+                console.print("  [cyan]format json[/cyan]             Enable JSON mode")
+                console.print("  [cyan]noformat[/cyan]                Disable formatting")
+                console.print("  [cyan]verbose[/cyan]                 Show LLM stats after each reply")
+                console.print("  [cyan]quiet[/cyan]                   Disable LLM stats")
+                console.print("  [cyan]think[/cyan]                   Show thinking blocks")
+                console.print("  [cyan]nothink[/cyan]                 Hide thinking blocks")
+
+            def _set_parameter_help() -> None:
+                console.print("[bold]/set parameter options:[/bold]")
+                console.print("  [cyan]temperature <float>[/cyan]   Sampling temperature (e.g. 0.7)")
+                console.print("  [cyan]max_tokens <int>[/cyan]      Max tokens to generate (e.g. 2048)")
+                console.print("  [cyan]num_predict <int>[/cyan]     Alias for max_tokens")
+
+            if not sub or sub == "?":
+                _set_help()
+            elif sub == "system":
+                if len(parts) < 2 or parts[1] == "?":
+                    console.print("[bold]/set system[/bold] — set the system message sent before the conversation.")
+                    console.print("  Usage: [cyan]/set system <your prompt here>[/cyan]")
+                else:
+                    new_system = arg[len("system"):].strip()
+                    messages = [m for m in messages if m["role"] != "system"]
+                    if new_system:
+                        messages.insert(0, {"role": "system", "content": new_system})
+                    console.print("[dim]System message updated.[/dim]")
+            elif sub == "history":
+                history_enabled = True
+                console.print("[dim]History enabled.[/dim]")
+            elif sub == "nohistory":
+                history_enabled = False
+                console.print("[dim]History disabled.[/dim]")
+            elif sub == "wordwrap":
+                wordwrap = True
+                console.print("[dim]Word wrap enabled.[/dim]")
+            elif sub == "nowordwrap":
+                wordwrap = False
+                console.print("[dim]Word wrap disabled.[/dim]")
+            elif sub == "format":
+                if len(parts) < 2 or parts[1] == "?":
+                    console.print("[bold]/set format[/bold] — enable a response format.")
+                    console.print("  [cyan]/set format json[/cyan]  Respond only with valid JSON")
+                elif parts[1] == "json":
+                    format_json = True
+                    console.print("[dim]JSON mode enabled.[/dim]")
+                else:
+                    console.print(f"[red]Unknown format: {parts[1]}. Supported: json[/red]")
+            elif sub == "noformat":
+                format_json = False
+                console.print("[dim]Formatting disabled.[/dim]")
+            elif sub == "verbose":
+                verbose = True
+                console.print("[dim]Verbose mode enabled.[/dim]")
+            elif sub == "quiet":
+                verbose = False
+                console.print("[dim]Quiet mode enabled.[/dim]")
+            elif sub == "think":
+                think = True
+                console.print("[dim]Thinking enabled.[/dim]")
+            elif sub == "nothink":
+                think = False
+                console.print("[dim]Thinking disabled.[/dim]")
+            elif sub == "parameter":
+                if len(parts) < 3 or parts[1] == "?":
+                    _set_parameter_help()
+                else:
+                    key, val = parts[1], parts[2]
+                    if key == "temperature":
+                        try:
+                            temperature = float(val)
+                            console.print(f"[dim]temperature = {temperature}[/dim]")
+                        except ValueError:
+                            console.print(f"[red]Invalid value: {val}[/red]")
+                    elif key in ("max_tokens", "num_predict"):
+                        try:
+                            max_tokens = int(val)
+                            console.print(f"[dim]max_tokens = {max_tokens}[/dim]")
+                        except ValueError:
+                            console.print(f"[red]Invalid value: {val}[/red]")
+                    else:
+                        console.print(f"[red]Unknown parameter: {key}[/red]")
+                        _set_parameter_help()
+            else:
+                console.print(f"[red]Unknown /set option: {sub}[/red]")
+                _set_help()
+
+        elif user_input.startswith("/show"):
+            sub = user_input[5:].strip()
+            sys_msgs = [m for m in messages if m["role"] == "system"]
+            sys_prompt = sys_msgs[0]["content"] if sys_msgs else "(none)"
+            t = temperature if temperature is not None else 0.7
+            mt = max_tokens if max_tokens is not None else 2048
+
+            if sub in ("", "info"):
+                console.print(f"  [bold]model[/bold]       {model}  ({repo_id})")
+                console.print(f"  [bold]path[/bold]        {local_path or '(not cached)'}")
+                console.print(f"  [bold]system[/bold]      {sys_prompt[:80]}")
+                console.print(f"  [bold]temperature[/bold] {t}")
+                console.print(f"  [bold]max_tokens[/bold]  {mt}")
+                console.print(f"  [bold]history[/bold]     {'on' if history_enabled else 'off'}")
+                console.print(f"  [bold]wordwrap[/bold]    {'on' if wordwrap else 'off'}")
+                console.print(f"  [bold]verbose[/bold]     {'on' if verbose else 'off'}")
+                console.print(f"  [bold]think[/bold]       {'on' if think else 'off'}")
+                console.print(f"  [bold]json[/bold]        {'on' if format_json else 'off'}")
+
+            elif sub == "system":
+                console.print(sys_prompt)
+
+            elif sub in ("parameters", "params"):
+                console.print(f"  temperature  {t}")
+                console.print(f"  max_tokens   {mt}")
+
+            elif sub == "license":
+                if local_path:
+                    for name in ("LICENSE", "LICENSE.md", "LICENSE.txt", "license.txt"):
+                        lic = Path(local_path) / name
+                        if lic.exists():
+                            console.print(lic.read_text())
+                            break
+                    else:
+                        console.print("[dim]No LICENSE file found in model directory.[/dim]")
+                else:
+                    console.print("[dim]Model not downloaded yet.[/dim]")
+
+            elif sub == "modelfile":
+                console.print(f"  FROM {repo_id}")
+                if sys_prompt != "(none)":
+                    console.print(f"  SYSTEM {sys_prompt}")
+                console.print(f"  PARAMETER temperature {t}")
+                console.print(f"  PARAMETER num_predict {mt}")
+                if local_path:
+                    cfg = Path(local_path) / "config.json"
+                    if cfg.exists():
+                        try:
+                            data = json.loads(cfg.read_text())
+                            for k in ("model_type", "architectures", "quantization_config"):
+                                if k in data:
+                                    console.print(f"  # {k}: {data[k]}")
+                        except Exception:
+                            pass
+
+            elif sub == "template":
+                if local_path:
+                    tc = Path(local_path) / "tokenizer_config.json"
+                    if tc.exists():
+                        try:
+                            data = json.loads(tc.read_text())
+                            tmpl = data.get("chat_template")
+                            if tmpl:
+                                console.print(tmpl)
+                            else:
+                                console.print("[dim]No chat_template in tokenizer_config.json.[/dim]")
+                        except Exception as exc:
+                            console.print(f"[red]Could not read tokenizer_config.json: {exc}[/red]")
+                    else:
+                        console.print("[dim]tokenizer_config.json not found.[/dim]")
+                else:
+                    console.print("[dim]Model not downloaded yet.[/dim]")
+
+            elif sub == "?":
+                console.print("[bold]/show options:[/bold]")
+                console.print("  [cyan]info[/cyan]        Show model details and session state")
+                console.print("  [cyan]license[/cyan]     Show model license")
+                console.print("  [cyan]modelfile[/cyan]   Show model config (FROM, SYSTEM, PARAMETER)")
+                console.print("  [cyan]parameters[/cyan]  Show generation parameters")
+                console.print("  [cyan]system[/cyan]      Show system message")
+                console.print("  [cyan]template[/cyan]    Show chat template")
+            else:
+                console.print(f"[red]Unknown /show option: {sub}[/red]")
+                console.print("[bold]/show options:[/bold]")
+                console.print("  [cyan]info[/cyan]        Show model details and session state")
+                console.print("  [cyan]license[/cyan]     Show model license")
+                console.print("  [cyan]modelfile[/cyan]   Show model config (FROM, SYSTEM, PARAMETER)")
+                console.print("  [cyan]parameters[/cyan]  Show generation parameters")
+                console.print("  [cyan]system[/cyan]      Show system message")
+                console.print("  [cyan]template[/cyan]    Show chat template")
+
         elif user_input == "/clear":
-            system_msgs = [m for m in messages if m["role"] == "system"]
-            messages = system_msgs
+            sys_msgs = [m for m in messages if m["role"] == "system"]
+            messages = sys_msgs
             console.print("[dim]Conversation cleared.[/dim]")
-            continue
+
         elif user_input.startswith("/model "):
             new_model = user_input[7:].strip()
             try:
                 repo_id = resolve_alias(new_model)
+                local_path = get_model_path(repo_id)
                 model = new_model
                 console.print(f"[dim]Switched to {model}[/dim]")
-            except ModelNotFoundError as e:
-                console.print(f"[red]{e}[/red]")
+            except ModelNotFoundError as exc:
+                console.print(f"[red]{exc}[/red]")
+
+        else:
+            # Parse image references from input: [/path/to/img.jpg] or bare paths
+            import re as _re
+            _IMG_EXTS = r"\.(?:jpg|jpeg|png|gif|webp|bmp)"
+            _bracket = _re.compile(r"\[([^\[\]]+?" + _IMG_EXTS + r")\]", _re.IGNORECASE)
+            _bare    = _re.compile(r"(?<!\S)((?:/|~/)[\S]+" + _IMG_EXTS + r")(?!\S)", _re.IGNORECASE)
+
+            image_paths = [m.group(1) for m in _bracket.finditer(user_input)]
+            clean_input = _bracket.sub("", user_input)
+            for m in _bare.finditer(clean_input):
+                image_paths.append(m.group(1))
+            clean_input = _bare.sub("", clean_input).strip()
+            text_input  = clean_input or user_input  # fallback if only path was typed
+
+            # Build user content: structured if images present, plain string otherwise
+            if image_paths:
+                user_content: object = [{"type": "text", "text": text_input}] + [
+                    {"type": "image_url", "image_url": {"url": p}} for p in image_paths
+                ]
+            else:
+                user_content = user_input
+
+            if history_enabled:
+                messages.append({"role": "user", "content": user_content})
+
+            # Build messages to send (inject JSON instruction if needed)
+            send_msgs = list(messages) if history_enabled else []
+            if not history_enabled:
+                sys_msgs = [m for m in messages if m["role"] == "system"]
+                send_msgs = sys_msgs + [{"role": "user", "content": user_content}]
+            if format_json:
+                if send_msgs and send_msgs[0]["role"] == "system":
+                    send_msgs[0] = {
+                        "role": "system",
+                        "content": send_msgs[0]["content"] + "\n\nRespond only with valid JSON.",
+                    }
+                else:
+                    send_msgs.insert(0, {"role": "system", "content": "Respond only with valid JSON."})
+
+            console.print("[bold green]Assistant:[/bold green] ", end="")
+            full_response = ""
+            try:
+                if image_paths:
+                    # Vision path — no streaming support in mlx-vlm
+                    from ppmlx.engine_vlm import get_vision_engine
+                    import time as _time
+                    t0 = _time.monotonic()
+                    text, prompt_toks, completion_toks = get_vision_engine().generate(
+                        repo_id, send_msgs,
+                        temperature=temperature or 0.7,
+                        max_tokens=max_tokens or 2048,
+                    )
+                    elapsed = _time.monotonic() - t0
+                    console.print(text, no_wrap=not wordwrap)
+                    full_response = text
+                    if verbose:
+                        tps = completion_toks / elapsed if elapsed > 0 else 0
+                        console.print(
+                            f"[dim]prompt {prompt_toks} tokens  "
+                            f"completion {completion_toks} tokens  "
+                            f"{tps:.1f} tok/s  {elapsed:.2f}s[/dim]"
+                        )
+                elif verbose:
+                    import time as _time
+                    t0 = _time.monotonic()
+                    text, reasoning, prompt_toks, completion_toks = engine.generate(
+                        repo_id, send_msgs,
+                        temperature=temperature or 0.7,
+                        max_tokens=max_tokens or 2048,
+                        strip_thinking=not think,
+                        enable_thinking=think,
+                    )
+                    elapsed = _time.monotonic() - t0
+                    if think and reasoning:
+                        console.print()
+                        console.print(f"[dim italic]{reasoning}[/dim italic]")
+                        console.print()
+                    console.print(text, no_wrap=not wordwrap)
+                    full_response = text
+                    tps = completion_toks / elapsed if elapsed > 0 else 0
+                    console.print(
+                        f"[dim]prompt {prompt_toks} tokens  "
+                        f"completion {completion_toks} tokens  "
+                        f"{tps:.1f} tok/s  {elapsed:.2f}s[/dim]"
+                    )
+                else:
+                    # Streaming with think-tag handling
+                    in_think = False
+                    for chunk in engine.stream_generate(
+                        repo_id, send_msgs,
+                        temperature=temperature or 0.7,
+                        max_tokens=max_tokens or 2048,
+                        enable_thinking=think,
+                    ):
+                        if "<think>" in chunk and not in_think:
+                            before, _, after = chunk.partition("<think>")
+                            if before:
+                                console.print(before, end="")
+                                full_response += before
+                            in_think = True
+                            chunk = after
+                        if "</think>" in chunk and in_think:
+                            inside, _, after = chunk.partition("</think>")
+                            if think and inside:
+                                console.print(f"[dim italic]{inside}[/dim italic]", end="")
+                            in_think = False
+                            chunk = after
+                        if chunk:
+                            if in_think:
+                                if think:
+                                    console.print(chunk, end="", style="dim italic")
+                            else:
+                                console.print(chunk, end="")
+                                full_response += chunk
+                    console.print()
+            except Exception as exc:
+                console.print(f"\n[red]Error: {exc}[/red]")
+                if history_enabled:
+                    messages.pop()
+                continue
+
+            if history_enabled:
+                messages.append({"role": "assistant", "content": full_response})
             continue
 
-        messages.append({"role": "user", "content": user_input})
-
-        console.print("[bold green]Assistant:[/bold green] ", end="")
-        full_response = ""
-        try:
-            for chunk in engine.stream_generate(
-                repo_id, messages,
-                temperature=temperature or 0.7,
-                max_tokens=max_tokens or 2048,
-            ):
-                console.print(chunk, end="")
-                full_response += chunk
-        except Exception as e:
-            console.print(f"\n[red]Error: {e}[/red]")
-            continue
-        console.print()  # newline after response
-        messages.append({"role": "assistant", "content": full_response})
+        continue
 
 
 def _do_pull(model: str, token: Optional[str]) -> bool:
@@ -297,33 +1201,39 @@ def list_models():
 
 @app.command()
 def rm(
-    model: str = typer.Argument(..., help="Model alias or name to remove"),
+    model: Optional[str] = typer.Argument(None, help="Model alias or name to remove"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ):
     """Remove a locally downloaded model."""
     from ppmlx.models import remove_model, get_model_path, resolve_alias
 
-    try:
-        repo_id = resolve_alias(model)
-    except Exception:
-        repo_id = model
-
-    path = get_model_path(repo_id)
-    if not path:
-        console.print(f"[yellow]Model '{model}' not found locally.[/yellow]")
-        raise typer.Exit(1)
-
-    if not force:
-        confirm = typer.confirm(f"Remove model '{model}' from {path}?")
-        if not confirm:
-            raise typer.Abort()
-
-    removed = remove_model(model)
-    if removed:
-        console.print(f"[green]Removed {model}[/green]")
+    models_to_remove: list[str] = []
+    if not model:
+        selected = _pick_model(local_only=True, multi=True)
+        models_to_remove = selected  # type: ignore[assignment]
     else:
-        console.print(f"[red]Failed to remove {model}[/red]")
-        raise typer.Exit(1)
+        models_to_remove = [model]
+
+    for m in models_to_remove:
+        try:
+            repo_id = resolve_alias(m)
+        except Exception:
+            repo_id = m
+
+        path = get_model_path(repo_id)
+        if not path:
+            console.print(f"[yellow]Model '{m}' not found locally.[/yellow]")
+            continue
+
+        if not force:
+            confirm = typer.confirm(f"Remove '{m}' from {path}?")
+            if not confirm:
+                continue
+
+        if remove_model(m):
+            console.print(f"[green]Removed {m}[/green]")
+        else:
+            console.print(f"[red]Failed to remove {m}[/red]")
 
 
 @app.command(name="alias")
@@ -392,7 +1302,7 @@ def ps():
 
 @app.command()
 def quantize(
-    model: str = typer.Argument(..., help="HuggingFace repo ID or alias"),
+    model: Optional[str] = typer.Argument(None, help="HuggingFace repo ID or alias"),
     bits: int = typer.Option(4, "--bits", "-b", help="Quantization bits (2,3,4,6,8)"),
     group_size: int = typer.Option(64, "--group-size", help="Quantization group size"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory"),
@@ -400,6 +1310,8 @@ def quantize(
     token: Optional[str] = typer.Option(None, "--token", help="HuggingFace token"),
 ):
     """Convert and quantize a HuggingFace model to MLX format."""
+    if not model:
+        model = _pick_model()
     from ppmlx.quantize import quantize as do_quantize, QuantizeConfig
 
     cfg = QuantizeConfig(
@@ -527,9 +1439,11 @@ def logs(
 
 @app.command()
 def info(
-    model: str = typer.Argument(..., help="Model alias or repo ID"),
+    model: Optional[str] = typer.Argument(None, help="Model alias or repo ID"),
 ):
     """Show detailed model information."""
+    if not model:
+        model = _pick_model()
     from ppmlx.models import resolve_alias, get_model_path, ModelNotFoundError
     from ppmlx.memory import estimate_model_memory_gb, get_system_ram_gb
 
@@ -561,9 +1475,11 @@ def info(
 
 @app.command()
 def estimate(
-    model: str = typer.Argument(..., help="Model alias or repo ID"),
+    model: Optional[str] = typer.Argument(None, help="Model alias or repo ID"),
 ):
     """Estimate RAM requirements before downloading."""
+    if not model:
+        model = _pick_model()
     from ppmlx.models import resolve_alias, get_model_path, ModelNotFoundError
     from ppmlx.memory import estimate_model_memory_gb, get_system_ram_gb, check_memory_warning
 
@@ -590,6 +1506,63 @@ def estimate(
         console.print(f"[yellow]Model not downloaded. Cannot estimate size accurately.[/yellow]")
         console.print(f"[cyan]System RAM:[/cyan] {ram_gb:.0f} GB")
         console.print(f"[dim]Pull the model first: ppmlx pull {model}[/dim]")
+
+
+@app.command(name="config")
+def config_cmd(
+    hf_token: Optional[str] = typer.Option(None, "--hf-token", help="Set HuggingFace token"),
+):
+    """View or interactively set ppmlx configuration (HF token, defaults, etc.)."""
+    import tomllib
+    import tomli_w  # type: ignore[import]
+    from ppmlx.config import get_ppmlx_dir
+
+    cfg_path = get_ppmlx_dir() / "config.toml"
+
+    # Load existing config
+    try:
+        with open(cfg_path, "rb") as f:
+            data: dict = tomllib.load(f)
+    except Exception:
+        data = {}
+
+    if hf_token is not None:
+        # Non-interactive: set token directly
+        data.setdefault("auth", {})["hf_token"] = hf_token
+        cfg_path.write_bytes(tomli_w.dumps(data).encode())
+        console.print(f"[green]HuggingFace token saved to {cfg_path}[/green]")
+        return
+
+    # Interactive flow
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.formatted_text import ANSI
+
+    console.print(f"[bold]ppmlx config[/bold]  ({cfg_path})\n")
+
+    current_token = data.get("auth", {}).get("hf_token") or os.environ.get("HF_TOKEN", "")
+    masked = ("*" * (len(current_token) - 4) + current_token[-4:]) if len(current_token) > 4 else ("(not set)" if not current_token else current_token)
+    console.print(f"  HuggingFace token: [dim]{masked}[/dim]")
+    console.print()
+
+    new_token = pt_prompt(
+        ANSI("\033[1mNew HF token\033[0m (leave blank to keep current, 'clear' to remove): "),
+    ).strip()
+
+    if new_token == "clear":
+        data.setdefault("auth", {}).pop("hf_token", None)
+        console.print("[dim]Token cleared.[/dim]")
+    elif new_token:
+        data.setdefault("auth", {})["hf_token"] = new_token
+        console.print("[green]Token saved.[/green]")
+    else:
+        console.print("[dim]No change.[/dim]")
+        return
+
+    try:
+        cfg_path.write_bytes(tomli_w.dumps(data).encode())
+    except Exception as exc:
+        console.print(f"[red]Failed to write config: {exc}[/red]")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from ppmlx.models import (
 
 
 def test_default_aliases_count():
-    assert len(DEFAULT_ALIASES) >= 30
+    assert len(DEFAULT_ALIASES) >= 5
 
 
 def test_resolve_alias_direct_repo():
@@ -140,7 +140,7 @@ def test_download_model_already_exists(tmp_home, monkeypatch):
 def test_download_model_calls_snapshot(tmp_home, monkeypatch):
     called = []
 
-    def fake_snapshot_download(repo_id, local_dir, token, ignore_patterns):
+    def fake_snapshot_download(repo_id, local_dir, token, ignore_patterns, **kwargs):
         called.append({
             "repo_id": repo_id,
             "local_dir": local_dir,
