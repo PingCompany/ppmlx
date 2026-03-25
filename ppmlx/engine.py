@@ -19,6 +19,20 @@ class LoadedModel:
 
 _THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
+# Sanity cap: never auto-set max_tokens above this even on huge-context models.
+_MAX_AUTO_TOKENS = 32_768
+
+
+def _context_size(lm: "LoadedModel") -> int:
+    """Return the model's context window size from its tokenizer."""
+    tok = lm.tokenizer
+    inner = getattr(tok, "tokenizer", tok)
+    for obj in (tok, inner):
+        val = getattr(obj, "model_max_length", None)
+        if val and isinstance(val, int) and val < 10 ** 9:
+            return val
+    return 4096  # conservative fallback
+
 
 def _strip_thinking(text: str) -> tuple[str, str | None]:
     """
@@ -166,7 +180,7 @@ class TextEngine:
         messages: list[dict],
         temperature: float = 0.7,
         top_p: float = 0.9,
-        max_tokens: int = 2048,
+        max_tokens: int | None = None,
         stop: list[str] | None = None,
         seed: int | None = None,
         repetition_penalty: float | None = None,
@@ -181,10 +195,13 @@ class TextEngine:
         reasoning_text is populated for <think>...</think> models.
         prompt_tokens and completion_tokens are estimates (token count from encode).
         enable_thinking=False suppresses the thinking phase for models that support it (e.g. Qwen3).
+        max_tokens=None means 50% of the model's context window (capped at _MAX_AUTO_TOKENS).
         """
         from mlx_lm import generate as mlx_generate
 
         lm = self._get_or_load(repo_id)
+        if max_tokens is None:
+            max_tokens = min(_context_size(lm) // 2, _MAX_AUTO_TOKENS)
         prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking, tools=tools)
 
         try:
@@ -225,7 +242,7 @@ class TextEngine:
         messages: list[dict],
         temperature: float = 0.7,
         top_p: float = 0.9,
-        max_tokens: int = 2048,
+        max_tokens: int | None = None,
         stop: list[str] | None = None,
         seed: int | None = None,
         repetition_penalty: float | None = None,
@@ -238,10 +255,13 @@ class TextEngine:
         Yields text chunks. When strip_thinking=True (default), <think>...</think>
         blocks are silently consumed and not yielded.
         enable_thinking=False suppresses the thinking phase for models that support it (e.g. Qwen3).
+        max_tokens=None means 50% of the model's context window (capped at _MAX_AUTO_TOKENS).
         """
         from mlx_lm import stream_generate as mlx_stream
 
         lm = self._get_or_load(repo_id)
+        if max_tokens is None:
+            max_tokens = min(_context_size(lm) // 2, _MAX_AUTO_TOKENS)
         prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking, tools=tools)
 
         try:
@@ -270,8 +290,21 @@ class TextEngine:
         # Buffers partial tag matches and only yields text outside think blocks.
         # Qwen3's chat template injects "<think>\n" into the generation prompt,
         # so the model output begins *inside* a think block.
+        #
+        # State machine to strip <think>...</think> blocks from streamed tokens.
+        # Buffers partial tag matches and only yields text outside think blocks.
+        # Qwen3's chat template injects "<think>\n" into the generation prompt,
+        # so the model output begins *inside* a think block.
+        #
+        # Models that inject <think> but never emit </think> (e.g. GLM-4.7-Flash)
+        # are detected by a token budget: if we suppress more than
+        # _THINK_PASSTHROUGH_TOKENS chars without finding </think>, we assume the
+        # model doesn't use think-tag pairs and switch to pass-through mode.
+        _THINK_PASSTHROUGH_TOKENS = 50  # ~50 tokens worth of chars before giving up
+
         inside_think = bool(re.search(r"<think>\s*$", prompt))
         buf = ""
+        think_chars = 0  # chars suppressed while inside_think=True
 
         for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
             chunk = response.text if hasattr(response, "text") else response
@@ -282,18 +315,29 @@ class TextEngine:
                     # Look for </think> closing tag
                     end_idx = buf.find("</think>")
                     if end_idx != -1:
-                        # Skip everything up to and including </think>
+                        # Properly closed — discard thinking content
+                        think_chars = 0
                         buf = buf[end_idx + len("</think>"):]
                         inside_think = False
                         continue
                     # Check if buf ends with a partial match for </think>
-                    # Keep the tail that could be a prefix of "</think>"
                     tag = "</think>"
                     keep = 0
                     for i in range(1, min(len(tag), len(buf)) + 1):
                         if buf.endswith(tag[:i]):
                             keep = i
+                    suppressed = buf[:-keep] if keep else buf
+                    think_chars += len(suppressed)
                     buf = buf[-keep:] if keep else ""
+
+                    # If we've suppressed too much without a close tag, this
+                    # model doesn't use proper think-tag pairs — yield as plain text.
+                    if think_chars > _THINK_PASSTHROUGH_TOKENS:
+                        inside_think = False
+                        think_chars = 0
+                        if suppressed:
+                            yield suppressed
+                        continue
                     break
                 else:
                     # Look for <think> opening tag
@@ -312,19 +356,17 @@ class TextEngine:
                         if buf.endswith(tag[:i]):
                             keep = i
                     if keep:
-                        # Yield everything before the potential partial tag
                         safe = buf[:-keep]
                         if safe:
                             yield safe
                         buf = buf[-keep:]
                     else:
-                        # No partial match — yield everything
                         if buf:
                             yield buf
                         buf = ""
                     break
 
-        # Flush any remaining buffer (partial tag that never completed)
+        # Flush any remaining buffer outside think blocks
         if buf and not inside_think:
             yield buf
 

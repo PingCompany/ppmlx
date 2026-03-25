@@ -6,4 +6,4 @@ source "$SCRIPT_DIR/bench_common.sh"
 
 run_full_benchmark "glm-4.7-flash" "ppmlx" \
     "http://localhost:6767/v1/chat/completions" \
-    "ppmlx:glm-4.7-flash"
+    "ppmlx/glm-4.7-flash"

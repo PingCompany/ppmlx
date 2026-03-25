@@ -35,7 +35,13 @@ class EmbedEngine:
         if repo_id in self._models:
             return
         path = _resolve_model_path(repo_id)
-        from mlx_embeddings.utils import load as embed_load
+        try:
+            from mlx_embeddings.utils import load as embed_load
+        except ImportError:
+            raise ImportError(
+                "Embeddings require the 'mlx-embeddings' package.\n"
+                "Install it with: uv tool install ppmlx[embeddings]  (or: pip install ppmlx[embeddings])"
+            )
         with self._lock:
             if repo_id not in self._models:
                 model, tokenizer = embed_load(path)

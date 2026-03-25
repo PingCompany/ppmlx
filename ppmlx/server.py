@@ -458,7 +458,7 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
-    max_tokens = body.get("max_tokens", 2048)
+    max_tokens = body.get("max_tokens")
     stop = body.get("stop")
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
@@ -510,7 +510,7 @@ def _stream_chat(
                     repo_id, messages,
                     temperature=0.7 if temperature is None else temperature,
                     top_p=1.0 if top_p is None else top_p,
-                    max_tokens=2048 if max_tokens is None else max_tokens,
+                    max_tokens=max_tokens,
                     seed=seed,
                     tools=tools,
                 )
@@ -534,7 +534,7 @@ def _stream_chat(
             elif engine_type == "vision":
                 from ppmlx.engine_vlm import get_vision_engine
                 engine = get_vision_engine()
-                text, _, _ = engine.generate(repo_id, messages, max_tokens=1024 if max_tokens is None else max_tokens)
+                text, _, _ = engine.generate(repo_id, messages, max_tokens=max_tokens or 1024)
                 full_text = text
                 if first_token_ts is None:
                     first_token_ts = time.time()
@@ -620,7 +620,7 @@ async def _nonstream_chat(
                 repo_id, messages,
                 temperature=0.7 if temperature is None else temperature,
                 top_p=1.0 if top_p is None else top_p,
-                max_tokens=2048 if max_tokens is None else max_tokens,
+                max_tokens=max_tokens,
                 seed=seed,
                 repetition_penalty=repetition_penalty,
                 tools=tools,
@@ -704,7 +704,7 @@ async def completions(request: Request):
     body = await request.json()
     model_name = body.get("model", "")
     prompt = body.get("prompt", "")
-    max_tokens = body.get("max_tokens", 2048)
+    max_tokens = body.get("max_tokens")
     temperature = body.get("temperature", 0.7)
     stream = body.get("stream", False)
 
@@ -726,7 +726,7 @@ async def completions(request: Request):
         text, reasoning, prompt_tokens, completion_tokens = engine.generate(
             repo_id, messages,
             temperature=0.7 if temperature is None else temperature,
-            max_tokens=2048 if max_tokens is None else max_tokens,
+            max_tokens=max_tokens,
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -871,7 +871,7 @@ async def responses(request: Request):
     stream = body.get("stream", False)
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
-    max_tokens = body.get("max_output_tokens") or body.get("max_tokens", 4096)
+    max_tokens = body.get("max_output_tokens") or body.get("max_tokens")
     # instructions field acts as a system prompt
     instructions = body.get("instructions")
 
@@ -1019,7 +1019,7 @@ def _stream_responses(
                     repo_id, messages,
                     temperature=0.7 if temperature is None else temperature,
                     top_p=1.0 if top_p is None else top_p,
-                    max_tokens=4096 if max_tokens is None else max_tokens,
+                    max_tokens=max_tokens,
                     tools=tools,
                     strip_thinking=False,  # Handle thinking in server
                 )
@@ -1137,7 +1137,7 @@ def _stream_responses(
                 engine = get_vision_engine()
                 text, _, _ = engine.generate(
                     repo_id, messages,
-                    max_tokens=4096 if max_tokens is None else max_tokens,
+                    max_tokens=max_tokens,
                 )
                 full_text = text
                 yield _sse("response.output_text.delta", {
@@ -1279,7 +1279,7 @@ async def _nonstream_responses(
                 repo_id, messages,
                 temperature=0.7 if temperature is None else temperature,
                 top_p=1.0 if top_p is None else top_p,
-                max_tokens=4096 if max_tokens is None else max_tokens,
+                max_tokens=max_tokens,
                 tools=tools,
             )
         elif engine_type == "vision":
@@ -1365,7 +1365,7 @@ async def anthropic_messages(request: Request):
     model_name = body.get("model", "")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    max_tokens = body.get("max_tokens", 4096)
+    max_tokens = body.get("max_tokens")
     temperature = body.get("temperature", 0.7)
     system_prompt = body.get("system")
     tools = _limit_tools(body.get("tools") or None)
@@ -1487,7 +1487,7 @@ def _stream_anthropic(
             gen = engine.stream_generate(
                 repo_id, messages,
                 temperature=0.7 if temperature is None else temperature,
-                max_tokens=4096 if max_tokens is None else max_tokens,
+                max_tokens=max_tokens,
                 tools=oai_tools,
                 strip_thinking=False,  # We handle thinking/text separation here
             )
@@ -1742,7 +1742,7 @@ async def _nonstream_anthropic(
         text, reasoning, prompt_tokens, completion_tokens = engine.generate(
             repo_id, messages,
             temperature=0.7 if temperature is None else temperature,
-            max_tokens=4096 if max_tokens is None else max_tokens,
+            max_tokens=max_tokens,
             tools=oai_tools,
         )
     except Exception as e:
@@ -1859,7 +1859,7 @@ async def responses_ws(websocket: WebSocket):
                             repo_id, messages,
                             temperature=0.7 if temperature is None else temperature,
                             top_p=1.0 if top_p is None else top_p,
-                            max_tokens=4096 if max_tokens is None else max_tokens,
+                            max_tokens=max_tokens,
                             tools=tools,
                         )
                         full_text = text
@@ -1868,7 +1868,7 @@ async def responses_ws(websocket: WebSocket):
                             repo_id, messages,
                             temperature=0.7 if temperature is None else temperature,
                             top_p=1.0 if top_p is None else top_p,
-                            max_tokens=4096 if max_tokens is None else max_tokens,
+                            max_tokens=max_tokens,
                         ):
                             full_text += chunk
                 elif engine_type == "vision":
@@ -1876,7 +1876,7 @@ async def responses_ws(websocket: WebSocket):
                     engine = get_vision_engine()
                     text, _, _ = engine.generate(
                         repo_id, messages,
-                        max_tokens=4096 if max_tokens is None else max_tokens,
+                        max_tokens=max_tokens,
                     )
                     full_text = text
             except Exception as e:

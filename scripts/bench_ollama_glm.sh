@@ -6,4 +6,4 @@ source "$SCRIPT_DIR/bench_common.sh"
 
 run_full_benchmark "glm-4.7-flash" "ollama" \
     "http://localhost:11434/v1/chat/completions" \
-    "ollama:glm-4.7-flash"
+    "ollama/glm-4.7-flash"

@@ -17,6 +17,10 @@ DEFAULT_ALIASES: dict[str, str] = {
     "qwen3.5:27b":        "mlx-community/Qwen3.5-27B-4bit",
     "qwen3.5:35b-a3b":    "mlx-community/Qwen3.5-35B-A3B-4bit",
     "qwen3.5:122b-a10b":  "mlx-community/Qwen3.5-122B-A10B-4bit",
+    # GLM-4 — THUDM / mlx-community
+    "glm4:flash":         "mlx-community/GLM-4.7-Flash-4bit",
+    "glm4":               "mlx-community/GLM-4.7-Flash-4bit",
+    "glm-4.7-flash":      "mlx-community/GLM-4.7-Flash-4bit",
     # GPT-OSS (OpenAI open weights) — released Aug 2025
     "gpt-oss:20b":        "mlx-community/gpt-oss-20b-4bit",
     "gpt-oss:120b":       "mlx-community/gpt-oss-120b-4bit",
@@ -216,14 +220,22 @@ def repo_to_local_name(repo_id: str) -> str:
     return repo_id.replace("/", "--")
 
 
+_DOWNLOAD_IGNORE_PATTERNS = ["*.md", "*.txt", "original/*"]
+
+
 def _get_repo_size(repo_id: str, token: str | None = None) -> int | None:
-    """Return total download size in bytes by listing the repo tree. Returns None on failure."""
+    """Return total download size in bytes, excluding ignored patterns."""
     try:
+        import fnmatch
         from huggingface_hub import list_repo_tree
-        return sum(
-            getattr(f, "size", 0) or 0
-            for f in list_repo_tree(repo_id, token=token, recursive=True)
-        )
+        total = 0
+        for f in list_repo_tree(repo_id, token=token, recursive=True):
+            path = getattr(f, "rfilename", "") or ""
+            size = getattr(f, "size", 0) or 0
+            if any(fnmatch.fnmatch(path, pat) for pat in _DOWNLOAD_IGNORE_PATTERNS):
+                continue
+            total += size
+        return total or None
     except Exception:
         return None
 
@@ -246,16 +258,42 @@ def _get_hf_token(explicit: str | None = None) -> str | None:
     return os.environ.get("HF_TOKEN") or None
 
 
+def _tree_size(path: Path) -> int:
+    """Total bytes of all files under *path* (recursive, follows symlinks)."""
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
 def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     """
-    Download a model from HuggingFace Hub with a uv-style Rich progress bar.
-    Returns local path.
+    Download a model from HuggingFace Hub with a Rich progress bar.
+
+    ``snapshot_download`` runs in a daemon thread with tqdm disabled.
+    The main thread polls two directories every 0.5 s:
+
+    * **local_path** — where finished files land
+    * **HF blob cache** — ``~/.cache/huggingface/hub/models--…/blobs/``
+      where in-progress ``.incomplete`` files grow byte-by-byte
+
+    ``downloaded = max(cache_growth, local_growth)`` avoids double-
+    counting while still tracking whichever location is active.
     """
+    import threading
     from rich.progress import (
-        Progress, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, TextColumn,
+        Progress, BarColumn, DownloadColumn, TransferSpeedColumn,
+        TimeRemainingColumn, TextColumn, SpinnerColumn,
     )
     from huggingface_hub import snapshot_download
-    from tqdm.auto import tqdm as _tqdm_base
+    from huggingface_hub.constants import HF_HUB_CACHE
 
     token = _get_hf_token(token)
     repo_id = resolve_alias(alias_or_repo)
@@ -268,46 +306,93 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     local_path.mkdir(parents=True, exist_ok=True)
     total = _get_repo_size(repo_id, token)
 
+    # HF blob cache for this specific model (in-progress .incomplete files live here).
+    cache_path = Path(HF_HUB_CACHE) / f"models--{repo_id.replace('/', '--')}" / "blobs"
+
+    # Baselines — subtract pre-existing data (previous partial attempts, etc.)
+    baseline_local = _tree_size(local_path)
+    baseline_cache = _tree_size(cache_path)
+
+    # Suppress HF's own tqdm bars BEFORE the thread starts.
+    prev_hf_env = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+    # ── colours ──────────────────────────────────────────────────────
+    BLUE, GREEN, ORANGE, RED, WHITE = "blue", "green", "#d78700", "red", "white"
+
+    bar = BarColumn(bar_width=None, complete_style=BLUE, finished_style=GREEN)
     with Progress(
+        SpinnerColumn(style=WHITE),
         TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=None),
+        bar,
         DownloadColumn(),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
-        refresh_per_second=2,
+        refresh_per_second=10,
     ) as progress:
         task = progress.add_task(f"↓ {alias_or_repo}", total=total)
 
-        class _RichTqdm(_tqdm_base):  # type: ignore[valid-type]
-            def __init__(self, *args, **kwargs):
-                kwargs.pop("name", None)
-                kwargs["mininterval"] = 0.5
-                super().__init__(*args, **kwargs)
+        # ── background download ──────────────────────────────────────
+        result: dict = {}
 
-            def display(self, *args, **kwargs) -> None:
-                pass
+        def _bg_download() -> None:
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(local_path),
+                    token=token,
+                    ignore_patterns=_DOWNLOAD_IGNORE_PATTERNS,
+                )
+            except BaseException as exc:
+                result["error"] = exc
 
-            def close(self) -> None:
-                pass
+        dl_thread = threading.Thread(target=_bg_download, daemon=True)
+        dl_thread.start()
 
-            def update(self, n: int = 1) -> None:
-                if n and n > 0:
-                    progress.update(task, advance=int(n))
-
+        # ── poll filesystem ──────────────────────────────────────────
         try:
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=str(local_path),
-                token=token,
-                ignore_patterns=["*.md", "*.txt", "original/*"],
-                tqdm_class=_RichTqdm,
-            )
-        except Exception as e:
+            while dl_thread.is_alive():
+                local_growth = _tree_size(local_path) - baseline_local
+                cache_growth = _tree_size(cache_path) - baseline_cache
+                downloaded = max(local_growth, cache_growth)
+                if total:
+                    downloaded = min(downloaded, total)
+                progress.update(task, completed=downloaded)
+                dl_thread.join(timeout=0.5)
+        except KeyboardInterrupt:
+            bar.complete_style = ORANGE  # type: ignore[assignment]
+            bar.finished_style = ORANGE  # type: ignore[assignment]
+            progress.update(task, description=f"[bold {ORANGE}]✗ {alias_or_repo}")
+            progress.stop()
             shutil.rmtree(local_path, ignore_errors=True)
-            raise ModelNotFoundError(f"Failed to download '{repo_id}': {e}") from e
+            raise
         finally:
-            if total:
-                progress.update(task, completed=total)
+            # Restore env var no matter what.
+            if prev_hf_env is None:
+                os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+            else:
+                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_hf_env
+
+        # ── handle result ────────────────────────────────────────────
+        exc = result.get("error")
+        if exc:
+            bar.complete_style = RED  # type: ignore[assignment]
+            bar.finished_style = RED  # type: ignore[assignment]
+            progress.update(task, description=f"[bold {RED}]✗ {alias_or_repo}")
+            shutil.rmtree(local_path, ignore_errors=True)
+            if isinstance(exc, KeyboardInterrupt):
+                raise exc
+            raise ModelNotFoundError(
+                f"Failed to download '{repo_id}': {exc}"
+            ) from exc
+
+        # success
+        bar.complete_style = GREEN  # type: ignore[assignment]
+        progress.update(
+            task,
+            completed=total or _tree_size(local_path) - baseline_local,
+            description=f"[bold {GREEN}]✓ {alias_or_repo}",
+        )
 
     return local_path
 

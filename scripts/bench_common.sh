@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # bench_common.sh — shared functions for ppmlx vs ollama benchmarks
 # Source this file, don't run it directly.
+#
+# Scenarios:
+#   S1 Simple      — short prompt → short answer (TTFT, baseline tok/s)
+#   S2 Complex     — short prompt → long answer (sustained generation throughput)
+#   S3 LongContext — large prompt → medium answer (prefill/prompt processing speed)
+#   S4 Agentic     — real multi-turn with tools via pi (wall-time, tool use)
+#
+# Run order: for each run R in 1..RUNS → S1, S2, S3, S4
 
 RUNS=3
-MAX_TOKENS=512
+MAX_TOKENS=8192
 RESULTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/benchmark_results"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$RESULTS_DIR"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
@@ -21,21 +30,20 @@ COMPLEX_PROMPT="Design a rate limiter for an API gateway. Describe:
 4. Edge cases (clock skew, burst traffic, graceful degradation)
 Provide pseudocode for the core logic."
 
-AGENTIC_PROMPT="Review this Python function. Find all bugs and security issues, explain each one, then provide a corrected version with inline comments explaining every fix.
+# S3: Long context — embed real source code (~4K tokens) and ask for analysis.
+# Built dynamically from engine.py so the prompt is always realistic.
+_build_long_context_prompt() {
+    local engine_src
+    engine_src=$(cat "$PROJECT_DIR/ppmlx/engine.py" 2>/dev/null || echo "# file not found")
+    printf 'Analyze the following Python module. Provide:\n1. A summary of its architecture and main classes\n2. Thread-safety analysis — are there race conditions?\n3. Performance bottlenecks and optimization suggestions\n4. Any bugs or edge cases that could cause failures\n\n```python\n%s\n```' "$engine_src"
+}
+LONG_CONTEXT_PROMPT="$(_build_long_context_prompt)"
 
-\`\`\`python
-def process_user_data(user_input):
-    import os
-    query = f\"SELECT * FROM users WHERE name = '{user_input}'\"
-    result = os.popen(f'echo {user_input} | base64').read()
-    data = eval(result)
-    return data
-\`\`\`"
+# S4: Agentic — prompt that requires pi to use tools (read files, explore).
+AGENTIC_PROMPT="Review the ppmlx project in the current directory for security vulnerabilities. Focus on the server endpoints and how user input is handled. Read the relevant source files (especially server.py and engine.py) and provide a detailed security audit report with specific line references."
 
-# ── API call helper (streaming — measures TTFT) ──────────────────────────
+# ── API call helper (streaming — measures TTFT) ───────────────────────────
 #
-# Uses streaming mode to measure time-to-first-token accurately.
-# Parses SSE chunks, captures first content delta timestamp.
 # Returns JSON: {ms, tokens, tok_s, ttft_ms, error}
 
 call_api() {
@@ -57,22 +65,20 @@ call_api() {
             stream: true
         }')
 
-    # Use python to stream and measure TTFT precisely
     python3 -c "
 import sys, json, time, urllib.request
 
-url = sys.argv[1]
+url  = sys.argv[1]
 data = sys.argv[2].encode()
-label = sys.argv[3]
 
 req = urllib.request.Request(url, data=data, headers={
     'Content-Type': 'application/json',
     'Authorization': 'Bearer local',
 })
 
-start_ns = time.time_ns()
-ttft_ns = None
-chunks = 0
+start_ns  = time.time_ns()
+ttft_ns   = None
+chunks    = 0
 full_text = []
 
 try:
@@ -92,9 +98,12 @@ try:
                 if payload == '[DONE]':
                     break
                 try:
-                    obj = json.loads(payload)
-                    delta = obj.get('choices', [{}])[0].get('delta', {})
-                    content = delta.get('content', '')
+                    obj     = json.loads(payload)
+                    delta   = obj.get('choices', [{}])[0].get('delta', {})
+                    # Some backends (ollama+GLM) put thinking in delta.reasoning
+                    # and only surface final answer in delta.content.
+                    # Count both for TTFT/throughput; prefer content, fallback reasoning.
+                    content = delta.get('content', '') or delta.get('reasoning', '')
                     if content:
                         if ttft_ns is None:
                             ttft_ns = time.time_ns()
@@ -106,179 +115,168 @@ except Exception as e:
     print(json.dumps({'ms':0,'tokens':0,'tok_s':0,'ttft_ms':0,'error':True}))
     sys.exit(0)
 
-end_ns = time.time_ns()
+end_ns     = time.time_ns()
 elapsed_ms = round((end_ns - start_ns) / 1_000_000)
-ttft_ms = round((ttft_ns - start_ns) / 1_000_000) if ttft_ns else 0
+ttft_ms    = round((ttft_ns - start_ns) / 1_000_000) if ttft_ns else 0
+tokens     = chunks
+tok_s      = round(tokens / (elapsed_ms / 1000), 2) if elapsed_ms > 0 and tokens > 0 else 0
 
-# Estimate token count from chunks (each SSE chunk ≈ 1 token for most backends)
-tokens = chunks
+print(json.dumps({'ms': elapsed_ms, 'tokens': tokens, 'tok_s': tok_s,
+                  'ttft_ms': ttft_ms, 'error': False}))
+" "$url" "$body" 2>/dev/null
+}
+
+# ── pi agentic call helper ────────────────────────────────────────────────
+#
+# Runs pi with --mode json and extracts:
+#   ms, ttft_ms, tokens (≈message_update count), tok_s,
+#   chars_total, think_chars, answer_chars, turns, tool_calls
+#
+# Returns JSON with all fields above + error flag.
+
+call_pi() {
+    local pi_model="$1"
+    local prompt="$2"
+
+    # Pass model/prompt via env vars to avoid all shell quoting issues with
+    # newlines, backticks and quotes inside the prompt string.
+    _BENCH_PI_MODEL="$pi_model" _BENCH_PI_PROMPT="$prompt" \
+    python3 - 2>/dev/null << 'PYEOF'
+import os, sys, json, time, subprocess, re
+
+EMPTY = {'ms':0,'ttft_ms':0,'tokens':0,'tok_s':0,'chars_total':0,
+         'think_chars':0,'answer_chars':0,'turns':0,
+         'tool_calls':0,'tool_names':[],'error':True}
+
+pi_model = os.environ.get('_BENCH_PI_MODEL', '')
+prompt   = os.environ.get('_BENCH_PI_PROMPT', '')
+if not pi_model or not prompt:
+    print(json.dumps(EMPTY)); sys.exit(0)
+
+try:
+    start_ns = time.time_ns()
+    proc = subprocess.run(
+        ['pi', '--model', pi_model, '--mode', 'json', '--print', prompt],
+        capture_output=True, text=True, timeout=300,
+    )
+    end_ns = time.time_ns()
+except Exception:
+    print(json.dumps(EMPTY)); sys.exit(0)
+
+elapsed_ms   = round((end_ns - start_ns) / 1_000_000)
+tokens       = 0
+ttft_ms      = 0
+turns        = 0
+tool_calls   = []
+first_tok_ns = None
+answer_text  = ''
+
+for line in proc.stdout.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    t = obj.get('type', '')
+    if t == 'turn_start':
+        turns += 1
+    elif t == 'message_update':
+        ev      = obj.get('assistantMessageEvent', {})
+        partial = ev.get('partial', {})
+        ts_ms   = partial.get('timestamp')
+        for c in partial.get('content', []):
+            if c.get('text', ''):
+                if first_tok_ns is None and ts_ms:
+                    first_tok_ns = ts_ms * 1_000_000
+                tokens += 1
+    elif t == 'tool_call':
+        tool = obj.get('tool', {})
+        tool_calls.append({'name': tool.get('name',''),
+                           'input': str(tool.get('input',''))[:120]})
+    elif t == 'agent_end':
+        for msg in obj.get('messages', []):
+            if msg.get('role') == 'assistant':
+                for c in msg.get('content', []):
+                    answer_text = c.get('text', '')
+
+if first_tok_ns:
+    ttft_ms = round((first_tok_ns - start_ns) / 1_000_000)
+
+think_match = re.search(r'(.*?)</think>(.*)', answer_text, re.DOTALL)
+if think_match:
+    think_chars  = len(think_match.group(1))
+    answer_chars = len(think_match.group(2).strip())
+else:
+    think_chars  = 0
+    answer_chars = len(answer_text)
+
 tok_s = round(tokens / (elapsed_ms / 1000), 2) if elapsed_ms > 0 and tokens > 0 else 0
 
 print(json.dumps({
-    'ms': elapsed_ms,
-    'tokens': tokens,
-    'tok_s': tok_s,
-    'ttft_ms': ttft_ms,
-    'error': False,
+    'ms':           elapsed_ms,
+    'ttft_ms':      ttft_ms,
+    'tokens':       tokens,
+    'tok_s':        tok_s,
+    'chars_total':  len(answer_text),
+    'think_chars':  think_chars,
+    'answer_chars': answer_chars,
+    'turns':        turns,
+    'tool_calls':   len(tool_calls),
+    'tool_names':   [tc['name'] for tc in tool_calls],
+    'error':        proc.returncode != 0 or tokens == 0,
 }))
-" "$url" "$body" "$label" 2>/dev/null
+PYEOF
+}
+
+# ── Statistics helper ─────────────────────────────────────────────────────
+#
+# Usage: _stats "v1 v2 v3" → emits: mean stddev min max cv_pct
+
+_stats() {
+    python3 - "$1" <<'PYEOF'
+import sys, math
+vals = [float(x) for x in sys.argv[1].split() if x]
+if not vals:
+    print("0 0 0 0 0"); sys.exit()
+n    = len(vals)
+mean = sum(vals) / n
+sd   = math.sqrt(sum((v - mean)**2 for v in vals) / n)
+cv   = sd / mean * 100 if mean else 0
+print(f"{mean:.1f} {sd:.1f} {min(vals):.1f} {max(vals):.1f} {cv:.1f}")
+PYEOF
 }
 
 # ── Peak memory helper ────────────────────────────────────────────────────
-#
-# Reads GPU/unified memory from the backend's health/status endpoint.
-# ppmlx: /health → .system.memory_total_gb (and loaded models)
-# ollama: /api/ps → loaded model VRAM
 
 get_memory_mb() {
     local backend="$1"
-
     if [[ "$backend" == "ppmlx" ]]; then
-        # ppmlx /health reports loaded models
-        local health
-        health=$(curl -s --max-time 5 "http://localhost:6767/health" 2>/dev/null) || echo "0"
-        # Get loaded model memory from ps-like info if available
-        local loaded
-        loaded=$(echo "$health" | jq -r '.loaded_models | length // 0' 2>/dev/null) || loaded=0
-        # Use system_profiler for actual GPU memory pressure
         local mem_pressure
-        mem_pressure=$(memory_pressure 2>/dev/null | grep "System-wide memory free percentage:" | awk '{print $NF}' | tr -d '%') || mem_pressure=""
-        if [[ -n "$mem_pressure" ]]; then
-            echo "$mem_pressure"
-        else
-            echo "0"
-        fi
+        mem_pressure=$(memory_pressure 2>/dev/null \
+            | grep "System-wide memory free percentage:" \
+            | awk '{print $NF}' | tr -d '%') || mem_pressure=""
+        echo "${mem_pressure:-0}"
     elif [[ "$backend" == "ollama" ]]; then
         local ps
-        ps=$(curl -s --max-time 5 "http://localhost:11434/api/ps" 2>/dev/null) || echo "0"
+        ps=$(curl -s --max-time 5 "http://localhost:11434/api/ps" 2>/dev/null) || ps="{}"
         local vram
         vram=$(echo "$ps" | jq -r '.models[0].size_vram // 0' 2>/dev/null) || vram=0
-        echo $(python3 -c "print(round($vram / 1048576))") # bytes → MB
+        python3 -c "print(round($vram / 1048576))"
     else
         echo "0"
     fi
 }
 
-# ── Pi CLI call helper ────────────────────────────────────────────────────
-
-call_pi() {
-    local pi_model="$1"
-    local prompt="$2"
-    local label="$3"
-
-    local start_ns end_ns output
-    start_ns=$(python3 -c "import time; print(int(time.time_ns()))")
-
-    output=$(pi --model "$pi_model" "$prompt" 2>/dev/null) || true
-
-    end_ns=$(python3 -c "import time; print(int(time.time_ns()))")
-
-    local elapsed_ms
-    elapsed_ms=$(python3 -c "print(round(($end_ns - $start_ns) / 1_000_000))")
-
-    local char_count=0
-    if [[ -n "$output" ]]; then
-        char_count=${#output}
-    fi
-
-    if [[ "$char_count" -eq 0 ]]; then
-        printf "${RED}    [%s] pi returned empty output${RESET}\n" "$label" >&2
-        echo "{\"ms\":0,\"chars\":0,\"error\":true}"
-        return
-    fi
-
-    echo "{\"ms\":$elapsed_ms,\"chars\":$char_count,\"error\":false}"
-}
-
-# ── Run a single scenario (direct API, streaming) ────────────────────────
-
-run_direct() {
-    local scenario_name="$1"
-    local prompt="$2"
-    local api_url="$3"
-    local model="$4"
-    local backend="$5"
-
-    printf "\n  ${BOLD}%s${RESET}\n" "$scenario_name"
-
-    local total_ms=0 total_tok=0 total_tps=0 total_ttft=0 ok=0
-
-    for i in $(seq 1 $RUNS); do
-        printf "    ${DIM}run %d/%d...${RESET}\r" "$i" "$RUNS"
-        local result
-        result=$(call_api "$api_url" "$model" "$prompt" "$backend")
-
-        local err ms tok tps ttft
-        err=$(echo "$result" | jq -r '.error')
-        if [[ "$err" == "false" ]]; then
-            ms=$(echo "$result" | jq -r '.ms')
-            tok=$(echo "$result" | jq -r '.tokens')
-            tps=$(echo "$result" | jq -r '.tok_s')
-            ttft=$(echo "$result" | jq -r '.ttft_ms')
-            total_ms=$((total_ms + ms))
-            total_tok=$((total_tok + tok))
-            total_tps=$(python3 -c "print($total_tps + $tps)")
-            total_ttft=$((total_ttft + ttft))
-            ok=$((ok + 1))
-        fi
-    done
-
-    if [[ "$ok" -gt 0 ]]; then
-        local avg_ms=$((total_ms / ok))
-        local avg_tps
-        avg_tps=$(python3 -c "print(round($total_tps / $ok, 1))")
-        local avg_tok=$((total_tok / ok))
-        local avg_ttft=$((total_ttft / ok))
-        printf "    ${GREEN}%dms total  |  %dms TTFT  |  %s tok/s  |  %d tokens  (%d/%d)${RESET}\n" \
-            "$avg_ms" "$avg_ttft" "$avg_tps" "$avg_tok" "$ok" "$RUNS"
-        echo "$avg_ms $avg_tps $avg_tok $avg_ttft" > "$RESULTS_DIR/.last_direct"
-    else
-        printf "    ${RED}all runs failed${RESET}\n"
-        echo "0 0 0 0" > "$RESULTS_DIR/.last_direct"
-    fi
-}
-
-# ── Run a single scenario (pi CLI) ───────────────────────────────────────
-
-run_pi() {
-    local scenario_name="$1"
-    local prompt="$2"
-    local pi_model="$3"
-    local backend="$4"
-
-    printf "\n  ${BOLD}%s (via pi)${RESET}\n" "$scenario_name"
-
-    local total_ms=0 total_chars=0 ok=0
-
-    for i in $(seq 1 $RUNS); do
-        printf "    ${DIM}run %d/%d...${RESET}\r" "$i" "$RUNS"
-        local result
-        result=$(call_pi "$pi_model" "$prompt" "$backend")
-
-        local err ms chars
-        err=$(echo "$result" | jq -r '.error')
-        if [[ "$err" == "false" ]]; then
-            ms=$(echo "$result" | jq -r '.ms')
-            chars=$(echo "$result" | jq -r '.chars')
-            total_ms=$((total_ms + ms))
-            total_chars=$((total_chars + chars))
-            ok=$((ok + 1))
-        fi
-    done
-
-    if [[ "$ok" -gt 0 ]]; then
-        local avg_ms=$((total_ms / ok))
-        local avg_chars=$((total_chars / ok))
-        printf "    ${GREEN}%dms avg  |  %d chars  (%d/%d)${RESET}\n" \
-            "$avg_ms" "$avg_chars" "$ok" "$RUNS"
-        echo "$avg_ms $avg_chars" > "$RESULTS_DIR/.last_pi"
-    else
-        printf "    ${RED}all runs failed${RESET}\n"
-        echo "0 0" > "$RESULTS_DIR/.last_pi"
-    fi
-}
-
-# ── Full benchmark for one model+backend ──────────────────────────────────
+# ── Full benchmark ────────────────────────────────────────────────────────
+#
+# Outer loop: runs (R=1..RUNS)
+# Inner order: S1 → S2 → S3 → S4
+# S1-S3: direct API calls (fair tok/s comparison)
+# S4: real agentic via pi (wall-time only comparison)
+# Prints one-line result per scenario immediately after it completes.
+# Final block shows per-scenario stats across runs.
 
 run_full_benchmark() {
     local model="$1"
@@ -293,45 +291,209 @@ run_full_benchmark() {
     printf "\n${BOLD}════════════════════════════════════════${RESET}\n"
     printf "${BOLD}  %s — %s${RESET}\n" "$backend" "$model"
     printf "${BOLD}════════════════════════════════════════${RESET}\n"
-    printf "Runs: %d | Max tokens: %d\n" "$RUNS" "$MAX_TOKENS"
+    printf "Runs: %d | Max tokens (S1-S3): %d\n\n" "$RUNS" "$MAX_TOKENS"
 
-    # Measure memory before
-    local mem_before
-    mem_before=$(get_memory_mb "$backend")
+    # Raw data arrays (space-separated strings)
+    local s1_ms_v="" s1_tps_v="" s1_tok_v="" s1_ttft_v=""
+    local s2_ms_v="" s2_tps_v="" s2_tok_v="" s2_ttft_v=""
+    local s3_ms_v="" s3_tps_v="" s3_tok_v="" s3_ttft_v=""
+    local s4_ms_v="" s4_ttft_v="" s4_tok_v="" s4_tps_v=""
+    local s4_chars_v="" s4_think_v="" s4_ans_v="" s4_turns_v="" s4_tools_v=""
 
-    # Scenario 1: Simple (direct, streaming)
-    run_direct "Scenario 1: Simple (direct)" "$SIMPLE_PROMPT" "$api_url" "$model" "$backend"
-    read -r s1_ms s1_tps s1_tok s1_ttft < "$RESULTS_DIR/.last_direct"
+    local mem_after=0
 
-    # Scenario 2: Complex (direct, streaming)
-    run_direct "Scenario 2: Complex (direct)" "$COMPLEX_PROMPT" "$api_url" "$model" "$backend"
-    read -r s2_ms s2_tps s2_tok s2_ttft < "$RESULTS_DIR/.last_direct"
+    for run in $(seq 1 "$RUNS"); do
+        printf "${BOLD}── Run %d/%d ──────────────────────────────${RESET}\n" "$run" "$RUNS"
 
-    # Measure memory after model is loaded
-    local mem_after
-    mem_after=$(get_memory_mb "$backend")
+        # ── Scenario 1: Simple ──────────────────────────────────────────
+        printf "  ${DIM}S1 Simple...${RESET}"
+        local r1
+        r1=$(call_api "$api_url" "$model" "$SIMPLE_PROMPT" "$backend")
+        if [[ "$(echo "$r1" | jq -r '.error')" == "false" ]]; then
+            local r1_ms r1_tps r1_tok r1_ttft
+            r1_ms=$(echo   "$r1" | jq -r '.ms')
+            r1_tps=$(echo  "$r1" | jq -r '.tok_s')
+            r1_tok=$(echo  "$r1" | jq -r '.tokens')
+            r1_ttft=$(echo "$r1" | jq -r '.ttft_ms')
+            s1_ms_v="$s1_ms_v $r1_ms"; s1_tps_v="$s1_tps_v $r1_tps"
+            s1_tok_v="$s1_tok_v $r1_tok"; s1_ttft_v="$s1_ttft_v $r1_ttft"
+            printf "\r  ${GREEN}S1 Simple     %6dms | TTFT %4dms | %5.1f tok/s | %4d tok${RESET}\n" \
+                "$r1_ms" "$r1_ttft" "$r1_tps" "$r1_tok"
+        else
+            printf "\r  ${RED}S1 Simple     FAILED${RESET}\n"
+        fi
 
-    # Scenario 3: Agentic (via pi)
-    run_pi "Scenario 3: Agentic" "$AGENTIC_PROMPT" "$pi_model" "$backend"
-    read -r s3_ms s3_chars < "$RESULTS_DIR/.last_pi"
+        # ── Scenario 2: Complex ─────────────────────────────────────────
+        printf "  ${DIM}S2 Complex...${RESET}"
+        local r2
+        r2=$(call_api "$api_url" "$model" "$COMPLEX_PROMPT" "$backend")
+        if [[ "$(echo "$r2" | jq -r '.error')" == "false" ]]; then
+            local r2_ms r2_tps r2_tok r2_ttft
+            r2_ms=$(echo   "$r2" | jq -r '.ms')
+            r2_tps=$(echo  "$r2" | jq -r '.tok_s')
+            r2_tok=$(echo  "$r2" | jq -r '.tokens')
+            r2_ttft=$(echo "$r2" | jq -r '.ttft_ms')
+            s2_ms_v="$s2_ms_v $r2_ms"; s2_tps_v="$s2_tps_v $r2_tps"
+            s2_tok_v="$s2_tok_v $r2_tok"; s2_ttft_v="$s2_ttft_v $r2_ttft"
+            printf "\r  ${GREEN}S2 Complex    %6dms | TTFT %4dms | %5.1f tok/s | %4d tok${RESET}\n" \
+                "$r2_ms" "$r2_ttft" "$r2_tps" "$r2_tok"
+        else
+            printf "\r  ${RED}S2 Complex    FAILED${RESET}\n"
+        fi
 
-    # Write results JSON
-    cat > "$outfile" <<JSONEOF
-{
-  "backend": "$backend",
-  "model": "$model",
-  "timestamp": "$timestamp",
-  "runs": $RUNS,
-  "max_tokens": $MAX_TOKENS,
-  "memory_mb": $mem_after,
+        # Memory sample after first run (model is loaded)
+        if [[ "$run" -eq 1 ]]; then
+            mem_after=$(get_memory_mb "$backend")
+        fi
+
+        # ── Scenario 3: Long Context (direct API — prefill speed) ──────
+        printf "  ${DIM}S3 LongCtx...${RESET}"
+        local r3
+        r3=$(call_api "$api_url" "$model" "$LONG_CONTEXT_PROMPT" "$backend")
+        if [[ "$(echo "$r3" | jq -r '.error')" == "false" ]]; then
+            local r3_ms r3_tps r3_tok r3_ttft
+            r3_ms=$(echo   "$r3" | jq -r '.ms')
+            r3_tps=$(echo  "$r3" | jq -r '.tok_s')
+            r3_tok=$(echo  "$r3" | jq -r '.tokens')
+            r3_ttft=$(echo "$r3" | jq -r '.ttft_ms')
+            s3_ms_v="$s3_ms_v $r3_ms"; s3_tps_v="$s3_tps_v $r3_tps"
+            s3_tok_v="$s3_tok_v $r3_tok"; s3_ttft_v="$s3_ttft_v $r3_ttft"
+            printf "\r  ${GREEN}S3 LongCtx    %6dms | TTFT %4dms | %5.1f tok/s | %4d tok${RESET}\n" \
+                "$r3_ms" "$r3_ttft" "$r3_tps" "$r3_tok"
+        else
+            printf "\r  ${RED}S3 LongCtx    FAILED${RESET}\n"
+        fi
+
+        # ── Scenario 4: Agentic (pi — real tool use, wall-time) ───────
+        printf "  ${DIM}S4 Agentic...${RESET}"
+        local r4
+        r4=$(call_pi "$pi_model" "$AGENTIC_PROMPT") || true
+        if [[ "$(echo "$r4" | jq -r '.error')" == "false" ]]; then
+            local r4_ms r4_ttft r4_tok r4_tps r4_chars r4_think r4_ans r4_turns r4_tools
+            r4_ms=$(echo    "$r4" | jq -r '.ms')
+            r4_ttft=$(echo  "$r4" | jq -r '.ttft_ms')
+            r4_tok=$(echo   "$r4" | jq -r '.tokens')
+            r4_tps=$(echo   "$r4" | jq -r '.tok_s')
+            r4_chars=$(echo "$r4" | jq -r '.chars_total')
+            r4_think=$(echo "$r4" | jq -r '.think_chars')
+            r4_ans=$(echo   "$r4" | jq -r '.answer_chars')
+            r4_turns=$(echo "$r4" | jq -r '.turns')
+            r4_tools=$(echo "$r4" | jq -r '.tool_calls')
+            s4_ms_v="$s4_ms_v $r4_ms";     s4_ttft_v="$s4_ttft_v $r4_ttft"
+            s4_tok_v="$s4_tok_v $r4_tok";   s4_tps_v="$s4_tps_v $r4_tps"
+            s4_chars_v="$s4_chars_v $r4_chars"
+            s4_think_v="$s4_think_v $r4_think"; s4_ans_v="$s4_ans_v $r4_ans"
+            s4_turns_v="$s4_turns_v $r4_turns"; s4_tools_v="$s4_tools_v $r4_tools"
+            printf "\r  ${GREEN}S4 Agentic    %6dms | TTFT %4dms | %4d tok | turns %d | tools %d | ans %d chars${RESET}\n" \
+                "$r4_ms" "$r4_ttft" "$r4_tok" "$r4_turns" "$r4_tools" "$r4_ans"
+        else
+            printf "\r  ${RED}S4 Agentic    FAILED${RESET}\n"
+            s4_ms_v="$s4_ms_v 0"; s4_ttft_v="$s4_ttft_v 0"; s4_tok_v="$s4_tok_v 0"
+            s4_tps_v="$s4_tps_v 0"; s4_chars_v="$s4_chars_v 0"
+            s4_think_v="$s4_think_v 0"; s4_ans_v="$s4_ans_v 0"
+            s4_turns_v="$s4_turns_v 0"; s4_tools_v="$s4_tools_v 0"
+        fi
+
+        printf "\n"
+    done
+
+    # ── Summary stats ─────────────────────────────────────────────────────
+    printf "${BOLD}── Summary (avg ± sd  |  CV%%) ─────────────────${RESET}\n"
+
+    _print_stats_row() {
+        local label="$1" vals_ms="$2" vals_tps="$3" vals_tok="$4" vals_ttft="$5"
+        read -r a_ms  sd_ms  _ _ cv_ms  <<< "$(_stats "$vals_ms")"
+        read -r a_tps sd_tps _ _ cv_tps <<< "$(_stats "$vals_tps")"
+        read -r a_tok sd_tok _ _ cv_tok <<< "$(_stats "$vals_tok")"
+        read -r a_ttft sd_ttft _ _ cv_ttft <<< "$(_stats "$vals_ttft")"
+        printf "  ${BOLD}%-14s${RESET}  %6.0fms ±%4.0f (CV %4.1f%%)  |  TTFT %4.0fms ±%3.0f (CV %4.1f%%)  |  %5.1f tok/s ±%4.1f  |  %4.0f tok ±%3.0f\n" \
+            "$label" \
+            "$a_ms" "$sd_ms" "$cv_ms" \
+            "$a_ttft" "$sd_ttft" "$cv_ttft" \
+            "$a_tps" "$sd_tps" \
+            "$a_tok" "$sd_tok"
+    }
+
+    _print_stats_row "S1 Simple"     "$s1_ms_v" "$s1_tps_v" "$s1_tok_v" "$s1_ttft_v"
+    _print_stats_row "S2 Complex"    "$s2_ms_v" "$s2_tps_v" "$s2_tok_v" "$s2_ttft_v"
+    _print_stats_row "S3 LongCtx"    "$s3_ms_v" "$s3_tps_v" "$s3_tok_v" "$s3_ttft_v"
+
+    # S4 special summary (wall-time focus — tok/s not comparable between backends)
+    read -r a4_ms   sd4_ms   _ _ cv4_ms   <<< "$(_stats "$s4_ms_v")"
+    read -r a4_ttft sd4_ttft _ _ cv4_ttft <<< "$(_stats "$s4_ttft_v")"
+    read -r a4_tok  sd4_tok  _ _ cv4_tok  <<< "$(_stats "$s4_tok_v")"
+    read -r a4_chars  sd4_chars  _ _ cv4_chars  <<< "$(_stats "$s4_chars_v")"
+    read -r a4_think  sd4_think  _ _ cv4_think  <<< "$(_stats "$s4_think_v")"
+    read -r a4_ans    sd4_ans    _ _ cv4_ans    <<< "$(_stats "$s4_ans_v")"
+    read -r a4_turns  sd4_turns  _ _ cv4_turns  <<< "$(_stats "$s4_turns_v")"
+    read -r a4_tools  sd4_tools  _ _ cv4_tools  <<< "$(_stats "$s4_tools_v")"
+    printf "  ${BOLD}%-14s${RESET}  %6.0fms ±%4.0f (CV %4.1f%%)  |  TTFT %4.0fms ±%3.0f (CV %4.1f%%)  |  %4.0f tok ±%3.0f  |  turns %.0f  |  tools %.0f  |  ans %4.0f±%3.0f chars\n" \
+        "S4 Agentic" \
+        "$a4_ms" "$sd4_ms" "$cv4_ms" \
+        "$a4_ttft" "$sd4_ttft" "$cv4_ttft" \
+        "$a4_tok" "$sd4_tok" \
+        "$a4_turns" \
+        "$a4_tools" \
+        "$a4_ans" "$sd4_ans"
+
+    printf "\n"
+
+    # ── Write JSON ────────────────────────────────────────────────────────
+    python3 - "$outfile" "$timestamp" "$RUNS" "$MAX_TOKENS" "$mem_after" \
+        "$s1_ms_v" "$s1_tps_v" "$s1_tok_v" "$s1_ttft_v" \
+        "$s2_ms_v" "$s2_tps_v" "$s2_tok_v" "$s2_ttft_v" \
+        "$s3_ms_v" "$s3_tps_v" "$s3_tok_v" "$s3_ttft_v" \
+        "$s4_ms_v" "$s4_ttft_v" "$s4_tok_v" "$s4_tps_v" \
+        "$s4_chars_v" "$s4_think_v" "$s4_ans_v" "$s4_turns_v" "$s4_tools_v" \
+        "$model" "$backend" <<'PYEOF'
+import sys, json, math
+
+def arr(s):
+    return [float(x) for x in s.split() if x]
+
+def stats(vals):
+    if not vals: return {"avg":0,"sd":0,"min":0,"max":0,"cv":0,"runs":[]}
+    n = len(vals); m = sum(vals)/n
+    sd = math.sqrt(sum((v-m)**2 for v in vals)/n)
+    return {"avg":round(m,2),"sd":round(sd,2),"min":min(vals),"max":max(vals),
+            "cv":round(sd/m*100,1) if m else 0,"runs":vals}
+
+(outfile, ts, runs, max_tok, mem,
+ s1_ms, s1_tps, s1_tok, s1_ttft,
+ s2_ms, s2_tps, s2_tok, s2_ttft,
+ s3_ms, s3_tps, s3_tok, s3_ttft,
+ s4_ms, s4_ttft, s4_tok, s4_tps,
+ s4_chars, s4_think, s4_ans, s4_turns, s4_tools,
+ model, backend) = sys.argv[1:]
+
+doc = {
+  "backend": backend, "model": model,
+  "timestamp": ts, "runs": int(runs),
+  "max_tokens_s1s3": int(max_tok), "memory_mb": int(mem),
   "results": {
-    "simple":  { "avg_ms": $s1_ms, "avg_tok_s": $s1_tps, "avg_tokens": $s1_tok, "avg_ttft_ms": $s1_ttft },
-    "complex": { "avg_ms": $s2_ms, "avg_tok_s": $s2_tps, "avg_tokens": $s2_tok, "avg_ttft_ms": $s2_ttft },
-    "agentic": { "avg_ms": $s3_ms, "avg_chars": $s3_chars }
+    "simple":      {"ms": stats(arr(s1_ms)),  "tok_s": stats(arr(s1_tps)),
+                    "tokens": stats(arr(s1_tok)), "ttft_ms": stats(arr(s1_ttft))},
+    "complex":     {"ms": stats(arr(s2_ms)),  "tok_s": stats(arr(s2_tps)),
+                    "tokens": stats(arr(s2_tok)), "ttft_ms": stats(arr(s2_ttft))},
+    "long_context": {"ms": stats(arr(s3_ms)),  "tok_s": stats(arr(s3_tps)),
+                     "tokens": stats(arr(s3_tok)), "ttft_ms": stats(arr(s3_ttft))},
+    "agentic":     {"ms":         stats(arr(s4_ms)),
+                    "ttft_ms":    stats(arr(s4_ttft)),
+                    "tokens":     stats(arr(s4_tok)),
+                    "tok_s":      stats(arr(s4_tps)),
+                    "chars_total":stats(arr(s4_chars)),
+                    "think_chars":stats(arr(s4_think)),
+                    "answer_chars":stats(arr(s4_ans)),
+                    "turns":      stats(arr(s4_turns)),
+                    "tool_calls": stats(arr(s4_tools))},
   }
 }
-JSONEOF
+with open(outfile, "w") as f:
+    json.dump(doc, f, indent=2)
+print(outfile)
+PYEOF
 
-    printf "\n${GREEN}Results saved → %s${RESET}\n" "$outfile"
-    rm -f "$RESULTS_DIR/.last_direct" "$RESULTS_DIR/.last_pi"
+    local saved_to
+    saved_to=$(cat /tmp/_bench_outfile 2>/dev/null || echo "$outfile")
+    printf "${GREEN}Results saved → %s${RESET}\n" "$outfile"
 }
