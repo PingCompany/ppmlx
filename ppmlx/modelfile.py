@@ -100,7 +100,7 @@ def _read_block(lines: list[str], start: int) -> tuple[str, int]:
 
 def parse_modelfile(text: str, name: str = "") -> ModelfileConfig:
     """
-    Parse an Ollama-compatible Modelfile text.
+    Parse a Modelfile text.
 
     Directives (case-insensitive):
       FROM <model>

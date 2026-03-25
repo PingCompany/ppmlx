@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ppmlx",
     version=__version__,
-    description="Ollama-style OpenAI-compatible LLM API for Apple Silicon",
+    description="OpenAI-compatible LLM API for Apple Silicon via MLX",
     lifespan=lifespan,
 )
 
@@ -201,6 +201,63 @@ def _parse_tool_call_body(body: str) -> dict | None:
     return None
 
 
+# Core tools that Codex/Claude Code always need — everything else is optional.
+_CORE_TOOL_NAMES = {
+    "exec_command", "apply_patch", "write_stdin", "update_plan",
+    "request_user_input", "view_image",
+    # Anthropic / Claude Code tools
+    "bash", "read", "edit", "write", "computer",
+}
+
+# Maximum estimated tokens for all tools combined.  Large tool lists
+# (Codex sends 66) cause extremely slow prefill on local models
+# (e.g. 50s+ for ~20k tool tokens on a 9b model), which makes
+# clients timeout.  Keeping the budget small ensures fast first-token.
+_MAX_TOOLS_TOKENS = 3000
+
+
+def _limit_tools(tools: list[dict] | None) -> list[dict] | None:
+    """Trim the tools list to keep prompt prefill fast on local models.
+
+    Prioritises core coding tools and drops MCP / agent tools first.
+    """
+    if not tools:
+        return tools
+    # Estimate tokens per tool (~4 chars per token)
+    total = sum(len(json.dumps(t)) for t in tools) // 4
+    if total <= _MAX_TOOLS_TOKENS:
+        return tools
+
+    # Filter out non-function tools (e.g. web_search with name=None)
+    # and split into core vs non-core
+    core = []
+    extra = []
+    for t in tools:
+        name = t.get("name") or t.get("function", {}).get("name", "")
+        if not name:
+            continue  # skip tools without a name
+        if name in _CORE_TOOL_NAMES:
+            core.append(t)
+        else:
+            extra.append(t)
+
+    # Start with core, add extras until budget reached
+    result = list(core)
+    budget = _MAX_TOOLS_TOKENS - sum(len(json.dumps(t)) for t in result) // 4
+    for t in extra:
+        cost = len(json.dumps(t)) // 4
+        if cost <= budget:
+            result.append(t)
+            budget -= cost
+        if budget <= 0:
+            break
+
+    log.info("_limit_tools: %d → %d tools (est %d → %d tokens)",
+             len(tools), len(result), total,
+             sum(len(json.dumps(t)) for t in result) // 4)
+    return result
+
+
 def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
     """Extract ``<tool_call>`` blocks from model output.
 
@@ -214,6 +271,50 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
             calls.append(tc)
     remaining = _TOOL_CALL_RE.sub("", text).strip()
     return remaining, calls
+
+
+def _normalize_tool_messages(messages: list[dict]) -> list[dict]:
+    """Convert OpenAI tool_calls message format to plain-text format.
+
+    Qwen's chat template doesn't understand OpenAI's ``tool_calls`` list
+    structure on assistant messages.  It expects the tool call to appear as
+    ``<tool_call>`` JSON blocks in the content string.  Similarly, ``tool``
+    role messages are not understood — they must be re-wrapped.
+
+    This function converts:
+    - assistant messages with ``tool_calls`` → content with ``<tool_call>`` blocks
+    - ``tool`` role messages → keep as-is (Qwen template maps them to
+      ``<tool_response>`` via the ``name`` field)
+    """
+    out: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        tc_list = msg.get("tool_calls")
+
+        if role == "assistant" and tc_list:
+            # Convert tool_calls list to <tool_call> text blocks
+            parts: list[str] = []
+            content = msg.get("content") or ""
+            if content:
+                parts.append(content)
+            for tc in tc_list:
+                fn = tc.get("function", tc)
+                name = fn.get("name", "")
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args_obj = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        args_obj = args
+                else:
+                    args_obj = args
+                parts.append(
+                    f'<tool_call>\n{{"name": "{name}", "arguments": {json.dumps(args_obj)}}}\n</tool_call>'
+                )
+            out.append({"role": "assistant", "content": "\n".join(parts)})
+        else:
+            out.append(msg)
+    return out
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────
@@ -342,10 +443,17 @@ async def chat_completions(request: Request):
 
     model_name = body.get("model", "")
     messages = body.get("messages", [])
-    # Normalize OpenAI "developer" role to "system" for compatibility
+    # Normalize messages for model compatibility
+    tools = _limit_tools(body.get("tools") or None)
     for msg in messages:
         if msg.get("role") == "developer":
+
             msg["role"] = "system"
+        # Ensure content is never None (breaks some chat templates)
+        if msg.get("content") is None and not msg.get("tool_calls"):
+            msg["content"] = ""
+    if tools:
+        messages = _normalize_tool_messages(messages)
     messages = _merge_system_messages(messages)
     stream = body.get("stream", False)
     temperature = body.get("temperature", 0.7)
@@ -354,7 +462,6 @@ async def chat_completions(request: Request):
     stop = body.get("stop")
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
-    tools = body.get("tools") or None
 
     try:
         from ppmlx.models import resolve_alias
@@ -660,6 +767,11 @@ async def embeddings(request: Request):
         from ppmlx.engine_embed import get_embed_engine
         engine = get_embed_engine()
         vectors = engine.encode(repo_id, texts)
+    except ImportError:
+        raise HTTPException(
+            status_code=501,
+            detail="Embeddings require the 'mlx-embeddings' package. Install with: pip install ppmlx[embeddings]",
+        )
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -763,7 +875,7 @@ async def responses(request: Request):
     # instructions field acts as a system prompt
     instructions = body.get("instructions")
 
-    tools = body.get("tools") or None
+    tools = _limit_tools(body.get("tools") or None)
     log.info("POST /v1/responses model=%s stream=%s tools=%d",
              model_name, stream, len(tools) if tools else 0)
 
@@ -800,10 +912,17 @@ async def responses(request: Request):
         )
 
 
-def _sse(event: str, data: dict) -> str:
-    # Codex requires a "type" field matching the event name in each SSE payload.
+def _sse(event: str, data: dict, seq: list[int] | None = None) -> str:
+    """Format an SSE event.
+
+    *seq* is a mutable 1-element list used as an auto-incrementing counter
+    (pass the same list across calls to get monotonic sequence numbers).
+    """
     if "type" not in data:
         data = {**data, "type": event}
+    if seq is not None:
+        data["sequence_number"] = seq[0]
+        seq[0] += 1
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
@@ -853,62 +972,166 @@ def _stream_responses(
     async def event_generator():
         log.info("responses stream start model=%s tools=%d msgs=%d",
                  model_name, len(tools) if tools else 0, len(messages))
+        seq = [0]  # mutable counter for sequence_number
 
-        # response.created
+        # Build the full response object (matches Ollama's structure)
         resp_obj = {
             "id": resp_id,
             "object": "response",
             "created_at": created,
+            "completed_at": None,
             "model": model_name,
             "status": "in_progress",
             "output": [],
             "usage": None,
+            "error": None,
+            "instructions": None,
+            "tools": tools or [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "truncation": "disabled",
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_output_tokens": max_tokens,
+            "previous_response_id": None,
+            "metadata": {},
+            "text": {"format": {"type": "text"}},
         }
-        yield _sse("response.created", resp_obj)
 
-        # Always open a text message item upfront so the client sees
-        # output_item.added immediately (prevents timeout while model loads).
-        msg_item = {
-            "type": "message",
-            "id": msg_id,
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        }
-        yield _sse("response.output_item.added", {
-            "output_index": 0,
-            "item": msg_item,
-        })
-        yield _sse("response.content_part.added", {
-            "output_index": 0,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": "", "annotations": []},
-        })
+        # response.created — wrapped in "response" key (Codex/Ollama format)
+        yield _sse("response.created", {"response": resp_obj}, seq)
+
+        # response.in_progress
+        yield _sse("response.in_progress", {"response": resp_obj}, seq)
 
         full_text = ""
+        reasoning_text = ""
         start_ts = time.time()
+        # Track output index: reasoning (if any) is at 0, message at 0 or 1
+        reasoning_idx: int | None = None
+        msg_output_idx = 0
 
         try:
             if engine_type == "text":
                 from ppmlx.engine import get_engine
                 engine = get_engine()
-                # Always stream — keeps the SSE connection alive and
-                # prevents Codex from timing out during generation.
                 gen = engine.stream_generate(
                     repo_id, messages,
                     temperature=0.7 if temperature is None else temperature,
                     top_p=1.0 if top_p is None else top_p,
                     max_tokens=4096 if max_tokens is None else max_tokens,
                     tools=tools,
+                    strip_thinking=False,  # Handle thinking in server
                 )
+
+                # Qwen3 template injects <think> into the prompt, so model
+                # output starts inside a thinking block.  Start in thinking
+                # mode and emit a reasoning output item immediately.
+                in_thinking = True
+                msg_item_emitted = False
+                buf = ""
+                reasoning_idx = 0
+                msg_output_idx = 1
+                rs_id = "rs_" + uuid.uuid4().hex[:12]
+                yield _sse("response.output_item.added", {
+                    "output_index": reasoning_idx,
+                    "item": {"id": rs_id, "type": "reasoning", "summary": []},
+                }, seq)
+
                 async for chunk in _async_iter_sync_gen(gen):
-                    full_text += chunk
-                    # Stream text deltas to keep connection alive.
-                    yield _sse("response.output_text.delta", {
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": chunk,
-                    })
+                    buf += chunk
+                    while buf:
+                        if not in_thinking:
+                            think_pos = buf.find("<think>")
+                            close_pos = buf.find("</think>")
+                            if think_pos == 0:
+                                in_thinking = True
+                                buf = buf[len("<think>"):]
+                                if reasoning_idx is None:
+                                    reasoning_idx = 0
+                                    msg_output_idx = 1
+                                    rs_id = "rs_" + uuid.uuid4().hex[:12]
+                                    yield _sse("response.output_item.added", {
+                                        "output_index": reasoning_idx,
+                                        "item": {"id": rs_id, "type": "reasoning", "summary": []},
+                                    }, seq)
+                                continue
+                            elif close_pos == 0:
+                                buf = buf[len("</think>"):]
+                                if reasoning_idx is not None:
+                                    yield _sse("response.output_item.done", {
+                                        "output_index": reasoning_idx,
+                                        "item": {"id": rs_id, "type": "reasoning",
+                                                 "summary": [{"type": "summary_text", "text": reasoning_text}]},
+                                    }, seq)
+                                continue
+                            else:
+                                # Check for partial tag
+                                partial = any(buf.endswith(t[:i])
+                                              for t in ("<think>", "</think>")
+                                              for i in range(1, len(t)))
+                                if partial:
+                                    break
+                                # Plain text — buffer it (don't stream yet).
+                                # We'll emit clean text after parsing tool calls.
+                                text_chunk = buf[:think_pos] if think_pos > 0 else buf
+                                buf = buf[len(text_chunk):]
+                                if text_chunk:
+                                    full_text += text_chunk
+                                if not buf:
+                                    break
+                        else:
+                            close_pos = buf.find("</think>")
+                            if close_pos >= 0:
+                                think_chunk = buf[:close_pos]
+                                buf = buf[close_pos + len("</think>"):]
+                                in_thinking = False
+                                if think_chunk:
+                                    reasoning_text += think_chunk
+                                    yield _sse("response.reasoning_summary_text.delta", {
+                                        "output_index": reasoning_idx,
+                                        "delta": think_chunk,
+                                    }, seq)
+                                yield _sse("response.reasoning_summary_text.done", {
+                                    "output_index": reasoning_idx,
+                                    "text": reasoning_text,
+                                }, seq)
+                                yield _sse("response.output_item.done", {
+                                    "output_index": reasoning_idx,
+                                    "item": {"id": rs_id, "type": "reasoning",
+                                             "summary": [{"type": "summary_text", "text": reasoning_text}]},
+                                }, seq)
+                                continue
+                            else:
+                                # Partial check
+                                partial_len = 0
+                                for i in range(1, len("</think>")):
+                                    if buf.endswith("</think>"[:i]):
+                                        partial_len = i
+                                        break
+                                safe = buf[:len(buf) - partial_len] if partial_len else buf
+                                buf = buf[len(safe):] if partial_len else ""
+                                if safe:
+                                    reasoning_text += safe
+                                    if reasoning_idx is None:
+                                        # Template-injected thinking
+                                        reasoning_idx = 0
+                                        msg_output_idx = 1
+                                        rs_id = "rs_" + uuid.uuid4().hex[:12]
+                                        in_thinking = True
+                                        yield _sse("response.output_item.added", {
+                                            "output_index": reasoning_idx,
+                                            "item": {"id": rs_id, "type": "reasoning", "summary": []},
+                                        }, seq)
+                                    yield _sse("response.reasoning_summary_text.delta", {
+                                        "output_index": reasoning_idx,
+                                        "delta": safe,
+                                    }, seq)
+                                break
+
+                # Flush remaining buf as text (buffered, not streamed)
+                if buf and not in_thinking:
+                    full_text += buf
             elif engine_type == "vision":
                 from ppmlx.engine_vlm import get_vision_engine
                 engine = get_vision_engine()
@@ -921,13 +1144,13 @@ def _stream_responses(
                     "output_index": 0,
                     "content_index": 0,
                     "delta": text,
-                })
+                }, seq)
         except Exception as e:
             log.exception("responses stream error")
             yield _sse("error", {
                 "type": "server_error",
                 "message": str(e),
-            })
+            }, seq)
             return
 
         gen_dur = time.time() - start_ts
@@ -938,17 +1161,33 @@ def _stream_responses(
         log.info("parsed %d tool_calls, remaining_text=%d chars",
                  len(tool_calls), len(remaining_text))
 
-        # ── Close the text message ───────────────────────────────────
+        # ── Emit text message (clean, without <tool_call> blocks) ────
+        msg_item = {
+            "type": "message", "id": msg_id,
+            "status": "in_progress", "role": "assistant", "content": [],
+        }
+        yield _sse("response.output_item.added", {
+            "output_index": msg_output_idx, "item": msg_item,
+        }, seq)
+        yield _sse("response.content_part.added", {
+            "output_index": msg_output_idx, "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        }, seq)
+        if remaining_text:
+            yield _sse("response.output_text.delta", {
+                "output_index": msg_output_idx, "content_index": 0,
+                "delta": remaining_text,
+            }, seq)
         yield _sse("response.output_text.done", {
-            "output_index": 0,
+            "output_index": msg_output_idx,
             "content_index": 0,
             "text": remaining_text,
-        })
+        }, seq)
         yield _sse("response.content_part.done", {
-            "output_index": 0,
+            "output_index": msg_output_idx,
             "content_index": 0,
             "part": {"type": "output_text", "text": remaining_text, "annotations": []},
-        })
+        }, seq)
         done_msg = {
             "type": "message",
             "id": msg_id,
@@ -957,12 +1196,21 @@ def _stream_responses(
             "content": [{"type": "output_text", "text": remaining_text, "annotations": []}],
         }
         yield _sse("response.output_item.done", {
-            "output_index": 0,
+            "output_index": msg_output_idx,
             "item": done_msg,
-        })
+        }, seq)
 
-        output_items: list[dict] = [done_msg]
-        output_idx = 1
+        output_items: list[dict] = []
+        # Include reasoning item if we emitted one
+        if reasoning_idx is not None:
+            output_items.append({
+                "type": "reasoning",
+                "id": rs_id,
+                "summary": [{"type": "summary_text", "text": reasoning_text}],
+                "encrypted_content": reasoning_text,
+            })
+        output_items.append(done_msg)
+        output_idx = msg_output_idx + 1
 
         # ── Emit function call items ─────────────────────────────────
         for tc in tool_calls:
@@ -979,20 +1227,20 @@ def _stream_responses(
             yield _sse("response.output_item.added", {
                 "output_index": output_idx,
                 "item": fc_item,
-            })
+            }, seq)
             yield _sse("response.function_call_arguments.delta", {
                 "output_index": output_idx,
                 "delta": tc["arguments"],
-            })
+            }, seq)
             yield _sse("response.function_call_arguments.done", {
                 "output_index": output_idx,
                 "arguments": tc["arguments"],
-            })
+            }, seq)
             done_fc = {**fc_item, "arguments": tc["arguments"], "status": "completed"}
             yield _sse("response.output_item.done", {
                 "output_index": output_idx,
                 "item": done_fc,
-            })
+            }, seq)
             output_items.append(done_fc)
             output_idx += 1
 
@@ -1003,12 +1251,15 @@ def _stream_responses(
             "input_tokens": prompt_tokens,
             "output_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
         }
 
         resp_obj["status"] = "completed"
+        resp_obj["completed_at"] = int(time.time())
         resp_obj["output"] = output_items
         resp_obj["usage"] = usage
-        yield _sse("response.completed", resp_obj)
+        yield _sse("response.completed", {"response": resp_obj}, seq)
         log.info("responses stream completed, %d output items", len(output_items))
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -1076,13 +1327,462 @@ async def _nonstream_responses(
         "id": resp_id,
         "object": "response",
         "created_at": created,
+        "completed_at": int(time.time()),
         "model": model_name,
         "status": "completed",
         "output": output,
+        "error": None,
+        "tools": tools or [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "truncation": "disabled",
+        "metadata": {},
         "usage": {
             "input_tokens": prompt_tokens,
             "output_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    })
+
+
+# ── Anthropic Messages API (/v1/messages) ─────────────────────────────
+#
+# Claude Code talks to this endpoint when ANTHROPIC_BASE_URL is set.
+# Format mirrors the Anthropic Messages API (not OpenAI).
+
+
+def _anthropic_sse(data: dict) -> str:
+    event_type = data.get("type", "unknown")
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API endpoint (used by Claude Code)."""
+    body = await request.json()
+    model_name = body.get("model", "")
+    messages = body.get("messages", [])
+    stream = body.get("stream", False)
+    max_tokens = body.get("max_tokens", 4096)
+    temperature = body.get("temperature", 0.7)
+    system_prompt = body.get("system")
+    tools = _limit_tools(body.get("tools") or None)
+
+    # Build chat messages
+    chat_messages: list[dict] = []
+    if system_prompt:
+        if isinstance(system_prompt, list):
+            system_prompt = "\n".join(
+                p.get("text", "") for p in system_prompt if isinstance(p, dict)
+            )
+        chat_messages.append({"role": "system", "content": system_prompt})
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        # Anthropic content can be a list of blocks
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "tool_result":
+                        # Tool results in Anthropic format
+                        tc_content = part.get("content", "")
+                        if isinstance(tc_content, list):
+                            tc_content = "\n".join(
+                                p.get("text", "") for p in tc_content
+                                if isinstance(p, dict)
+                            )
+                        chat_messages.append({"role": "user", "content": tc_content})
+                        continue
+                    elif part.get("type") == "tool_use":
+                        # Previous assistant tool call — convert
+                        chat_messages.append({
+                            "role": "assistant",
+                            "content": f'<tool_call>\n{{"name": "{part.get("name","")}", '
+                                       f'"arguments": {json.dumps(part.get("input", {}))}}}\n</tool_call>',
+                        })
+                        continue
+            if text_parts:
+                chat_messages.append({"role": role, "content": "\n".join(text_parts)})
+        else:
+            chat_messages.append({"role": role, "content": content})
+
+    chat_messages = _merge_system_messages(chat_messages)
+
+    # Convert Anthropic tools format to OpenAI format for apply_chat_template
+    oai_tools = None
+    if tools:
+        oai_tools = []
+        for t in tools:
+            oai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            })
+
+    try:
+        from ppmlx.models import resolve_alias
+        repo_id = resolve_alias(model_name)
+    except Exception:
+        repo_id = model_name
+
+    msg_id = "msg_" + uuid.uuid4().hex[:24]
+
+    if stream:
+        return _stream_anthropic(
+            msg_id, model_name, repo_id, chat_messages,
+            temperature, max_tokens, oai_tools, tools,
+        )
+    else:
+        return await _nonstream_anthropic(
+            msg_id, model_name, repo_id, chat_messages,
+            temperature, max_tokens, oai_tools, tools,
+        )
+
+
+def _stream_anthropic(
+    msg_id, model_name, repo_id, messages,
+    temperature, max_tokens, oai_tools, orig_tools,
+):
+    from fastapi.responses import StreamingResponse
+
+    async def event_generator():
+        # message_start
+        yield _anthropic_sse({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model_name,
+                "content": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+
+        full_text = ""
+        content_idx = 0
+
+        # State machine: track whether we're inside <think> or in text.
+        # We use strip_thinking=False so we get raw tokens including
+        # <think>...</think>, then emit them as thinking_delta / text_delta.
+        # Start in thinking mode — Qwen3 template injects <think> into
+        # the prompt so the model starts generating inside a thinking block.
+        in_thinking = True
+        thinking_started = True
+        text_started = False
+        buf = ""
+
+        try:
+            from ppmlx.engine import get_engine
+            engine = get_engine()
+            gen = engine.stream_generate(
+                repo_id, messages,
+                temperature=0.7 if temperature is None else temperature,
+                max_tokens=4096 if max_tokens is None else max_tokens,
+                tools=oai_tools,
+                strip_thinking=False,  # We handle thinking/text separation here
+            )
+
+            # Emit thinking block start immediately
+            yield _anthropic_sse({
+                "type": "content_block_start",
+                "index": content_idx,
+                "content_block": {"type": "thinking", "thinking": ""},
+            })
+
+            async for chunk in _async_iter_sync_gen(gen):
+                buf += chunk
+
+                # Detect transitions between thinking and text
+                while buf:
+                    if not in_thinking:
+                        # Look for <think> to start thinking block
+                        think_pos = buf.find("<think>")
+                        close_pos = buf.find("</think>")
+
+                        if think_pos == 0:
+                            # Start thinking block
+                            in_thinking = True
+                            buf = buf[len("<think>"):]
+                            if not thinking_started:
+                                thinking_started = True
+                                yield _anthropic_sse({
+                                    "type": "content_block_start",
+                                    "index": content_idx,
+                                    "content_block": {"type": "thinking", "thinking": ""},
+                                })
+                            continue
+                        elif close_pos == 0:
+                            # Closing tag without opening — template injected
+                            # <think> into prompt, so we started inside thinking
+                            buf = buf[len("</think>"):]
+                            if thinking_started:
+                                yield _anthropic_sse({
+                                    "type": "content_block_stop",
+                                    "index": content_idx,
+                                })
+                                content_idx += 1
+                                thinking_started = False
+                            continue
+                        elif think_pos > 0:
+                            # Text before <think>
+                            text_chunk = buf[:think_pos]
+                            buf = buf[think_pos:]
+                            if text_chunk.strip():
+                                if not text_started:
+                                    text_started = True
+                                    yield _anthropic_sse({
+                                        "type": "content_block_start",
+                                        "index": content_idx,
+                                        "content_block": {"type": "text", "text": ""},
+                                    })
+                                full_text += text_chunk
+                                yield _anthropic_sse({
+                                    "type": "content_block_delta",
+                                    "index": content_idx,
+                                    "delta": {"type": "text_delta", "text": text_chunk},
+                                })
+                            continue
+                        else:
+                            # No tag found — might be partial tag at end of buf
+                            # Check for partial "<thi" or "</thi" at end
+                            partial = False
+                            for tag in ("<think>", "</think>"):
+                                for i in range(1, len(tag)):
+                                    if buf.endswith(tag[:i]):
+                                        partial = True
+                                        break
+                                if partial:
+                                    break
+                            if partial:
+                                break  # Wait for more data
+
+                            # Plain text, no partial tags
+                            text_chunk = buf
+                            buf = ""
+                            if text_chunk:
+                                if not text_started:
+                                    text_started = True
+                                    yield _anthropic_sse({
+                                        "type": "content_block_start",
+                                        "index": content_idx,
+                                        "content_block": {"type": "text", "text": ""},
+                                    })
+                                full_text += text_chunk
+                                yield _anthropic_sse({
+                                    "type": "content_block_delta",
+                                    "index": content_idx,
+                                    "delta": {"type": "text_delta", "text": text_chunk},
+                                })
+                            break
+                    else:
+                        # Inside thinking block — look for </think>
+                        close_pos = buf.find("</think>")
+                        if close_pos >= 0:
+                            think_chunk = buf[:close_pos]
+                            buf = buf[close_pos + len("</think>"):]
+                            in_thinking = False
+                            if think_chunk:
+                                yield _anthropic_sse({
+                                    "type": "content_block_delta",
+                                    "index": content_idx,
+                                    "delta": {"type": "thinking_delta", "thinking": think_chunk},
+                                })
+                            yield _anthropic_sse({
+                                "type": "content_block_stop",
+                                "index": content_idx,
+                            })
+                            content_idx += 1
+                            thinking_started = False
+                            continue
+                        else:
+                            # Check for partial "</thi" at end
+                            partial = False
+                            for i in range(1, len("</think>")):
+                                if buf.endswith("</think>"[:i]):
+                                    partial = True
+                                    break
+                            if partial:
+                                # Emit everything except the partial tag
+                                safe = buf[:len(buf) - i]
+                                buf = buf[len(buf) - i:]
+                            else:
+                                safe = buf
+                                buf = ""
+                            if safe:
+                                if not thinking_started:
+                                    # Template injected <think>, we start mid-think
+                                    thinking_started = True
+                                    in_thinking = True
+                                    yield _anthropic_sse({
+                                        "type": "content_block_start",
+                                        "index": content_idx,
+                                        "content_block": {"type": "thinking", "thinking": ""},
+                                    })
+                                yield _anthropic_sse({
+                                    "type": "content_block_delta",
+                                    "index": content_idx,
+                                    "delta": {"type": "thinking_delta", "thinking": safe},
+                                })
+                            break
+
+            # Flush remaining buffer
+            if buf:
+                if in_thinking or thinking_started:
+                    if buf.strip():
+                        yield _anthropic_sse({
+                            "type": "content_block_delta",
+                            "index": content_idx,
+                            "delta": {"type": "thinking_delta", "thinking": buf},
+                        })
+                    yield _anthropic_sse({"type": "content_block_stop", "index": content_idx})
+                    content_idx += 1
+                else:
+                    if not text_started:
+                        text_started = True
+                        yield _anthropic_sse({
+                            "type": "content_block_start",
+                            "index": content_idx,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    full_text += buf
+                    yield _anthropic_sse({
+                        "type": "content_block_delta",
+                        "index": content_idx,
+                        "delta": {"type": "text_delta", "text": buf},
+                    })
+            elif thinking_started:
+                yield _anthropic_sse({"type": "content_block_stop", "index": content_idx})
+                content_idx += 1
+
+            # Close text block if open
+            if text_started:
+                yield _anthropic_sse({"type": "content_block_stop", "index": content_idx})
+                content_idx += 1
+
+        except Exception as e:
+            yield _anthropic_sse({
+                "type": "error",
+                "error": {"type": "server_error", "message": str(e)},
+            })
+            return
+
+        # Parse tool calls from the collected text output
+        remaining_text, tool_calls = _parse_tool_calls(full_text)
+
+        # Emit tool_use blocks
+        stop_reason = "end_turn"
+        if tool_calls:
+            stop_reason = "tool_use"
+            for tc in tool_calls:
+                tc_id = "toolu_" + uuid.uuid4().hex[:24]
+                try:
+                    args_obj = json.loads(tc["arguments"])
+                except (json.JSONDecodeError, ValueError):
+                    args_obj = tc["arguments"]
+                yield _anthropic_sse({
+                    "type": "content_block_start",
+                    "index": content_idx,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc_id,
+                        "name": tc["name"],
+                        "input": {},
+                    },
+                })
+                yield _anthropic_sse({
+                    "type": "content_block_delta",
+                    "index": content_idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(args_obj),
+                    },
+                })
+                yield _anthropic_sse({
+                    "type": "content_block_stop",
+                    "index": content_idx,
+                })
+                content_idx += 1
+
+        prompt_tokens = sum(
+            len(m.get("content", "").split()) for m in messages
+            if isinstance(m.get("content"), str)
+        )
+        completion_tokens = len(full_text.split())
+
+        yield _anthropic_sse({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
+        })
+        yield _anthropic_sse({"type": "message_stop"})
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+async def _nonstream_anthropic(
+    msg_id, model_name, repo_id, messages,
+    temperature, max_tokens, oai_tools, orig_tools,
+):
+    try:
+        from ppmlx.engine import get_engine
+        engine = get_engine()
+        text, reasoning, prompt_tokens, completion_tokens = engine.generate(
+            repo_id, messages,
+            temperature=0.7 if temperature is None else temperature,
+            max_tokens=4096 if max_tokens is None else max_tokens,
+            tools=oai_tools,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    remaining_text, tool_calls = _parse_tool_calls(text)
+
+    content: list[dict] = []
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
+    if remaining_text:
+        content.append({"type": "text", "text": remaining_text})
+
+    stop_reason = "end_turn"
+    for tc in tool_calls:
+        stop_reason = "tool_use"
+        try:
+            args_obj = json.loads(tc["arguments"])
+        except (json.JSONDecodeError, ValueError):
+            args_obj = tc["arguments"]
+        content.append({
+            "type": "tool_use",
+            "id": "toolu_" + uuid.uuid4().hex[:24],
+            "name": tc["name"],
+            "input": args_obj,
+        })
+
+    if not content:
+        content.append({"type": "text", "text": text})
+
+    return JSONResponse({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model_name,
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
         },
     })
 

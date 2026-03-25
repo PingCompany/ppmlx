@@ -313,7 +313,7 @@ def _visible_rows(rows: list[_PickerRow], ft: str) -> list[_PickerRow]:
 
 
 def _launch_tui(local_models: list, available_aliases: dict) -> tuple[str | None, str | None]:
-    """Two-screen Ollama-style TUI. Returns (action_key, model_alias) or (None, None)."""
+    """Two-screen TUI launcher. Returns (action_key, model_alias) or (None, None)."""
     import curses
     from ppmlx import __version__
 
@@ -611,8 +611,11 @@ def _launch_coding_tool(action: str, model: str, host: str, port: int) -> None:
     env = os.environ.copy()
 
     if action == "claude":
-        cmd = ["claude"]
-        env["ANTHROPIC_BASE_URL"] = base_url
+        # Claude Code uses Anthropic Messages API (/v1/messages).
+        # Point ANTHROPIC_BASE_URL to our server which implements it.
+        base = f"http://{host}:{port}"
+        cmd = ["claude", "--model", model]
+        env["ANTHROPIC_BASE_URL"] = base
         env["ANTHROPIC_API_KEY"] = "local"
     elif action == "codex":
         cmd = [
@@ -677,7 +680,7 @@ def _launch_coding_tool(action: str, model: str, host: str, port: int) -> None:
 
 
 def _model_selector_tui(local_models: list) -> str | None:
-    """Ollama-style interactive model selector. Returns alias, None (lazy load), or 'CANCELLED'."""
+    """Interactive model selector. Returns alias, None (lazy load), or 'CANCELLED'."""
     import curses
     from ppmlx import __version__
 
