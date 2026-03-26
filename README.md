@@ -37,15 +37,17 @@ print(response.choices[0].message.content)
 
 ## Commands
 
-```
-ppmlx launch           Interactive launcher (pick action + model)
-ppmlx pull <model>     Download a model
-ppmlx run <model>      Interactive chat
-ppmlx serve            Start API server
-ppmlx list             Show downloaded models
-ppmlx rm <model>       Remove a model
-ppmlx ps               Show loaded models & memory
-```
+| Command | Description | Key Options |
+|---|---|---|
+| `ppmlx launch` | Interactive launcher (pick action + model) | `-m model`, `--host`, `--port`, `--flush` |
+| `ppmlx serve` | Start API server on :6767 | `-m model`, `--embed-model`, `-i`, `--no-cors` |
+| `ppmlx run <model>` | Interactive chat REPL | `-s system`, `-t temp`, `--max-tokens` |
+| `ppmlx pull [model]` | Download model (multiselect if no arg) | `--token` |
+| `ppmlx list` | Show downloaded models | `-a` all (incl. registry), `--path` |
+| `ppmlx rm <model>` | Remove a model | `-f` skip confirmation |
+| `ppmlx ps` | Show loaded models & memory | |
+| `ppmlx quantize <model>` | Convert & quantize HF model to MLX | `-b bits`, `--group-size`, `-o output` |
+| `ppmlx config` | View/set configuration | `--hf-token` |
 
 ## Connect Your Tools
 

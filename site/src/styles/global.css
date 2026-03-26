@@ -73,7 +73,7 @@ body::before {
   letter-spacing: -0.02em; margin-bottom: 16px;
 }
 .section-sub {
-  font-size: 17px; color: var(--text-secondary); max-width: 540px;
+  font-size: 17px; color: var(--text-secondary);
   font-weight: 300; line-height: 1.6;
 }
 
