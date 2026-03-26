@@ -75,12 +75,15 @@ curl http://localhost:6767/v1/embeddings \
 ## Key CLI Commands
 
 ```bash
+ppmlx launch          # Interactive TUI launcher (action + model picker)
 ppmlx pull <model>    # Download a model
 ppmlx run <model>     # Interactive chat REPL
 ppmlx serve           # Start API server
 ppmlx list            # List local models
 ppmlx ps              # Show loaded models + memory usage
 ppmlx rm <model>      # Remove a model
+ppmlx config          # View/set configuration
+ppmlx quantize        # Convert & quantize a model to MLX format
 ```
 
 ## Config

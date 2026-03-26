@@ -150,55 +150,96 @@ def _merge_system_messages(messages: list[dict]) -> list[dict]:
 
 # ── Tool-call parsing ───────────────────────────────────────────────────
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-
-# JSON format: <tool_call>{"name": "fn", "arguments": {...}}</tool_call>
+_TOOL_CALL_FALLBACK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _TC_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-# XML-like format: <function=name>\n<parameter=key>\nvalue\n</parameter>\n</function>
-_TC_XML_FUNC_RE = re.compile(
-    r"<function=(\w+)>(.*?)</function>", re.DOTALL
-)
-_TC_XML_PARAM_RE = re.compile(
-    r"<parameter=(\w+)>(.*?)</parameter>", re.DOTALL
-)
+def _parse_tool_calls(
+    text: str, tokenizer: Any = None, tools: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
+    """Extract tool-call blocks from model output.
 
+    When *tokenizer* has ``has_tool_calling`` (set by mlx_lm), the
+    model-specific parser is used — covers Qwen, GLM-4.7, Mistral,
+    Llama, Phi, DeepSeek, Gemma, and others automatically.
 
-def _parse_tool_call_body(body: str) -> dict | None:
-    """Parse the content inside a ``<tool_call>`` block.
+    Falls back to basic ``<tool_call>`` JSON regex otherwise.
 
-    Supports two formats:
-    1. JSON: ``{"name": "fn", "arguments": {"key": "val"}}``
-    2. XML-like (Qwen3.5): ``<function=fn><parameter=k>v</parameter></function>``
+    Returns *(remaining_text, tool_calls)* where each tool call is
+    ``{"name": "...", "arguments": "..."}`` (arguments as a JSON string).
     """
-    body = body.strip()
+    if tokenizer is not None and getattr(tokenizer, "has_tool_calling", False):
+        return _parse_tool_calls_mlx(text, tokenizer, tools)
+    return _parse_tool_calls_fallback(text)
 
-    # Try JSON first
-    jm = _TC_JSON_RE.search(body)
-    if jm:
+
+def _parse_tool_calls_mlx(
+    text: str, tokenizer: Any, tools: list[dict] | None,
+) -> tuple[str, list[dict]]:
+    """Parse tool calls using mlx_lm's model-specific parser."""
+    start_tag = tokenizer.tool_call_start
+    end_tag = tokenizer.tool_call_end
+    parser = tokenizer.tool_parser
+
+    calls: list[dict] = []
+    remaining_parts: list[str] = []
+    rest = text
+
+    while True:
+        s_idx = rest.find(start_tag)
+        if s_idx == -1:
+            remaining_parts.append(rest)
+            break
+        remaining_parts.append(rest[:s_idx])
+        after_start = rest[s_idx + len(start_tag):]
+
+        if end_tag:
+            e_idx = after_start.find(end_tag)
+            if e_idx == -1:
+                body = after_start
+                rest = ""
+            else:
+                body = after_start[:e_idx]
+                rest = after_start[e_idx + len(end_tag):]
+        else:
+            body = after_start
+            rest = ""
+
         try:
-            data = json.loads(jm.group(0))
-            name = data.get("name", "")
-            args = data.get("arguments", data.get("parameters", {}))
-            if isinstance(args, dict):
-                args = json.dumps(args)
-            elif not isinstance(args, str):
-                args = json.dumps(args)
-            return {"name": name, "arguments": args}
-        except (json.JSONDecodeError, ValueError):
-            pass
+            result = parser(body.strip(), tools=tools)
+            if result:
+                name = result.get("name", "").strip()
+                args = result.get("arguments", {})
+                if isinstance(args, dict):
+                    args = json.dumps(args)
+                elif not isinstance(args, str):
+                    args = json.dumps(args)
+                calls.append({"name": name, "arguments": args})
+        except Exception:
+            remaining_parts.append(start_tag + body + (end_tag or ""))
 
-    # Try XML-like format
-    fm = _TC_XML_FUNC_RE.search(body)
-    if fm:
-        name = fm.group(1)
-        func_body = fm.group(2)
-        params = {}
-        for pm in _TC_XML_PARAM_RE.finditer(func_body):
-            params[pm.group(1)] = pm.group(2).strip()
-        return {"name": name, "arguments": json.dumps(params)}
+    return "".join(remaining_parts).strip(), calls
 
-    return None
+
+def _parse_tool_calls_fallback(text: str) -> tuple[str, list[dict]]:
+    """Fallback: extract ``<tool_call>`` JSON blocks (Qwen/Hermes style)."""
+    calls: list[dict] = []
+    for m in _TOOL_CALL_FALLBACK_RE.finditer(text):
+        body = m.group(1).strip()
+        jm = _TC_JSON_RE.search(body)
+        if jm:
+            try:
+                data = json.loads(jm.group(0))
+                name = data.get("name", "")
+                args = data.get("arguments", data.get("parameters", {}))
+                if isinstance(args, dict):
+                    args = json.dumps(args)
+                elif not isinstance(args, str):
+                    args = json.dumps(args)
+                calls.append({"name": name, "arguments": args})
+            except (json.JSONDecodeError, ValueError):
+                pass
+    remaining = _TOOL_CALL_FALLBACK_RE.sub("", text).strip()
+    return remaining, calls
 
 
 # Core tools that Codex/Claude Code always need — everything else is optional.
@@ -256,21 +297,6 @@ def _limit_tools(tools: list[dict] | None) -> list[dict] | None:
              len(tools), len(result), total,
              sum(len(json.dumps(t)) for t in result) // 4)
     return result
-
-
-def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """Extract ``<tool_call>`` blocks from model output.
-
-    Returns *(remaining_text, tool_calls)* where each tool call is
-    ``{"name": "...", "arguments": "..."}`` (arguments as a JSON string).
-    """
-    calls: list[dict] = []
-    for m in _TOOL_CALL_RE.finditer(text):
-        tc = _parse_tool_call_body(m.group(1))
-        if tc:
-            calls.append(tc)
-    remaining = _TOOL_CALL_RE.sub("", text).strip()
-    return remaining, calls
 
 
 def _normalize_tool_messages(messages: list[dict]) -> list[dict]:
@@ -553,7 +579,8 @@ def _stream_chat(
             yield f"data: {json.dumps(err)}\n\n"
 
         # Parse tool calls if tools were provided
-        _, tool_calls = _parse_tool_calls(full_text) if tools else ("", [])
+        tokenizer = engine.get_tokenizer(repo_id)
+        _, tool_calls = _parse_tool_calls(full_text, tokenizer=tokenizer, tools=tools) if tools else ("", [])
 
         if tool_calls:
             # Emit tool_calls in streaming format
@@ -650,7 +677,8 @@ async def _nonstream_chat(
     total_dur = (time.time() - start_ts) * 1000
 
     # Parse tool calls if tools were provided
-    remaining_text, tool_calls = _parse_tool_calls(text) if tools else (text, [])
+    tokenizer = engine.get_tokenizer(repo_id)
+    remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=tools) if tools else (text, [])
 
     message: dict = {"role": "assistant", "content": remaining_text or None}
     if reasoning:
@@ -1157,7 +1185,8 @@ def _stream_responses(
         log.info("responses generation done in %.1fs, %d chars", gen_dur, len(full_text))
 
         # Parse tool calls from the model output
-        remaining_text, tool_calls = _parse_tool_calls(full_text)
+        tokenizer = engine.get_tokenizer(repo_id)
+        remaining_text, tool_calls = _parse_tool_calls(full_text, tokenizer=tokenizer, tools=tools)
         log.info("parsed %d tool_calls, remaining_text=%d chars",
                  len(tool_calls), len(remaining_text))
 
@@ -1293,7 +1322,8 @@ async def _nonstream_responses(
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    remaining_text, tool_calls = _parse_tool_calls(text)
+    tokenizer = engine.get_tokenizer(repo_id)
+    remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=tools)
 
     output: list[dict] = []
     if remaining_text:
@@ -1677,7 +1707,8 @@ def _stream_anthropic(
             return
 
         # Parse tool calls from the collected text output
-        remaining_text, tool_calls = _parse_tool_calls(full_text)
+        tokenizer = engine.get_tokenizer(repo_id)
+        remaining_text, tool_calls = _parse_tool_calls(full_text, tokenizer=tokenizer, tools=oai_tools)
 
         # Emit tool_use blocks
         stop_reason = "end_turn"
@@ -1748,7 +1779,8 @@ async def _nonstream_anthropic(
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    remaining_text, tool_calls = _parse_tool_calls(text)
+    tokenizer = engine.get_tokenizer(repo_id)
+    remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=oai_tools)
 
     content: list[dict] = []
     if reasoning:
@@ -1886,7 +1918,8 @@ async def responses_ws(websocket: WebSocket):
                 })
                 continue
 
-            remaining_text, tool_calls = _parse_tool_calls(full_text)
+            tokenizer = engine.get_tokenizer(repo_id)
+            remaining_text, tool_calls = _parse_tool_calls(full_text, tokenizer=tokenizer, tools=tools if tools else None)
             output_items: list[dict] = []
             output_idx = 0
 

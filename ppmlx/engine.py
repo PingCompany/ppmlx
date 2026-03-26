@@ -218,6 +218,14 @@ class TextEngine:
             kwargs["sampler"] = sampler
         if seed is not None:
             kwargs["seed"] = seed
+        if repetition_penalty is not None and repetition_penalty != 1.0:
+            try:
+                from mlx_lm.sample_utils import make_logits_processors
+                kwargs["logits_processors"] = make_logits_processors(
+                    repetition_penalty=repetition_penalty,
+                )
+            except (ImportError, TypeError):
+                pass
 
         text = mlx_generate(lm.model, lm.tokenizer, **kwargs)
 
@@ -277,6 +285,14 @@ class TextEngine:
             kwargs["sampler"] = sampler
         if seed is not None:
             kwargs["seed"] = seed
+        if repetition_penalty is not None and repetition_penalty != 1.0:
+            try:
+                from mlx_lm.sample_utils import make_logits_processors
+                kwargs["logits_processors"] = make_logits_processors(
+                    repetition_penalty=repetition_penalty,
+                )
+            except (ImportError, TypeError):
+                pass
 
         if not strip_thinking:
             for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
@@ -369,6 +385,10 @@ class TextEngine:
         # Flush any remaining buffer outside think blocks
         if buf and not inside_think:
             yield buf
+
+    def get_tokenizer(self, repo_id: str) -> Any:
+        """Return the tokenizer for a model (loads if needed)."""
+        return self._get_or_load(repo_id).tokenizer
 
     def unload(self, repo_id: str) -> bool:
         """Unload a specific model from cache. Returns True if it was loaded."""

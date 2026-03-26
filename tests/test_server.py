@@ -17,6 +17,10 @@ mock_engine = MagicMock()
 mock_engine.generate.return_value = ("Hello!", None, 10, 5)
 mock_engine.stream_generate.return_value = iter(["Hello", " ", "world"])
 mock_engine.list_loaded.return_value = []
+# Mock tokenizer without tool calling so fallback parsing is used
+mock_tokenizer = MagicMock()
+mock_tokenizer.has_tool_calling = False
+mock_engine.get_tokenizer.return_value = mock_tokenizer
 sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
 
 # Set up mock embed engine
@@ -232,18 +236,10 @@ def test_parse_tool_calls_no_calls():
     assert calls == []
 
 
-def test_parse_tool_calls_xml_format():
-    """Qwen3.5 uses XML-like format inside <tool_call> blocks."""
+def test_parse_tool_calls_fallback_json():
+    """Fallback parser handles JSON inside <tool_call> blocks."""
     from ppmlx.server import _parse_tool_calls
-    text = (
-        '<tool_call>\n'
-        '<function=exec_command>\n'
-        '<parameter=cmd>\n'
-        'ls -la\n'
-        '</parameter>\n'
-        '</function>\n'
-        '</tool_call>'
-    )
+    text = '<tool_call>\n{"name": "exec_command", "arguments": {"cmd": "ls -la"}}\n</tool_call>'
     remaining, calls = _parse_tool_calls(text)
     assert remaining == ""
     assert len(calls) == 1
@@ -253,15 +249,12 @@ def test_parse_tool_calls_xml_format():
     assert args["cmd"] == "ls -la"
 
 
-def test_parse_tool_calls_xml_with_text():
+def test_parse_tool_calls_fallback_with_text():
+    """Fallback parser preserves surrounding text."""
     from ppmlx.server import _parse_tool_calls
     text = (
         'Let me check.\n\n'
-        '<tool_call>\n'
-        '<function=exec_command>\n'
-        '<parameter=cmd>\npwd\n</parameter>\n'
-        '</function>\n'
-        '</tool_call>'
+        '<tool_call>\n{"name": "exec_command", "arguments": {"cmd": "pwd"}}\n</tool_call>'
     )
     remaining, calls = _parse_tool_calls(text)
     assert "Let me check" in remaining

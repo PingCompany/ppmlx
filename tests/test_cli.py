@@ -1,11 +1,10 @@
 import sys
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import MagicMock
 from typer.testing import CliRunner
 
 # Mock all ppmlx modules before importing cli
 for mod_name in ["ppmlx.models", "ppmlx.engine", "ppmlx.db",
-                  "ppmlx.config", "ppmlx.memory", "ppmlx.modelfile",
+                  "ppmlx.config", "ppmlx.memory",
                   "ppmlx.quantize", "ppmlx.engine_embed", "ppmlx.engine_vlm",
                   "ppmlx.registry"]:
     if mod_name not in sys.modules:
@@ -17,10 +16,10 @@ runner = CliRunner()
 
 
 def test_version():
-    """--version returns 0.1.0 and exits 0."""
+    """--version returns 0.2.0 and exits 0."""
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert "0.2.0" in result.output
 
 
 def test_help():
@@ -52,20 +51,6 @@ def _setup_model_mocks(
     sys.modules["ppmlx.models"].list_local_models = MagicMock(return_value=local_models)
     sys.modules["ppmlx.models"].load_favorites = MagicMock(return_value=favorites)
     sys.modules["ppmlx.registry"].registry_entries = MagicMock(return_value={})
-
-
-def test_aliases_command():
-    """aliases command renders a table with alias/repo columns."""
-    _setup_model_mocks(defaults={
-        "llama3": "mlx-community/Meta-Llama-3-8B-Instruct-4bit",
-        "mistral": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
-    })
-
-    result = runner.invoke(app, ["aliases"])
-    assert result.exit_code == 0
-    assert "llama3" in result.output
-    assert "mistral" in result.output
-    assert "built-in" in result.output
 
 
 def test_list_command_empty():
@@ -133,26 +118,6 @@ def test_rm_with_force():
     result = runner.invoke(app, ["rm", "some-model", "--force"])
     assert result.exit_code == 0
     sys.modules["ppmlx.models"].remove_model.assert_called_once_with("some-model")
-
-
-def test_add_alias():
-    """alias command calls save_user_alias with correct (name, repo) args."""
-    sys.modules["ppmlx.models"].save_user_alias = MagicMock()
-
-    result = runner.invoke(app, ["alias", "my-model", "org/my-hf-model"])
-    assert result.exit_code == 0
-    sys.modules["ppmlx.models"].save_user_alias.assert_called_once_with("my-model", "org/my-hf-model")
-
-
-def test_logs_command():
-    """logs command shows 'No log entries' when database is empty."""
-    mock_db = MagicMock()
-    mock_db.query_requests.return_value = []
-    sys.modules["ppmlx.db"].get_db = MagicMock(return_value=mock_db)
-
-    result = runner.invoke(app, ["logs"])
-    assert result.exit_code == 0
-    assert "No log entries" in result.output
 
 
 def test_serve_help():

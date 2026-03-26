@@ -1,0 +1,255 @@
+---
+import { scenarios, models, MAX_TOK_S, MAX_WALL_S } from "../data/benchmarks";
+---
+
+<section class="bench-section" id="benchmarks">
+  <div class="container container--wide">
+    <div class="section-label reveal">Benchmarks</div>
+    <h2 class="section-title reveal reveal-delay-1">Numbers don't lie</h2>
+    <p class="section-sub reveal reveal-delay-2" style="margin-bottom:40px">
+      MacBook Pro M4 Pro, 48 GB. Same prompts, 3 runs averaged. All models 4-bit quantized.
+    </p>
+
+    <div class="reveal reveal-delay-3 bench-card">
+      <div class="bench-tabs" role="tablist">
+        {scenarios.map((s, i) => (
+          <button
+            class:list={["bench-tab", { active: i === 0 }]}
+            data-scenario={s.id}
+            role="tab"
+          >
+            {s.name}
+          </button>
+        ))}
+      </div>
+
+      <div id="bench-scenario-desc" class="bench-scenario-desc"></div>
+      <div id="bench-interactive" class="bench-chart-wrap"></div>
+
+      <div class="bench-legend">
+        <span><span class="bench-legend-dot ppmlx"></span>ppmlx (MLX native)</span>
+        <span><span class="bench-legend-dot ollama"></span>Ollama (GGUF)</span>
+      </div>
+
+      <div class="bench-metrics">
+        <div class="bench-metrics-label">Time To First Token</div>
+        <div id="bench-ttft-grid" class="bench-ttft-grid"></div>
+      </div>
+    </div>
+
+    <div class="bench-meta reveal">
+      <span>MacBook Pro M4 Pro &middot; 48 GB</span><span class="sep">|</span>
+      <span>3 runs averaged &middot; &pm; std dev</span><span class="sep">|</span>
+      <a href="https://github.com/PingCompany/ppmlx/tree/main/scripts" target="_blank" rel="noopener">Reproduce &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<script define:vars={{ scenarios, models, MAX_TOK_S, MAX_WALL_S }}>
+  const wrap = document.getElementById("bench-interactive");
+  const descEl = document.getElementById("bench-scenario-desc");
+  if (!wrap) throw new Error("bench-interactive not found");
+
+  let currentScenario = scenarios[0].id;
+
+  function pctTok(v) { return Math.round((v / MAX_TOK_S) * 100); }
+  function pctWall(v) { return Math.round((v / MAX_WALL_S) * 100); }
+
+  function render(scenarioId, animate) {
+    const scenario = scenarios.find((s) => s.id === scenarioId);
+    if (!scenario) return;
+
+    if (descEl) descEl.textContent = scenario.desc;
+
+    const isWall = scenario.metric === "wall_ms";
+    const unit = isWall ? "s" : " tok/s";
+
+    let html = "";
+    models.forEach((model) => {
+      const r = scenario.models[model.id];
+      if (!r) return;
+      const pw = isWall ? pctWall(r.ppmlx) : pctTok(r.ppmlx);
+      const ow = isWall ? pctWall(r.ollama) : pctTok(r.ollama);
+      const pLabel = r.ppmlx.toFixed(1) + (isWall ? "" : " \u00b1" + r.psd.toFixed(1)) + unit;
+      const oLabel = r.ollama.toFixed(1) + (isWall ? "" : " \u00b1" + r.osd.toFixed(1)) + unit;
+      html +=
+        '<div class="bench-row">' +
+          '<div class="bench-row-label">' + model.shortLabel + "</div>" +
+          '<div class="bench-bars">' +
+            '<div class="bench-bar-track">' +
+              '<div class="bench-bar-fill ppmlx" style="width:' + (animate ? "0%" : pw + "%") + '" data-w="' + pw + '"></div>' +
+              '<span class="bench-bar-val ppmlx' + (animate ? "" : " show") + '">' + pLabel + "</span>" +
+            "</div>" +
+            '<div class="bench-bar-track">' +
+              '<div class="bench-bar-fill ollama" style="width:' + (animate ? "0%" : ow + "%") + '" data-w="' + ow + '"></div>' +
+              '<span class="bench-bar-val ollama' + (animate ? "" : " show") + '">' + oLabel + "</span>" +
+            "</div>" +
+          "</div>" +
+          '<div class="bench-delta' + (animate ? "" : " show") + '">' + r.delta + "</div>" +
+        "</div>";
+    });
+
+    if (isWall) {
+      html += '<div class="bench-axis"><div></div><div class="bench-axis-labels">' +
+        '<span>0</span><span>25s</span><span>50s</span><span>100s</span></div><div></div></div>' +
+        '<div class="bench-wall-note">\u2190 shorter is better</div>';
+    } else {
+      html += '<div class="bench-axis"><div></div><div class="bench-axis-labels">' +
+        "<span>0</span><span>20</span><span>40</span><span>60 tok/s</span></div><div></div></div>";
+    }
+    wrap.innerHTML = html;
+
+    if (animate) {
+      setTimeout(() => {
+        wrap.querySelectorAll(".bench-bar-fill").forEach((bar, i) => {
+          setTimeout(() => { bar.style.width = bar.dataset.w + "%"; }, 80 + i * 80);
+        });
+      }, 50);
+      setTimeout(() => {
+        wrap.querySelectorAll(".bench-bar-val, .bench-delta").forEach((el) => el.classList.add("show"));
+      }, 1000);
+    }
+
+    // TTFT grid — hide for agentic
+    const ttftSection = document.querySelector(".bench-metrics");
+    const grid = document.getElementById("bench-ttft-grid");
+    if (ttftSection) ttftSection.style.display = isWall ? "none" : "";
+    if (grid && !isWall) {
+      grid.innerHTML = models.map((model) => {
+        const r = scenario.models[model.id];
+        if (!r) return "";
+        const pv = typeof r.ttft_ppmlx === "number" ? r.ttft_ppmlx + "ms" : String(r.ttft_ppmlx);
+        const ov = typeof r.ttft_ollama === "number" ? r.ttft_ollama + "ms" : String(r.ttft_ollama);
+        return '<div class="bench-ttft-item">' +
+          '<span class="bench-ttft-model">' + model.shortLabel + "</span>" +
+          '<span class="bench-ttft-values">' +
+            '<span class="ppmlx-val">' + pv + "</span>" +
+            '<span class="vs">vs</span>' +
+            '<span class="ollama-val">' + ov + "</span>" +
+          "</span></div>";
+      }).join("");
+    }
+  }
+
+  document.querySelectorAll(".bench-tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".bench-tab").forEach((t) => t.classList.remove("active"));
+      tab.classList.add("active");
+      currentScenario = tab.dataset.scenario;
+      render(currentScenario, true);
+    });
+  });
+
+  let animated = false;
+  new IntersectionObserver(
+    (ee) => {
+      if (ee[0].isIntersecting && !animated) {
+        animated = true;
+        render(currentScenario, true);
+      }
+    },
+    { threshold: 0.3 }
+  ).observe(wrap);
+</script>
+
+<style>
+  .bench-section {
+    position: relative; z-index: 1; padding: var(--section-gap) 0;
+    border-top: 1px solid var(--border);
+    background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-deep) 100%);
+  }
+  .bench-card {
+    background: var(--bg-surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px 28px 20px; margin-bottom: 24px;
+  }
+  .bench-meta {
+    display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+    padding: 16px 24px; background: var(--bg-surface); border: 1px solid var(--border);
+    border-radius: 8px; font-family: var(--font-mono); font-size: 12px; color: var(--text-dim);
+  }
+  .bench-meta .sep { color: var(--border); }
+  .bench-meta a { color: var(--accent); text-decoration: none; }
+  .bench-meta a:hover { color: var(--accent-bright); }
+
+  .bench-tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .bench-tab {
+    font-family: var(--font-mono); font-size: 13px; padding: 6px 16px;
+    border-radius: 6px; border: 1px solid var(--border); background: transparent;
+    color: var(--text-secondary); cursor: pointer; transition: all 0.2s;
+    flex: 1; text-align: center;
+  }
+  @media (min-width: 640px) {
+    .bench-tab { flex: none; }
+  }
+  .bench-tab:hover { border-color: var(--accent); color: var(--text-primary); }
+  :global(.bench-tab.active) { background: var(--accent-glow); border-color: var(--accent); color: var(--accent-bright); }
+
+  :global(.bench-scenario-desc) {
+    font-family: var(--font-mono); font-size: 12px; color: var(--text-dim);
+    margin-bottom: 20px; line-height: 1.5;
+  }
+
+  .bench-chart-wrap { position: relative; min-height: 140px; }
+
+  .bench-legend {
+    display: flex; gap: 24px; margin-top: 16px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+  }
+  .bench-legend-dot { display: inline-block; width: 10px; height: 4px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  .bench-legend-dot.ppmlx { background: linear-gradient(90deg, #d4833c, #e8a04c); }
+  .bench-legend-dot.ollama { background: #545a66; opacity: 0.5; }
+
+  .bench-metrics {
+    margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border);
+  }
+  .bench-metrics-label {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 10px;
+  }
+
+  :global(.bench-ttft-grid) {
+    display: flex; flex-direction: column; gap: 6px;
+    font-family: var(--font-mono); font-size: 13px;
+  }
+  :global(.bench-ttft-item) { display: flex; align-items: center; gap: 16px; }
+  :global(.bench-ttft-model) { color: var(--text-secondary); min-width: 120px; font-size: 12px; }
+  :global(.bench-ttft-values) { display: flex; align-items: center; gap: 8px; }
+  :global(.ppmlx-val) { color: var(--accent-bright); font-weight: 500; min-width: 60px; }
+  :global(.vs) { color: var(--text-dim); font-size: 11px; }
+  :global(.ollama-val) { color: var(--text-dim); min-width: 60px; }
+
+  /* Dynamic chart elements */
+  :global(.bench-row) { display: grid; grid-template-columns: 120px 1fr 60px; align-items: center; gap: 16px; margin-bottom: 20px; }
+  :global(.bench-row-label) { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); text-align: right; }
+  :global(.bench-bars) { display: flex; flex-direction: column; gap: 4px; }
+  :global(.bench-bar-track) { height: 18px; border-radius: 4px; position: relative; display: flex; align-items: center; }
+  :global(.bench-bar-fill) { height: 100%; border-radius: 4px; transition: width 1s cubic-bezier(0.16,1,0.3,1); min-width: 0; }
+  :global(.bench-bar-fill.ppmlx) { background: linear-gradient(90deg, #d4833c, #e8a04c); }
+  :global(.bench-bar-fill.ollama) { background: #545a66; opacity: 0.5; }
+  :global(.bench-bar-val) {
+    font-family: var(--font-mono); font-size: 11px; margin-left: 10px;
+    white-space: nowrap; opacity: 0; transition: opacity 0.4s;
+  }
+  :global(.bench-bar-val.show) { opacity: 1; }
+  :global(.bench-bar-val.ppmlx) { color: #e8a04c; font-weight: 500; }
+  :global(.bench-bar-val.ollama) { color: #545a66; }
+  :global(.bench-delta) {
+    font-family: var(--font-mono); font-size: 14px; font-weight: 500;
+    color: var(--teal); text-align: right; opacity: 0; transition: opacity 0.4s 0.8s;
+  }
+  :global(.bench-delta.show) { opacity: 1; }
+  :global(.bench-axis) { display: grid; grid-template-columns: 120px 1fr 60px; gap: 16px; margin-top: 4px; padding-top: 8px; border-top: 1px solid var(--border-subtle); }
+  :global(.bench-axis-labels) { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); }
+  :global(.t-dim) { color: var(--text-dim); }
+
+  :global(.bench-wall-note) {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    text-align: center; margin-top: 4px;
+  }
+
+  @media (max-width: 640px) {
+    :global(.bench-row) { grid-template-columns: 80px 1fr 50px; gap: 8px; }
+    :global(.bench-axis) { grid-template-columns: 80px 1fr 50px; gap: 8px; }
+    :global(.bench-ttft-model) { min-width: 90px; }
+  }
+</style>
