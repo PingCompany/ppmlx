@@ -34,6 +34,7 @@ import ppmlx.quantize      # noqa: E402
 import ppmlx.engine        # noqa: E402
 import ppmlx.engine_embed  # noqa: E402
 import ppmlx.engine_vlm    # noqa: E402
+import ppmlx.rag           # noqa: E402
 
 # Snapshot real module attributes HERE (module level) — before any test file
 # is collected.  test_server.py's module-level code runs at collection time and
