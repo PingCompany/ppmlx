@@ -69,6 +69,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── API Playground ────────────────────────────────────────────────────
+from ppmlx.api_docs import router as playground_router  # noqa: E402
+
+app.include_router(playground_router)
+
 
 async def _snapshot_loop(interval_seconds: int) -> None:
     """Periodically log system snapshots to the database."""
