@@ -53,15 +53,15 @@ for model in $MODELS; do
     printf "  ${DIM}%-10s %8s %8s %8s %8s  │  %8s %8s %8s %8s  │  %8s${RESET}\n" \
         "" "ppmlx" "ppmlx" "ppmlx" "ppmlx" "ollama" "ollama" "ollama" "ollama" ""
 
-    for scenario in simple complex; do
-        p_tps=$(jq -r ".results.${scenario}.avg_tok_s" "$ppmlx_file")
-        o_tps=$(jq -r ".results.${scenario}.avg_tok_s" "$ollama_file")
-        p_ms=$(jq -r ".results.${scenario}.avg_ms" "$ppmlx_file")
-        o_ms=$(jq -r ".results.${scenario}.avg_ms" "$ollama_file")
-        p_ttft=$(jq -r ".results.${scenario}.avg_ttft_ms" "$ppmlx_file")
-        o_ttft=$(jq -r ".results.${scenario}.avg_ttft_ms" "$ollama_file")
-        p_tok=$(jq -r ".results.${scenario}.avg_tokens" "$ppmlx_file")
-        o_tok=$(jq -r ".results.${scenario}.avg_tokens" "$ollama_file")
+    for scenario in simple complex long_context; do
+        p_tps=$(jq -r ".results.${scenario}.tok_s.avg // 0" "$ppmlx_file")
+        o_tps=$(jq -r ".results.${scenario}.tok_s.avg // 0" "$ollama_file")
+        p_ms=$(jq -r ".results.${scenario}.ms.avg // 0" "$ppmlx_file")
+        o_ms=$(jq -r ".results.${scenario}.ms.avg // 0" "$ollama_file")
+        p_ttft=$(jq -r ".results.${scenario}.ttft_ms.avg // 0" "$ppmlx_file")
+        o_ttft=$(jq -r ".results.${scenario}.ttft_ms.avg // 0" "$ollama_file")
+        p_tok=$(jq -r ".results.${scenario}.tokens.avg // 0" "$ppmlx_file")
+        o_tok=$(jq -r ".results.${scenario}.tokens.avg // 0" "$ollama_file")
 
         speedup=$(python3 -c "
 p, o = $p_tps, $o_tps
@@ -82,10 +82,10 @@ else: print('N/A')
     done
 
     # Agentic row (pi CLI — wall clock only)
-    p_ms=$(jq -r ".results.agentic.avg_ms" "$ppmlx_file")
-    o_ms=$(jq -r ".results.agentic.avg_ms" "$ollama_file")
-    p_chars=$(jq -r ".results.agentic.avg_chars" "$ppmlx_file")
-    o_chars=$(jq -r ".results.agentic.avg_chars" "$ollama_file")
+    p_ms=$(jq -r ".results.agentic.ms.avg // 0" "$ppmlx_file")
+    o_ms=$(jq -r ".results.agentic.ms.avg // 0" "$ollama_file")
+    p_chars=$(jq -r ".results.agentic.answer_chars.avg // 0" "$ppmlx_file")
+    o_chars=$(jq -r ".results.agentic.answer_chars.avg // 0" "$ollama_file")
 
     if [[ "$p_ms" -gt 0 && "$o_ms" -gt 0 ]]; then
         speedup=$(python3 -c "
