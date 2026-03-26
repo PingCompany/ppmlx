@@ -8,6 +8,7 @@ interface Props {
 
 const { title, description } = Astro.props;
 const canonicalURL = new URL(Astro.url.pathname, Astro.site);
+const ogImage = new URL("/og.png", Astro.site);
 ---
 
 <!doctype html>
@@ -20,12 +21,20 @@ const canonicalURL = new URL(Astro.url.pathname, Astro.site);
     <meta name="description" content={description} />
     <link rel="canonical" href={canonicalURL} />
     <meta property="og:title" content={title} />
-    <meta property="og:description" content="43-112% faster than GGUF translation layers. OpenAI-compatible API on localhost." />
+    <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://ppmlx.dev" />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="ppmlx — MLX-native LLM inference for Apple Silicon" />
+    <meta property="og:site_name" content="ppmlx" />
+    <meta property="og:locale" content="en_US" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content={title} />
-    <meta name="twitter:description" content="43-112% faster than GGUF. OpenAI-compatible API on localhost. 168+ models." />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+    <meta name="twitter:image:alt" content="ppmlx — MLX-native LLM inference for Apple Silicon" />
     <meta name="keywords" content="MLX, Apple Silicon, LLM, local inference, Ollama alternative, OpenAI API, macOS, M1, M2, M3, M4, Metal GPU, ppmlx" />
     <script type="application/ld+json" set:html={JSON.stringify({
       "@context": "https://schema.org",
