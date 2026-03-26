@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -2031,6 +2032,100 @@ def registry(
     console.print(table)
     console.print(f"\n[dim]Pull a model:  ppmlx pull <alias>[/dim]")
     console.print(f"[dim]Disable:       set [registry] enabled = false in ~/.ppmlx/config.toml[/dim]")
+
+
+@app.command()
+def bench(
+    model: str = typer.Argument(..., help="Model name or alias to benchmark"),
+    runs: int = typer.Option(3, "--runs", "-n", help="Number of iterations per scenario"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Save JSON results to this path"),
+    scenarios: Optional[str] = typer.Option(None, "--scenarios", "-s", help="Comma-separated scenario names (simple,complex,long_context)"),
+    compare: Optional[str] = typer.Option(None, "--compare", "-c", help="Compare against a baseline JSON file"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Server host"),
+    port: int = typer.Option(6767, "--port", "-p", help="Server port"),
+    no_auto_server: bool = typer.Option(False, "--no-auto-server", help="Do not auto-start the server"),
+):
+    """Run standardized benchmarks against a model."""
+    from ppmlx.bench import (
+        BenchmarkRunner,
+        SCENARIOS,
+        print_results,
+        print_comparison,
+        save_results,
+        load_results,
+    )
+
+    base_url = f"http://{host}:{port}"
+    scenario_list = [s.strip() for s in scenarios.split(",")] if scenarios else None
+
+    # Check if server is already running
+    server_proc = None
+    if not no_auto_server:
+        import httpx
+
+        try:
+            resp = httpx.get(f"{base_url}/health", timeout=2.0)
+            resp.raise_for_status()
+            console.print(f"[green]Server already running at {base_url}[/green]")
+        except Exception:
+            console.print(f"[yellow]Starting ppmlx server on {base_url}...[/yellow]")
+            server_proc = subprocess.Popen(
+                [sys.executable, "-m", "ppmlx.cli", "serve", "--host", host, "--port", str(port)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait for server to become healthy
+            healthy = False
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    resp = httpx.get(f"{base_url}/health", timeout=2.0)
+                    if resp.status_code == 200:
+                        healthy = True
+                        break
+                except Exception:
+                    continue
+            if not healthy:
+                console.print("[red]Server failed to start within 30 seconds.[/red]")
+                if server_proc:
+                    server_proc.terminate()
+                raise typer.Exit(1)
+            console.print(f"[green]Server started at {base_url}[/green]")
+
+    try:
+        try:
+            runner = BenchmarkRunner(
+                model=model,
+                base_url=base_url,
+                runs=runs,
+                scenarios=scenario_list,
+            )
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        result = runner.run()
+        print_results(result, console)
+
+        # Save results
+        if output:
+            out_path = save_results(result, Path(output))
+            console.print(f"\n[green]Results saved to {out_path}[/green]")
+
+        # Compare against baseline
+        if compare:
+            compare_path = Path(compare)
+            if not compare_path.exists():
+                console.print(f"[red]Baseline file not found: {compare}[/red]")
+                raise typer.Exit(1)
+            baseline = load_results(compare_path)
+            console.print()
+            print_comparison(result, baseline, console)
+
+    finally:
+        if server_proc:
+            console.print("[dim]Stopping auto-started server...[/dim]")
+            server_proc.terminate()
+            server_proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
