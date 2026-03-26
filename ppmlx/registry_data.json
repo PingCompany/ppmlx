@@ -11,7 +11,16 @@
       "lab": "Moonshot AI",
       "modalities": "text",
       "downloads": 2011837,
-      "created": "2026-01-27"
+      "created": "2026-01-27",
+      "recommended_ram_gb": 700,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Massive MoE model from Moonshot AI; needs very high RAM but excels at complex reasoning."
     },
     "parakeet:0.6b-v3": {
       "repo_id": "mlx-community/parakeet-tdt-0.6b-v3",
@@ -21,7 +30,14 @@
       "lab": "NVIDIA",
       "modalities": "audio, speech",
       "downloads": 655802,
-      "created": "2025-08-16"
+      "created": "2025-08-16",
+      "recommended_ram_gb": 4,
+      "quality_tier": "lightweight",
+      "use_cases": [
+        "speech",
+        "transcription"
+      ],
+      "notes": "NVIDIA speech recognition model; very small and fast for audio transcription."
     },
     "gpt-oss:20b-mxfp4q8": {
       "repo_id": "mlx-community/gpt-oss-20b-MXFP4-Q8",
@@ -31,7 +47,16 @@
       "lab": "OpenAI",
       "modalities": "text",
       "downloads": 538398,
-      "created": "2025-08-29"
+      "created": "2025-08-29",
+      "recommended_ram_gb": 16,
+      "quality_tier": "balanced",
+      "use_cases": [
+        "chat",
+        "code",
+        "instruction",
+        "reasoning"
+      ],
+      "notes": "OpenAI open-weight model; strong general-purpose performance in a mid-size package."
     },
     "devstral:24b": {
       "repo_id": "mlx-community/Devstral-Small-2-24B-Instruct-2512-4bit",
@@ -41,7 +66,14 @@
       "lab": "Mistral AI",
       "modalities": "text",
       "downloads": 183250,
-      "created": "2025-12-09"
+      "created": "2025-12-09",
+      "recommended_ram_gb": 18,
+      "quality_tier": "balanced",
+      "use_cases": [
+        "code",
+        "instruction"
+      ],
+      "notes": "Mistral's coding-focused model; excellent for software development tasks."
     },
     "qwen3.5:9b": {
       "repo_id": "mlx-community/Qwen3.5-9B-MLX-4bit",
@@ -51,7 +83,17 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 103194,
-      "created": "2026-03-02"
+      "created": "2026-03-02",
+      "recommended_ram_gb": 10,
+      "quality_tier": "balanced",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Sweet spot of Qwen 3.5 family; strong multimodal model that fits most Macs."
     },
     "qwen3.5:4b": {
       "repo_id": "mlx-community/Qwen3.5-4B-4bit",
@@ -61,7 +103,15 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 80579,
-      "created": "2026-03-02"
+      "created": "2026-03-02",
+      "recommended_ram_gb": 6,
+      "quality_tier": "lightweight",
+      "use_cases": [
+        "chat",
+        "instruction",
+        "multilingual"
+      ],
+      "notes": "Compact Qwen 3.5 variant; good for quick tasks on low-RAM machines."
     },
     "qwen3.5:2b-6bit": {
       "repo_id": "mlx-community/Qwen3.5-2B-6bit",
@@ -71,7 +121,15 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 56090,
-      "created": "2026-03-02"
+      "created": "2026-03-02",
+      "recommended_ram_gb": 4,
+      "quality_tier": "lightweight",
+      "use_cases": [
+        "chat",
+        "instruction",
+        "multilingual"
+      ],
+      "notes": "Smallest Qwen 3.5 with vision support; ideal for constrained environments."
     },
     "qwen3:4b": {
       "repo_id": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
@@ -81,7 +139,15 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 51510,
-      "created": "2025-08-06"
+      "created": "2025-08-06",
+      "recommended_ram_gb": 6,
+      "quality_tier": "lightweight",
+      "use_cases": [
+        "chat",
+        "instruction",
+        "multilingual"
+      ],
+      "notes": "Fast and efficient Qwen 3 model; good baseline for everyday tasks."
     },
     "qwen3.5:27b": {
       "repo_id": "mlx-community/Qwen3.5-27B-4bit",
@@ -91,7 +157,17 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 49469,
-      "created": "2026-02-24"
+      "created": "2026-02-24",
+      "recommended_ram_gb": 20,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "High-quality Qwen 3.5 with vision; excellent for demanding tasks on 24GB+ Macs."
     },
     "qwen3.5:35b-a3b": {
       "repo_id": "mlx-community/Qwen3.5-35B-A3B-4bit",
@@ -101,7 +177,17 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 47416,
-      "created": "2026-02-24"
+      "created": "2026-02-24",
+      "recommended_ram_gb": 24,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Large MoE Qwen 3.5 with only 3B active params; great quality-to-speed ratio."
     },
     "gpt-oss:120b-mxfp4q8": {
       "repo_id": "mlx-community/gpt-oss-120b-MXFP4-Q8",
@@ -111,7 +197,17 @@
       "lab": "OpenAI",
       "modalities": "text",
       "downloads": 31190,
-      "created": "2025-08-29"
+      "created": "2025-08-29",
+      "recommended_ram_gb": 72,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "instruction"
+      ],
+      "notes": "Full-size OpenAI open model; flagship quality requiring high-end hardware."
     },
     "qwen3.5:4b-mlx": {
       "repo_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -121,7 +217,15 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 30452,
-      "created": "2026-03-02"
+      "created": "2026-03-02",
+      "recommended_ram_gb": 6,
+      "quality_tier": "lightweight",
+      "use_cases": [
+        "chat",
+        "instruction",
+        "multilingual"
+      ],
+      "notes": "MLX-optimized Qwen 3.5 4B with vision; slightly better quality than base 4bit."
     },
     "glm4.7-flash-8bit": {
       "repo_id": "mlx-community/GLM-4.7-Flash-8bit",
@@ -131,7 +235,15 @@
       "lab": "Zhipu AI",
       "modalities": "text",
       "downloads": 29214,
-      "created": "2026-01-19"
+      "created": "2026-01-19",
+      "recommended_ram_gb": 72,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "multilingual"
+      ],
+      "notes": "High-precision GLM 4.7 Flash; better quality than 4bit but needs significantly more RAM."
     },
     "qwen3.5:0.8b-8bit": {
       "repo_id": "mlx-community/Qwen3.5-0.8B-8bit",
@@ -141,7 +253,14 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 28809,
-      "created": "2026-03-02"
+      "created": "2026-03-02",
+      "recommended_ram_gb": 4,
+      "quality_tier": "lightweight",
+      "use_cases": [
+        "chat",
+        "instruction"
+      ],
+      "notes": "Tiny Qwen 3.5 with vision; runs anywhere but limited reasoning capability."
     },
     "glm4.7-flash": {
       "repo_id": "mlx-community/GLM-4.7-Flash-4bit",
@@ -151,7 +270,15 @@
       "lab": "Zhipu AI",
       "modalities": "text",
       "downloads": 28474,
-      "created": "2026-01-19"
+      "created": "2026-01-19",
+      "recommended_ram_gb": 36,
+      "quality_tier": "balanced",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "multilingual"
+      ],
+      "notes": "Zhipu's efficient MoE model; strong multilingual and reasoning at moderate size."
     },
     "glm4.7": {
       "repo_id": "mlx-community/GLM-4.7-4bit",
@@ -161,7 +288,16 @@
       "lab": "Zhipu AI",
       "modalities": "text",
       "downloads": 27561,
-      "created": "2025-12-22"
+      "created": "2025-12-22",
+      "recommended_ram_gb": 200,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Full GLM 4.7 model; top-tier quality for users with 200GB+ unified memory."
     },
     "qwen3:235b-a22b": {
       "repo_id": "mlx-community/Qwen3-235B-A22B-Instruct-2507-4bit",
@@ -171,7 +307,17 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 26813,
-      "created": "2025-07-22"
+      "created": "2025-07-22",
+      "recommended_ram_gb": 140,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Alibaba's largest MoE model; exceptional quality but requires M2/M3/M4 Ultra."
     },
     "qwen3.5:35b-a3b-8bit": {
       "repo_id": "mlx-community/Qwen3.5-35B-A3B-8bit",
@@ -181,7 +327,17 @@
       "lab": "Alibaba",
       "modalities": "text, vision",
       "downloads": 26471,
-      "created": "2026-02-24"
+      "created": "2026-02-24",
+      "recommended_ram_gb": 40,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Higher-precision variant of the 35B MoE; better quality at the cost of more RAM."
     },
     "kimi-k2-think": {
       "repo_id": "mlx-community/Kimi-K2-Thinking",
@@ -191,7 +347,15 @@
       "lab": "Moonshot AI",
       "modalities": "text",
       "downloads": 26255,
-      "created": "2025-11-07"
+      "created": "2025-11-07",
+      "recommended_ram_gb": 700,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Kimi K2 with extended thinking; top reasoning but needs extreme hardware."
     },
     "qwen3-coder:480b-a35b-8bit": {
       "repo_id": "mlx-community/Qwen3-Coder-480B-A35B-Instruct-8bit",
@@ -201,7 +365,14 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 25924,
-      "created": "2025-12-08"
+      "created": "2025-12-08",
+      "recommended_ram_gb": 550,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "code",
+        "reasoning"
+      ],
+      "notes": "Alibaba's largest coder model in 8bit; enterprise-grade code generation."
     },
     "glm4.5-air-8bit": {
       "repo_id": "mlx-community/GLM-4.5-Air-8bit",
@@ -211,7 +382,15 @@
       "lab": "Zhipu AI",
       "modalities": "text",
       "downloads": 25514,
-      "created": "2025-07-28"
+      "created": "2025-07-28",
+      "recommended_ram_gb": 120,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "multilingual"
+      ],
+      "notes": "High-precision GLM 4.5 Air MoE; strong general-purpose for high-RAM setups."
     },
     "qwen3-next:80b-a3b-think": {
       "repo_id": "mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit",
@@ -221,7 +400,15 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 25125,
-      "created": "2025-09-13"
+      "created": "2025-09-13",
+      "recommended_ram_gb": 48,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "reasoning",
+        "code",
+        "creative"
+      ],
+      "notes": "Qwen3 Next with thinking mode; excellent for step-by-step problem solving."
     },
     "qwen3-next:80b-a3b": {
       "repo_id": "mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit",
@@ -231,7 +418,16 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 24984,
-      "created": "2025-09-12"
+      "created": "2025-09-12",
+      "recommended_ram_gb": 48,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative"
+      ],
+      "notes": "Efficient MoE with only 3B active; flagship quality with surprisingly fast inference."
     },
     "kimi-k2": {
       "repo_id": "mlx-community/Kimi-K2-Instruct-4bit",
@@ -241,7 +437,16 @@
       "lab": "Moonshot AI",
       "modalities": "text",
       "downloads": 24693,
-      "created": "2025-07-11"
+      "created": "2025-07-11",
+      "recommended_ram_gb": 600,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "Moonshot's trillion-param MoE; exceptional but needs M2/M3/M4 Ultra with max RAM."
     },
     "glm4.7-flash-5bit": {
       "repo_id": "mlx-community/GLM-4.7-Flash-5bit",
@@ -251,7 +456,15 @@
       "lab": "Zhipu AI",
       "modalities": "text",
       "downloads": 24495,
-      "created": "2026-01-19"
+      "created": "2026-01-19",
+      "recommended_ram_gb": 44,
+      "quality_tier": "balanced",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "multilingual"
+      ],
+      "notes": "GLM 4.7 Flash at 5bit quantization; good balance between quality and memory."
     },
     "deepseek-v3.1": {
       "repo_id": "mlx-community/DeepSeek-V3.1-4bit",
@@ -261,7 +474,17 @@
       "lab": "DeepSeek",
       "modalities": "text",
       "downloads": 24340,
-      "created": "2025-08-21"
+      "created": "2025-08-21",
+      "recommended_ram_gb": 384,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "DeepSeek's flagship MoE model; top-tier across all tasks but needs extreme RAM."
     },
     "qwen3-coder:480b-a35b": {
       "repo_id": "mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit",
@@ -271,7 +494,14 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 24066,
-      "created": "2025-07-22"
+      "created": "2025-07-22",
+      "recommended_ram_gb": 280,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "code",
+        "reasoning"
+      ],
+      "notes": "Alibaba's massive coder in 4bit; professional code generation at scale."
     },
     "glm4.7-flash-6bit": {
       "repo_id": "mlx-community/GLM-4.7-Flash-6bit",
@@ -281,7 +511,15 @@
       "lab": "Zhipu AI",
       "modalities": "text",
       "downloads": 23959,
-      "created": "2026-01-19"
+      "created": "2026-01-19",
+      "recommended_ram_gb": 52,
+      "quality_tier": "balanced",
+      "use_cases": [
+        "chat",
+        "reasoning",
+        "multilingual"
+      ],
+      "notes": "GLM 4.7 Flash at 6bit; higher quality than 4bit with moderate RAM increase."
     },
     "qwen3:235b-a22b-8bit": {
       "repo_id": "mlx-community/Qwen3-235B-A22B-Instruct-2507-8bit",
@@ -291,7 +529,17 @@
       "lab": "Alibaba",
       "modalities": "text",
       "downloads": 23828,
-      "created": "2025-07-22"
+      "created": "2025-07-22",
+      "recommended_ram_gb": 256,
+      "quality_tier": "flagship",
+      "use_cases": [
+        "chat",
+        "code",
+        "reasoning",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "High-precision Qwen3 235B MoE; best quality variant for extreme hardware."
     },
     "minimax-m2.1-3bit": {
       "repo_id": "mlx-community/MiniMax-M2.1-3bit",
@@ -301,7 +549,15 @@
       "lab": "MiniMax",
       "modalities": "text",
       "downloads": 23675,
-      "created": "2025-12-26"
+      "created": "2025-12-26",
+      "recommended_ram_gb": 108,
+      "quality_tier": "experimental",
+      "use_cases": [
+        "chat",
+        "creative",
+        "multilingual"
+      ],
+      "notes": "MiniMax's dense 228B model at aggressive 3bit; experimental quality tradeoff."
     },
     "qwen3-next:80b-a3b-8bit": {
       "repo_id": "mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit",

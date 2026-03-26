@@ -69,6 +69,31 @@ class ModelRecord:
     downloads: int | None = None
     released: str | None = None
     source: str = "registry"        # "built-in" | "custom" | "registry" | "local-only"
+    # Garden fields
+    recommended_ram_gb: float | None = None
+    quality_tier: str | None = None   # "flagship" | "balanced" | "lightweight" | "experimental"
+    use_cases: list[str] = field(default_factory=list)
+    notes: str | None = None
+
+
+def _merge_record_metadata(target: ModelRecord, source: ModelRecord) -> None:
+    """Fill in missing metadata on *target* from *source*."""
+    if target.params_b is None:
+        target.params_b = source.params_b
+    if target.size_gb is None:
+        target.size_gb = source.size_gb
+    if target.lab is None:
+        target.lab = source.lab
+    if not target.is_favorite and source.is_favorite:
+        target.is_favorite = True
+    if target.recommended_ram_gb is None:
+        target.recommended_ram_gb = source.recommended_ram_gb
+    if target.quality_tier is None:
+        target.quality_tier = source.quality_tier
+    if not target.use_cases:
+        target.use_cases = source.use_cases
+    if target.notes is None:
+        target.notes = source.notes
 
 
 def _build_model_records(
@@ -134,6 +159,10 @@ def _build_model_records(
             downloads=reg_entry.get("downloads"),
             released=reg_entry.get("created"),
             source=source,
+            recommended_ram_gb=reg_entry.get("recommended_ram_gb"),
+            quality_tier=reg_entry.get("quality_tier"),
+            use_cases=reg_entry.get("use_cases", []),
+            notes=reg_entry.get("notes"),
         )
 
         existing = by_repo.get(repo_id)
@@ -144,26 +173,10 @@ def _build_model_records(
             e_prio = _SOURCE_PRIO.get(existing.source, 9)
             c_prio = _SOURCE_PRIO.get(candidate.source, 9)
             if (c_prio, len(alias)) < (e_prio, len(existing.alias)):
-                # Carry over fields the new candidate might lack.
-                if candidate.params_b is None:
-                    candidate.params_b = existing.params_b
-                if candidate.size_gb is None:
-                    candidate.size_gb = existing.size_gb
-                if candidate.lab is None:
-                    candidate.lab = existing.lab
-                if not candidate.is_favorite and existing.is_favorite:
-                    candidate.is_favorite = True
+                _merge_record_metadata(target=candidate, source=existing)
                 by_repo[repo_id] = candidate
             else:
-                # Keep existing but merge any missing metadata from candidate.
-                if existing.params_b is None:
-                    existing.params_b = candidate.params_b
-                if existing.size_gb is None:
-                    existing.size_gb = candidate.size_gb
-                if existing.lab is None:
-                    existing.lab = candidate.lab
-                if not existing.is_favorite and candidate.is_favorite:
-                    existing.is_favorite = True
+                _merge_record_metadata(target=existing, source=candidate)
 
     records = dict(by_repo)
 
@@ -2031,6 +2044,183 @@ def registry(
     console.print(table)
     console.print(f"\n[dim]Pull a model:  ppmlx pull <alias>[/dim]")
     console.print(f"[dim]Disable:       set [registry] enabled = false in ~/.ppmlx/config.toml[/dim]")
+
+
+# ── Garden command ────────────────────────────────────────────────────
+
+garden_app = typer.Typer(
+    name="garden",
+    help="Browse curated models with compatibility scores and recommendations.",
+    invoke_without_command=True,
+)
+app.add_typer(garden_app, name="garden")
+
+
+def _ram_color(recommended: float | None, system_ram: float) -> str:
+    """Return a Rich color name based on model RAM vs system RAM."""
+    if recommended is None:
+        return "dim"
+    ratio = recommended / system_ram
+    if ratio <= 0.7:
+        return "green"
+    if ratio <= 0.95:
+        return "yellow"
+    return "red"
+
+
+def _quality_style(tier: str | None) -> str:
+    """Return a Rich style string for a quality tier."""
+    return {
+        "flagship": "bold magenta",
+        "balanced": "cyan",
+        "lightweight": "green",
+        "experimental": "yellow",
+    }.get(tier or "", "dim")
+
+
+@garden_app.callback(invoke_without_command=True)
+def garden_browse(
+    ctx: typer.Context,
+    filter: str | None = typer.Option(None, "--filter", "-f", help="Filter by use case (e.g. code, chat, reasoning)"),
+    ram: bool = typer.Option(False, "--ram", "-r", help="Only show models that fit in your RAM"),
+    sort: str = typer.Option("downloads", "--sort", "-s", help="Sort by: downloads, size, params"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Max entries to show"),
+):
+    """Browse curated models with RAM compatibility and quality info."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    from ppmlx.memory import get_system_ram_gb
+
+    system_ram = get_system_ram_gb()
+
+    records = _build_model_records(sort_by=sort, limit=None)
+
+    # Only keep models with garden annotations (have at least quality_tier or use_cases)
+    garden_records = [r for r in records if r.quality_tier or r.use_cases]
+
+    if filter:
+        tag = filter.lower()
+        garden_records = [r for r in garden_records if tag in {uc.lower() for uc in r.use_cases}]
+
+    if ram:
+        garden_records = [
+            r for r in garden_records
+            if r.recommended_ram_gb is not None and r.recommended_ram_gb <= system_ram
+        ]
+
+    if limit:
+        garden_records = garden_records[:limit]
+
+    if not garden_records:
+        console.print("[dim]No models match the criteria.[/dim]")
+        if filter:
+            all_tags: set[str] = set()
+            for r in records:
+                all_tags.update(r.use_cases)
+            if all_tags:
+                console.print(f"[dim]Available use cases: {', '.join(sorted(all_tags))}[/dim]")
+        return
+
+    table = Table(title=f"Model Garden (system RAM: {system_ram:.0f} GB)", show_header=True)
+    table.add_column("", width=3)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Params", justify="right", style="magenta")
+    table.add_column("Size", justify="right")
+    table.add_column("RAM Needed", justify="right")
+    table.add_column("Quality", no_wrap=True)
+    table.add_column("Use Cases")
+    table.add_column("Notes", max_width=50)
+
+    for r in garden_records:
+        flags = ""
+        if r.is_favorite:
+            flags += "★"
+        if r.is_downloaded:
+            flags += "✓"
+
+        color = _ram_color(r.recommended_ram_gb, system_ram)
+        ram_str = f"[{color}]{r.recommended_ram_gb:.0f} GB[/{color}]" if r.recommended_ram_gb else "[dim]--[/dim]"
+        size_str = f"{r.size_gb:.1f} GB" if r.size_gb else "--"
+        params_str = f"{r.params_b}B" if r.params_b else "--"
+
+        q_style = _quality_style(r.quality_tier)
+        quality_str = f"[{q_style}]{r.quality_tier or '--'}[/{q_style}]"
+
+        use_cases_str = ", ".join(r.use_cases) if r.use_cases else "--"
+        notes_str = r.notes or "--"
+
+        table.add_row(flags, r.alias, params_str, size_str, ram_str, quality_str, use_cases_str, notes_str)
+
+    console.print(table)
+    console.print(f"\n[dim]Pull a model:         ppmlx pull <name>[/dim]")
+    console.print(f"[dim]Recommendations:      ppmlx garden recommend [--use-case chat][/dim]")
+
+
+@garden_app.command()
+def recommend(
+    use_case: str | None = typer.Option(None, "--use-case", "-u", help="Preferred use case (e.g. code, chat, reasoning)"),
+    count: int = typer.Option(3, "--count", "-n", help="Number of recommendations"),
+):
+    """Suggest the best models for your system based on available RAM and use case."""
+    from ppmlx.memory import get_system_ram_gb
+
+    system_ram = get_system_ram_gb()
+
+    records = _build_model_records(sort_by="downloads")
+    # Only consider models with garden annotations
+    garden_records = [r for r in records if r.quality_tier and r.recommended_ram_gb is not None]
+
+    # Filter to models that fit in RAM (with a small buffer for OS overhead)
+    usable_ram = system_ram * 0.95
+    fitting = [r for r in garden_records if r.recommended_ram_gb <= usable_ram]
+
+    if use_case:
+        tag = use_case.lower()
+        tagged = [r for r in fitting if tag in {uc.lower() for uc in r.use_cases}]
+        if tagged:
+            fitting = tagged
+
+    if not fitting:
+        msg = f"No curated models fit within your {system_ram:.0f} GB RAM"
+        if use_case:
+            msg += f" with use case '{use_case}'"
+        msg += "."
+        console.print(f"[yellow]{msg}[/yellow]")
+        console.print("[dim]Try: ppmlx garden --filter chat[/dim]")
+        return
+
+    # Score: prefer flagship > balanced > lightweight > experimental, then by downloads
+    tier_score = {"flagship": 4, "balanced": 3, "lightweight": 2, "experimental": 1}
+    fitting.sort(
+        key=lambda r: (
+            -tier_score.get(r.quality_tier or "", 0),
+            -(r.downloads or 0),
+        )
+    )
+
+    top = fitting[:count]
+
+    console.print(f"\n[bold]Top {len(top)} recommendations[/bold] for your {system_ram:.0f} GB Mac", end="")
+    if use_case:
+        console.print(f" [dim](use case: {use_case})[/dim]")
+    else:
+        console.print()
+    console.print()
+
+    for i, r in enumerate(top, 1):
+        color = _ram_color(r.recommended_ram_gb, system_ram)
+        q_style = _quality_style(r.quality_tier)
+
+        console.print(f"  [bold]{i}. {r.alias}[/bold]")
+        console.print(f"     [{q_style}]{r.quality_tier}[/{q_style}] | {r.params_b}B params | {r.size_gb:.1f} GB download | [{color}]{r.recommended_ram_gb:.0f} GB RAM[/{color}]")
+        if r.use_cases:
+            console.print(f"     Use cases: {', '.join(r.use_cases)}")
+        if r.notes:
+            console.print(f"     [dim]{r.notes}[/dim]")
+        console.print()
+
+    console.print(f"[dim]Pull a model: ppmlx pull <name>[/dim]")
 
 
 if __name__ == "__main__":
