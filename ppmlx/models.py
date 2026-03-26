@@ -395,6 +395,15 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     return local_path
 
 
+def resolve_model_path(repo_id: str) -> str:
+    """Resolve a repo_id to a local path if available, otherwise return the
+    repo_id for direct HuggingFace loading."""
+    local = get_model_path(repo_id)
+    if local:
+        return str(local)
+    return repo_id
+
+
 def get_model_path(alias_or_repo: str) -> Path | None:
     """Return local path if model exists, else None."""
     try:

@@ -6,13 +6,10 @@ from typing import Any
 
 def _resolve_model_path(repo_id: str) -> str:
     try:
-        from ppmlx.models import get_model_path
-        local = get_model_path(repo_id)
-        if local:
-            return str(local)
+        from ppmlx.models import resolve_model_path
+        return resolve_model_path(repo_id)
     except ImportError:
-        pass
-    return repo_id
+        return repo_id
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:
