@@ -31,6 +31,7 @@ import ppmlx.models        # noqa: E402
 import ppmlx.memory        # noqa: E402
 import ppmlx.modelfile     # noqa: E402
 import ppmlx.quantize      # noqa: E402
+import ppmlx.arena          # noqa: E402
 import ppmlx.engine        # noqa: E402
 import ppmlx.engine_embed  # noqa: E402
 import ppmlx.engine_vlm    # noqa: E402

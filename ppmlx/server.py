@@ -1984,3 +1984,132 @@ async def responses_ws(websocket: WebSocket):
         pass
     except Exception:
         pass
+
+
+# ── Arena routes ─────────────────────────────────────────────────────
+
+_arena_db_instance = None
+
+
+def _get_arena_db():
+    """Lazy singleton for the arena database."""
+    global _arena_db_instance
+    if _arena_db_instance is None:
+        from ppmlx.arena import ArenaDB
+        _arena_db_instance = ArenaDB()
+    return _arena_db_instance
+
+
+@app.get("/arena")
+async def arena_page():
+    """Serve the Arena web UI."""
+    from fastapi.responses import HTMLResponse
+    from ppmlx.arena import ARENA_HTML
+    return HTMLResponse(content=ARENA_HTML)
+
+
+@app.post("/arena/compare")
+async def arena_compare(request: Request):
+    """Run a side-by-side model comparison."""
+    body = await request.json()
+    model_a = body.get("model_a", "")
+    model_b = body.get("model_b", "")
+    prompt = body.get("prompt", "")
+    temperature = body.get("temperature", 0.7)
+
+    if not model_a or not model_b or not prompt:
+        raise HTTPException(status_code=400, detail="model_a, model_b, and prompt are required")
+
+    from ppmlx.arena import run_arena_match
+
+    # Determine the server's own base URL
+    host = request.base_url.hostname or "127.0.0.1"
+    port = request.base_url.port or 6767
+    scheme = request.base_url.scheme or "http"
+    base_url = f"{scheme}://{host}:{port}"
+
+    loop = asyncio.get_event_loop()
+    match = await loop.run_in_executor(
+        None, run_arena_match, model_a, model_b, prompt, base_url, temperature,
+    )
+
+    # Store in app state for voting (cap at 100 to prevent unbounded growth)
+    if not hasattr(app.state, "arena_matches"):
+        app.state.arena_matches = {}
+    matches_store = app.state.arena_matches
+    if len(matches_store) >= 100:
+        oldest_key = next(iter(matches_store))
+        del matches_store[oldest_key]
+    matches_store[match.match_id] = match
+
+    return {
+        "match_id": match.match_id,
+        "prompt": match.prompt,
+        "result_a": {
+            "model": match.result_a.model,
+            "response": match.result_a.response,
+            "elapsed_ms": match.result_a.elapsed_ms,
+            "error": match.result_a.error,
+        },
+        "result_b": {
+            "model": match.result_b.model,
+            "response": match.result_b.response,
+            "elapsed_ms": match.result_b.elapsed_ms,
+            "error": match.result_b.error,
+        },
+    }
+
+
+@app.post("/arena/vote")
+async def arena_vote(request: Request):
+    """Record a vote for an arena match."""
+    body = await request.json()
+    match_id = body.get("match_id", "")
+    winner = body.get("winner", "")
+
+    if winner not in ("a", "b", "draw"):
+        raise HTTPException(status_code=400, detail="winner must be 'a', 'b', or 'draw'")
+
+    matches = getattr(app.state, "arena_matches", {})
+    match = matches.get(match_id)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    db = _get_arena_db()
+    new_a, new_b = db.record_match(match, winner)
+
+    # Clean up stored match
+    matches.pop(match_id, None)
+
+    return {
+        "match_id": match_id,
+        "winner": winner,
+        "elo_a": new_a,
+        "elo_b": new_b,
+        "model_a": match.result_a.model,
+        "model_b": match.result_b.model,
+    }
+
+
+@app.get("/arena/leaderboard")
+async def arena_leaderboard():
+    """Return the ELO leaderboard."""
+    db = _get_arena_db()
+    entries = db.get_all_elos()
+    return [
+        {
+            "model": e.model,
+            "score": e.score,
+            "wins": e.wins,
+            "losses": e.losses,
+            "draws": e.draws,
+        }
+        for e in entries
+    ]
+
+
+@app.get("/arena/matches")
+async def arena_matches():
+    """Return recent arena matches."""
+    db = _get_arena_db()
+    return db.get_recent_matches(limit=20)
