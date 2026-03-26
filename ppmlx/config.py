@@ -11,7 +11,10 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 6767
     cors: bool = True
+    cors_origins: list[str] = field(default_factory=list)
     max_loaded_models: int = 2
+    max_request_body_mb: int = 10
+    max_tokens_cap: int = 32768
 
 
 @dataclass
@@ -81,7 +84,13 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         if "host" in s: cfg.server.host = str(s["host"])
         if "port" in s: cfg.server.port = int(s["port"])
         if "cors" in s: cfg.server.cors = bool(s["cors"])
+        if "cors_origins" in s:
+            origins = s["cors_origins"]
+            if isinstance(origins, list):
+                cfg.server.cors_origins = [str(o) for o in origins]
         if "max_loaded_models" in s: cfg.server.max_loaded_models = int(s["max_loaded_models"])
+        if "max_request_body_mb" in s: cfg.server.max_request_body_mb = int(s["max_request_body_mb"])
+        if "max_tokens_cap" in s: cfg.server.max_tokens_cap = int(s["max_tokens_cap"])
     if "defaults" in data:
         d = data["defaults"]
         if "model" in d: cfg.defaults.model = str(d["model"])

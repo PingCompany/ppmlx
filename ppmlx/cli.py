@@ -597,7 +597,11 @@ def _port_in_use(host: str, port: int) -> bool:
 
 
 def _flush_port(host: str, port: int) -> None:
-    """Kill any process listening on the given port and wait until it's free."""
+    """Kill ppmlx processes listening on the given port and wait until it's free.
+
+    Only kills processes whose command line contains 'ppmlx' to avoid
+    accidentally terminating unrelated services.
+    """
     import subprocess
     result = subprocess.run(
         ["lsof", "-ti", f"tcp:{port}"],
@@ -606,14 +610,35 @@ def _flush_port(host: str, port: int) -> None:
     pids = result.stdout.strip()
     if not pids:
         return
-    for pid in pids.splitlines():
-        pid = pid.strip()
-        if pid:
-            try:
-                os.kill(int(pid), 9)
-                console.print(f"[yellow]Killed process {pid} on port {port}[/yellow]")
-            except (ProcessLookupError, ValueError):
-                pass
+    for pid_str in pids.splitlines():
+        pid_str = pid_str.strip()
+        if not pid_str:
+            continue
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        # Verify the process belongs to ppmlx before killing
+        try:
+            ps_result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=5,
+            )
+            cmd_line = ps_result.stdout.strip()
+            if "ppmlx" not in cmd_line:
+                console.print(
+                    f"[yellow]Skipping PID {pid} on port {port} "
+                    f"(not a ppmlx process)[/yellow]"
+                )
+                continue
+        except Exception:
+            # If we can't verify, skip rather than kill blindly
+            continue
+        try:
+            os.kill(pid, 9)
+            console.print(f"[yellow]Killed ppmlx process {pid} on port {port}[/yellow]")
+        except (ProcessLookupError, PermissionError):
+            pass
     import time
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:

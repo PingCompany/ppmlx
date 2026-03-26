@@ -47,10 +47,16 @@ class VisionEngine:
                     raise
                 self._models[repo_id] = (model, processor)
 
-    def _extract_images(self, messages: list[dict]) -> list[str | bytes]:
+    def _extract_images(
+        self, messages: list[dict], *, allow_local_paths: bool = False,
+    ) -> list[str | bytes]:
         """
         Extract image references from message content.
-        Returns list of: local file paths (str), URLs (str), or decoded bytes.
+        Returns list of: URLs (str) or temp file paths from base64 data.
+
+        When ``allow_local_paths`` is False (default, for API requests),
+        ``file://`` URLs and bare filesystem paths are rejected to prevent
+        local file read attacks.  The CLI REPL sets ``allow_local_paths=True``.
         """
         images = []
         for msg in messages:
@@ -61,7 +67,7 @@ class VisionEngine:
                         image_url = part.get("image_url", {})
                         url = image_url.get("url", "") if isinstance(image_url, dict) else ""
                         if url.startswith("data:image/"):
-                            # base64 data URI → decode to bytes, save to temp file
+                            # base64 data URI -> decode to bytes, save to temp file
                             try:
                                 header, data = url.split(",", 1)
                                 img_bytes = base64.b64decode(data)
@@ -72,11 +78,16 @@ class VisionEngine:
                             except Exception:
                                 pass
                         elif url.startswith("file://"):
-                            images.append(url[7:])  # strip scheme → absolute path
+                            if allow_local_paths:
+                                images.append(url[7:])
+                            # else: silently skip — do not expose local files
                         elif url and (url.startswith("/") or url.startswith("~")):
-                            images.append(str(Path(url).expanduser()))
-                        elif url:
-                            images.append(url)  # HTTP URL — pass through to mlx-vlm
+                            if allow_local_paths:
+                                images.append(str(Path(url).expanduser()))
+                            # else: silently skip
+                        elif url and (url.startswith("http://") or url.startswith("https://")):
+                            images.append(url)  # HTTP(S) URL — pass through to mlx-vlm
+                        # else: skip unknown schemes
         return images
 
     def generate(

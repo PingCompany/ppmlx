@@ -9,6 +9,10 @@ from contextlib import asynccontextmanager
 
 log = logging.getLogger("ppmlx.server")
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -16,6 +20,78 @@ from fastapi.responses import JSONResponse
 from ppmlx import __version__
 
 _start_time = time.time()
+
+
+_DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+_DEFAULT_MAX_TOKENS_CAP = 32_768
+_MAX_EMBED_INPUTS = 256
+
+
+_cached_server_config = None
+_server_config_loaded = False
+
+
+def _load_server_config():
+    """Load the server config section, returning None on failure.
+
+    Caches the result so multiple callers at import time share one load.
+    """
+    global _cached_server_config, _server_config_loaded
+    if _server_config_loaded:
+        return _cached_server_config
+    _server_config_loaded = True
+    try:
+        from ppmlx.config import load_config
+        cfg = load_config()
+        # Guard against mocked config objects in tests
+        if hasattr(cfg.server, "host") and isinstance(cfg.server.host, str):
+            _cached_server_config = cfg.server
+    except Exception:
+        pass
+    return _cached_server_config
+
+
+def _get_max_request_body_bytes() -> int:
+    """Load max request body size from config (default 10 MB)."""
+    srv = _load_server_config()
+    if srv is not None:
+        val = getattr(srv, "max_request_body_mb", None)
+        if isinstance(val, int):
+            return val * 1024 * 1024
+    return _DEFAULT_MAX_BODY_BYTES
+
+
+def _get_max_tokens_cap() -> int:
+    """Load max_tokens cap from config (default 32768)."""
+    srv = _load_server_config()
+    if srv is not None:
+        val = getattr(srv, "max_tokens_cap", None)
+        if isinstance(val, int):
+            return val
+    return _DEFAULT_MAX_TOKENS_CAP
+
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject request bodies that exceed a configurable size limit."""
+
+    def __init__(self, app, max_bytes: int = 10 * 1024 * 1024):
+        super().__init__(app)
+        self.max_bytes = max_bytes
+
+    async def dispatch(
+        self, request: StarletteRequest, call_next
+    ) -> StarletteResponse:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"error": {"message": "Request body too large", "type": "invalid_request_error"}},
+                    )
+            except (ValueError, TypeError):
+                pass
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -61,13 +137,45 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS: default to localhost-only; configurable via config.toml.
+# Set [server] cors_origins = ["*"] to restore permissive behavior.
+_DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
+
+def _get_cors_config() -> tuple[list[str], str | None]:
+    """Return (origins_list, origin_regex) from config.
+
+    If the user sets cors_origins = ["*"], we pass that directly and skip regex.
+    Otherwise we use a regex that matches localhost on any port.
+    """
+    srv = _load_server_config()
+    if srv is not None:
+        origins = getattr(srv, "cors_origins", None)
+        if isinstance(origins, list) and origins:
+            return origins, None
+    return [], _DEFAULT_CORS_ORIGIN_REGEX
+
+
+_cors_origins, _cors_regex = _get_cors_config()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins or [],
+    allow_origin_regex=_cors_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(RequestSizeLimitMiddleware, max_bytes=_get_max_request_body_bytes())
+
+_MAX_TOKENS_CAP = _get_max_tokens_cap()
+
+
+def _clamp_max_tokens(requested: int | None) -> int | None:
+    """Clamp client-requested max_tokens to the server-side cap."""
+    if requested is None:
+        return None
+    return min(requested, _MAX_TOKENS_CAP)
 
 
 async def _snapshot_loop(interval_seconds: int) -> None:
@@ -423,24 +531,6 @@ async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
     body = await request.json()
 
-    # Append request summary for debugging (best-effort)
-    try:
-        import pathlib
-        _cc_log = pathlib.Path("/tmp/ppmlx_chatcompletions_debug.jsonl")
-        log_entry = {
-            "ts": time.time(),
-            "model": body.get("model"),
-            "stream": body.get("stream"),
-            "tools": len(body.get("tools") or []),
-            "tool_names": [t.get("function", {}).get("name") or t.get("name")
-                           for t in (body.get("tools") or [])],
-            "messages_count": len(body.get("messages", [])),
-        }
-        with open(_cc_log, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception:
-        pass
-
     model_name = body.get("model", "")
     messages = body.get("messages", [])
     # Normalize messages for model compatibility
@@ -458,7 +548,7 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
-    max_tokens = body.get("max_tokens")
+    max_tokens = _clamp_max_tokens(body.get("max_tokens"))
     stop = body.get("stop")
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
@@ -704,7 +794,7 @@ async def completions(request: Request):
     body = await request.json()
     model_name = body.get("model", "")
     prompt = body.get("prompt", "")
-    max_tokens = body.get("max_tokens")
+    max_tokens = _clamp_max_tokens(body.get("max_tokens"))
     temperature = body.get("temperature", 0.7)
     stream = body.get("stream", False)
 
@@ -756,6 +846,12 @@ async def embeddings(request: Request):
         texts = [input_text]
     else:
         texts = list(input_text)
+
+    if len(texts) > _MAX_EMBED_INPUTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many inputs ({len(texts)}). Maximum is {_MAX_EMBED_INPUTS}.",
+        )
 
     try:
         from ppmlx.models import resolve_alias
@@ -833,45 +929,12 @@ async def responses(request: Request):
     """OpenAI Responses API endpoint (used by Codex and newer OpenAI tools)."""
     body = await request.json()
 
-    # Append each request to a debug log (best-effort)
-    try:
-        import pathlib
-        _log_path = pathlib.Path("/tmp/ppmlx_responses_debug.jsonl")
-        input_data_raw = body.get("input", "")
-        # Summarize input for logging
-        if isinstance(input_data_raw, list):
-            input_summary = []
-            for item in input_data_raw:
-                role = item.get("role", "?")
-                content = item.get("content", "")
-                if isinstance(content, list):
-                    text = " ".join(p.get("text", "")[:200] for p in content if isinstance(p, dict))
-                elif isinstance(content, str):
-                    text = content[:200]
-                else:
-                    text = str(content)[:200]
-                input_summary.append({"role": role, "text": text[:200]})
-        else:
-            input_summary = str(input_data_raw)[:200]
-        log_entry = {
-            "ts": time.time(),
-            "model": body.get("model"),
-            "stream": body.get("stream"),
-            "tools": len(body.get("tools") or []),
-            "input_summary": input_summary,
-            "instructions_len": len(body.get("instructions", "") or ""),
-        }
-        with open(_log_path, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception:
-        pass
-
     model_name = body.get("model", "")
     input_data = body.get("input", "")
     stream = body.get("stream", False)
     temperature = body.get("temperature", 0.7)
     top_p = body.get("top_p", 1.0)
-    max_tokens = body.get("max_output_tokens") or body.get("max_tokens")
+    max_tokens = _clamp_max_tokens(body.get("max_output_tokens") or body.get("max_tokens"))
     # instructions field acts as a system prompt
     instructions = body.get("instructions")
 
@@ -1365,7 +1428,7 @@ async def anthropic_messages(request: Request):
     model_name = body.get("model", "")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    max_tokens = body.get("max_tokens")
+    max_tokens = _clamp_max_tokens(body.get("max_tokens"))
     temperature = body.get("temperature", 0.7)
     system_prompt = body.get("system")
     tools = _limit_tools(body.get("tools") or None)
@@ -1790,13 +1853,30 @@ async def _nonstream_anthropic(
 # ── WebSocket transport for Responses API (Codex) ────────────────────
 
 
+_WS_MAX_MESSAGE_BYTES = 10 * 1024 * 1024  # 10 MB limit per WS message
+
+
 @app.websocket("/v1/responses")
 async def responses_ws(websocket: WebSocket):
     """WebSocket transport for the Responses API (used by Codex CLI)."""
     await websocket.accept()
     try:
         while True:
-            body = await websocket.receive_json()
+            raw = await websocket.receive_text()
+            if len(raw) > _WS_MAX_MESSAGE_BYTES:
+                await websocket.send_json({
+                    "type": "error",
+                    "error": {"type": "invalid_request", "message": "Message too large"},
+                })
+                continue
+            try:
+                body = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                await websocket.send_json({
+                    "type": "error",
+                    "error": {"type": "invalid_request", "message": "Invalid JSON"},
+                })
+                continue
             msg_type = body.get("type", "")
             if msg_type != "response.create":
                 await websocket.send_json({
@@ -1811,7 +1891,7 @@ async def responses_ws(websocket: WebSocket):
             input_data = response_body.get("input", body.get("input", ""))
             temperature = response_body.get("temperature", body.get("temperature", 0.7))
             top_p = response_body.get("top_p", body.get("top_p", 1.0))
-            max_tokens = (
+            max_tokens = _clamp_max_tokens(
                 response_body.get("max_output_tokens")
                 or body.get("max_output_tokens")
                 or response_body.get("max_tokens")
