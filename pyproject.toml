@@ -35,6 +35,7 @@ dependencies = [
     "prompt-toolkit>=3.0",
     "tomli-w>=1.0",
     "setproctitle>=1.3",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

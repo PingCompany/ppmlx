@@ -23,6 +23,12 @@ app = typer.Typer(
     help="Run LLMs locally on Apple Silicon via MLX",
     no_args_is_help=True,
 )
+template_app = typer.Typer(
+    name="template",
+    help="Manage and run prompt templates",
+    no_args_is_help=True,
+)
+app.add_typer(template_app, name="template")
 console = Console()
 
 
@@ -2031,6 +2037,238 @@ def registry(
     console.print(table)
     console.print(f"\n[dim]Pull a model:  ppmlx pull <alias>[/dim]")
     console.print(f"[dim]Disable:       set [registry] enabled = false in ~/.ppmlx/config.toml[/dim]")
+
+
+# ── Template commands ──────────────────────────────────────────────────
+
+
+@template_app.command(name="list")
+def template_list():
+    """List all available prompt templates."""
+    from ppmlx.templates import list_templates
+
+    templates = list_templates()
+    if not templates:
+        console.print("[dim]No templates found.[/dim]")
+        return
+
+    table = Table(title="Prompt Templates", show_header=True)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Description")
+    table.add_column("Source", style="dim")
+
+    for t in templates:
+        table.add_row(t.name, t.description, t.source)
+
+    console.print(table)
+    console.print(f"\n[dim]Run a template:  ppmlx template run <name> --var input=\"your text\"[/dim]")
+    console.print(f"[dim]Show details:    ppmlx template show <name>[/dim]")
+
+
+@template_app.command(name="show")
+def template_show(
+    name: str = typer.Argument(..., help="Template name"),
+):
+    """Show details of a prompt template."""
+    from ppmlx.templates import get_template, TemplateNotFoundError
+
+    try:
+        t = get_template(name)
+    except TemplateNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold]{t.name}[/bold]\n"
+        f"[dim]{t.description}[/dim]\n"
+        f"[dim]Source: {t.source}[/dim]",
+        border_style="cyan",
+    ))
+
+    if t.system:
+        console.print("\n[bold]System prompt:[/bold]")
+        console.print(f"  {t.system}")
+
+    console.print("\n[bold]User prompt template:[/bold]")
+    console.print(f"  {t.prompt}")
+
+    if t.variables:
+        console.print("\n[bold]Variables:[/bold]")
+        for var_name, spec in t.variables.items():
+            req = "[red]required[/red]" if spec.required else f"default: [green]{spec.default}[/green]"
+            desc = f"  {spec.description}" if spec.description else ""
+            console.print(f"  [cyan]{{{{{var_name}}}}}[/cyan]  ({req}){desc}")
+
+    if t.parameters:
+        console.print("\n[bold]Parameters:[/bold]")
+        for k, v in t.parameters.items():
+            console.print(f"  {k}: {v}")
+
+    if t.default_model:
+        console.print(f"\n[bold]Default model:[/bold] {t.default_model}")
+
+
+@template_app.command(name="run")
+def template_run(
+    name: str = typer.Argument(..., help="Template name"),
+    var: list[str] = typer.Option([], "--var", "-v", help="Variable in key=value format (repeatable)"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model to use (overrides template default)"),
+    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw text without formatting"),
+):
+    """Run a prompt template with variables.
+
+    Variables are passed with --var key=value. The special 'input' variable
+    is read from stdin if not provided and stdin is piped.
+
+    Examples:
+      ppmlx template run summarize --var input="Long text here..."
+      cat file.txt | ppmlx template run summarize
+      echo "Hello world" | ppmlx template run translate --var lang=Spanish
+    """
+    from ppmlx.templates import (
+        get_template, render_template, read_stdin_if_available,
+        TemplateNotFoundError, TemplateMissingVariableError,
+    )
+
+    try:
+        t = get_template(name)
+    except TemplateNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    # Parse --var key=value pairs
+    variables: dict[str, str] = {}
+    for v in var:
+        if "=" not in v:
+            console.print(f"[red]Invalid variable format: '{v}'. Use key=value[/red]")
+            raise typer.Exit(1)
+        key, _, value = v.partition("=")
+        variables[key.strip()] = value.strip()
+
+    # Read stdin for 'input' variable if not provided and stdin is piped
+    if "input" in t.variables and "input" not in variables:
+        stdin_data = read_stdin_if_available()
+        if stdin_data:
+            variables["input"] = stdin_data.strip()
+
+    # Render the template
+    try:
+        system_prompt, user_prompt = render_template(t, variables)
+    except TemplateMissingVariableError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    # Determine which model to use
+    effective_model = model or t.default_model
+    if not effective_model:
+        from ppmlx.config import load_config
+        cfg = load_config()
+        effective_model = cfg.defaults.model
+
+    # Build messages
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    # Get generation parameters from template
+    temperature = t.parameters.get("temperature", 0.7)
+    max_tokens = t.parameters.get("max_tokens", 2048)
+
+    # Run inference
+    from ppmlx.models import resolve_alias, get_model_path, download_model, ModelNotFoundError
+    from ppmlx.engine import get_engine
+
+    try:
+        repo_id = resolve_alias(effective_model)
+    except ModelNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    local_path = get_model_path(repo_id)
+    if not local_path:
+        console.print(f"[yellow]Downloading {effective_model}...[/yellow]")
+        try:
+            local_path = download_model(effective_model)
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    engine = get_engine()
+
+    if not raw:
+        console.print(f"[dim]Template: {t.name} | Model: {effective_model}[/dim]")
+
+    try:
+        for chunk in engine.stream_generate(
+            repo_id, messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            if raw:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            else:
+                console.print(chunk, end="")
+        if raw:
+            sys.stdout.write("\n")
+        else:
+            console.print()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Generation interrupted.[/dim]")
+        raise typer.Exit(1)
+    except Exception as exc:
+        console.print(f"\n[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+
+
+@template_app.command(name="create")
+def template_create(
+    name: str = typer.Argument(..., help="Name for the new template"),
+    description: str = typer.Option("", "--description", "-d", help="Template description"),
+    system: str = typer.Option("", "--system", "-s", help="System prompt"),
+    prompt: str = typer.Option("", "--prompt", "-p", help="User prompt template (use {{var}} for variables)"),
+):
+    """Create a new user template.
+
+    Templates are saved to ~/.ppmlx/templates/<name>.yaml.
+
+    Example:
+      ppmlx template create my_template \\
+        --description "My custom template" \\
+        --system "You are helpful." \\
+        --prompt "Help me with: {{input}}"
+    """
+    import yaml
+
+    from ppmlx.templates import _user_dir, _VAR_PATTERN
+
+    if not prompt:
+        console.print("[red]--prompt is required. Use {{input}} for the main variable.[/red]")
+        raise typer.Exit(1)
+
+    found_vars = set(_VAR_PATTERN.findall(prompt))
+    if system:
+        found_vars.update(_VAR_PATTERN.findall(system))
+
+    variables: dict[str, dict] = {}
+    for v in sorted(found_vars):
+        variables[v] = {"required": True, "description": f"Value for {v}"}
+
+    template_data = {
+        "name": name,
+        "description": description or f"Custom template: {name}",
+        "system": system,
+        "prompt": prompt,
+        "variables": variables,
+        "parameters": {"temperature": 0.7, "max_tokens": 2048},
+    }
+
+    out_path = _user_dir(create=True) / f"{name}.yaml"
+    out_path.write_text(yaml.dump(template_data, default_flow_style=False, sort_keys=False))
+
+    console.print(f"[green]Template created: {out_path}[/green]")
+    console.print(f"[dim]Run it with: ppmlx template run {name} --var input=\"your text\"[/dim]")
 
 
 if __name__ == "__main__":
