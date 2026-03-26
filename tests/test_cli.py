@@ -161,3 +161,121 @@ def test_serve_help():
     assert result.exit_code == 0
     assert "--host" in result.output or "host" in result.output
     assert "--port" in result.output or "port" in result.output
+
+
+# ── pull --quantize tests ────────────────────────────────────────────────
+
+
+def _setup_pull_quantize_mocks():
+    """Set up mocks for pull --quantize tests."""
+    from pathlib import Path
+
+    ModelNotFoundError = type("ModelNotFoundError", (Exception,), {})
+    sys.modules["ppmlx.models"].ModelNotFoundError = ModelNotFoundError
+    sys.modules["ppmlx.models"].resolve_alias = MagicMock(
+        return_value="mlx-community/Mistral-7B-Instruct-v0.3"
+    )
+    sys.modules["ppmlx.models"].download_model = MagicMock(
+        return_value=Path("/tmp/mistral-fp")
+    )
+    sys.modules["ppmlx.memory"].check_memory_warning = MagicMock(return_value=None)
+    sys.modules["ppmlx.memory"].get_system_ram_gb = MagicMock(return_value=16.0)
+
+    QuantizationError = type("QuantizationError", (Exception,), {})
+    QuantizeConfig = MagicMock()
+    sys.modules["ppmlx.quantize"].QuantizationError = QuantizationError
+    sys.modules["ppmlx.quantize"].QuantizeConfig = QuantizeConfig
+    sys.modules["ppmlx.quantize"].quantize = MagicMock(
+        return_value=Path("/tmp/mistral-4bit")
+    )
+    return QuantizeConfig, QuantizationError
+
+
+def test_pull_quantize_downloads_and_quantizes():
+    """pull --quantize downloads the model then runs quantization."""
+    QuantizeConfig, _ = _setup_pull_quantize_mocks()
+
+    with patch("shutil.rmtree") as mock_rmtree:
+        result = runner.invoke(app, ["pull", "mistral", "--quantize"])
+
+    assert result.exit_code == 0
+    # Download should be called
+    sys.modules["ppmlx.models"].download_model.assert_called_once()
+    # Quantize should be called
+    sys.modules["ppmlx.quantize"].quantize.assert_called_once()
+    call_kwargs = sys.modules["ppmlx.quantize"].quantize.call_args
+    # Should pass local_path keyword
+    assert "local_path" in call_kwargs.kwargs or (
+        len(call_kwargs) > 1 and call_kwargs[1].get("local_path") is not None
+    )
+
+
+def test_pull_quantize_with_bits():
+    """pull --quantize --bits 8 passes the correct bit depth."""
+    QuantizeConfig, _ = _setup_pull_quantize_mocks()
+
+    with patch("shutil.rmtree"):
+        result = runner.invoke(app, ["pull", "mistral", "--quantize", "--bits", "8"])
+
+    assert result.exit_code == 0
+    # QuantizeConfig should have been called with bits=8
+    cfg_call = QuantizeConfig.call_args
+    assert cfg_call is not None
+    assert cfg_call.kwargs.get("bits") == 8 or (cfg_call.args and 8 in cfg_call.args)
+
+
+def test_pull_quantize_invalid_bits():
+    """pull --quantize --bits 5 fails with a validation error."""
+    _setup_pull_quantize_mocks()
+
+    result = runner.invoke(app, ["pull", "mistral", "--quantize", "--bits", "5"])
+    assert result.exit_code == 1
+    assert "Invalid --bits" in result.output
+
+
+def test_pull_quantize_keep_original():
+    """pull --quantize --keep-original does not remove the original download."""
+    _setup_pull_quantize_mocks()
+
+    with patch("shutil.rmtree") as mock_rmtree:
+        result = runner.invoke(
+            app, ["pull", "mistral", "--quantize", "--keep-original"]
+        )
+
+    assert result.exit_code == 0
+    # rmtree should NOT have been called since we asked to keep original
+    mock_rmtree.assert_not_called()
+
+
+def test_pull_quantize_removes_original_by_default():
+    """pull --quantize without --keep-original removes the original download."""
+    _setup_pull_quantize_mocks()
+
+    with patch("shutil.rmtree") as mock_rmtree:
+        result = runner.invoke(app, ["pull", "mistral", "--quantize"])
+
+    assert result.exit_code == 0
+    # rmtree should have been called to remove the original
+    mock_rmtree.assert_called_once()
+
+
+def test_pull_quantize_failure():
+    """pull --quantize exits with 1 when quantization fails."""
+    _, QuantizationError = _setup_pull_quantize_mocks()
+    sys.modules["ppmlx.quantize"].quantize = MagicMock(
+        side_effect=QuantizationError("conversion failed")
+    )
+
+    result = runner.invoke(app, ["pull", "mistral", "--quantize"])
+    assert result.exit_code == 1
+    assert "Quantization failed" in result.output
+
+
+def test_pull_without_quantize_unchanged():
+    """pull without --quantize still works as before (no quantization)."""
+    _setup_pull_quantize_mocks()
+
+    result = runner.invoke(app, ["pull", "mistral"])
+    assert result.exit_code == 0
+    # Quantize should NOT be called
+    sys.modules["ppmlx.quantize"].quantize.assert_not_called()

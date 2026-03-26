@@ -1,4 +1,6 @@
 from __future__ import annotations
+import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -40,13 +42,58 @@ def _resolve_source(hf_path_or_alias: str) -> str:
         return hf_path_or_alias
 
 
+def is_already_quantized(model_path: Path) -> bool:
+    """Check if a model directory already contains quantized weights."""
+    if not model_path.is_dir():
+        return False
+    # Quantized MLX models typically have a config.json with quantization info
+    config_file = model_path / "config.json"
+    if config_file.exists():
+        try:
+            data = json.loads(config_file.read_text())
+            if data.get("quantization"):
+                return True
+        except Exception:
+            pass
+    # Also check for quantized weight file naming patterns
+    for f in model_path.iterdir():
+        if f.suffix == ".safetensors" and "quantized" in f.name.lower():
+            return True
+    return False
+
+
+def check_disk_space(output_path: Path, required_bytes: int | None = None) -> str | None:
+    """Check available disk space. Returns a warning string if low, else None."""
+    try:
+        usage = shutil.disk_usage(output_path.parent if output_path.parent.exists() else Path.home())
+        free_gb = usage.free / (1024 ** 3)
+        if required_bytes:
+            required_gb = required_bytes / (1024 ** 3)
+            if free_gb < required_gb * 1.5:
+                return (
+                    f"Low disk space: {free_gb:.1f} GB free, "
+                    f"estimated {required_gb:.1f} GB needed for quantized model."
+                )
+        elif free_gb < 5:
+            return f"Low disk space: only {free_gb:.1f} GB free."
+    except Exception:
+        pass
+    return None
+
+
 def quantize(
     hf_path_or_alias: str,
     config: QuantizeConfig | None = None,
     progress_callback: Callable[[str], None] | None = None,
+    *,
+    local_path: Path | None = None,
 ) -> Path:
     """
-    Quantize a HuggingFace model to MLX format.
+    Quantize a model to MLX format.
+
+    When *local_path* is provided the model is read from that directory instead
+    of being downloaded from HuggingFace.  *hf_path_or_alias* is still used to
+    derive the output path and alias name.
 
     Returns the local path where the quantized model is saved.
     """
@@ -57,12 +104,24 @@ def quantize(
     output_path = config.output_path or _get_output_path(repo_id, config.bits)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    source = str(local_path) if local_path else repo_id
+
+    source_path = local_path or Path(source)
+    if source_path.is_dir() and is_already_quantized(source_path):
+        if progress_callback:
+            progress_callback("Model appears to be already quantized, proceeding anyway...")
+
+    # Warn about disk space
+    disk_warning = check_disk_space(output_path)
+    if disk_warning and progress_callback:
+        progress_callback(f"Warning: {disk_warning}")
+
     if progress_callback:
         progress_callback(f"Converting {repo_id} to {config.bits}-bit MLX format...")
 
-    success = _try_python_api(repo_id, output_path, config)
+    success = _try_python_api(source, output_path, config)
     if not success:
-        success = _try_subprocess(repo_id, output_path, config, progress_callback)
+        success = _try_subprocess(source, output_path, config, progress_callback)
 
     if not success:
         raise QuantizationError(
@@ -81,7 +140,7 @@ def quantize(
     return output_path
 
 
-def _try_python_api(repo_id: str, output_path: Path, config: QuantizeConfig) -> bool:
+def _try_python_api(source: str, output_path: Path, config: QuantizeConfig) -> bool:
     """Try calling mlx_lm.convert Python API."""
     try:
         import mlx_lm
@@ -89,7 +148,7 @@ def _try_python_api(repo_id: str, output_path: Path, config: QuantizeConfig) -> 
         if convert_fn is None:
             return False
         convert_fn(
-            hf_path=repo_id,
+            hf_path=source,
             mlx_path=str(output_path),
             quantize=True,
             q_bits=config.bits,
@@ -102,7 +161,7 @@ def _try_python_api(repo_id: str, output_path: Path, config: QuantizeConfig) -> 
 
 
 def _try_subprocess(
-    repo_id: str,
+    source: str,
     output_path: Path,
     config: QuantizeConfig,
     progress_callback: Callable[[str], None] | None,
@@ -111,7 +170,7 @@ def _try_subprocess(
     try:
         cmd = [
             sys.executable, "-m", "mlx_lm.convert",
-            "--hf-path", repo_id,
+            "--hf-path", source,
             "--mlx-path", str(output_path),
             "--quantize",
             "--q-bits", str(config.bits),

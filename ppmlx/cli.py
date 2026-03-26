@@ -25,6 +25,8 @@ app = typer.Typer(
 )
 console = Console()
 
+_VALID_QUANTIZE_BITS = frozenset({2, 3, 4, 6, 8})
+
 
 @dataclass
 class _LaunchItem:
@@ -1481,7 +1483,14 @@ def run(
         continue
 
 
-def _do_pull(model: str, token: Optional[str]) -> bool:
+def _do_pull(
+    model: str,
+    token: Optional[str],
+    *,
+    do_quantize: bool = False,
+    bits: int = 4,
+    keep_original: bool = False,
+) -> bool:
     """Download a single model and print result. Returns True on success."""
     from ppmlx.models import download_model, resolve_alias, ModelNotFoundError
     from ppmlx.memory import check_memory_warning
@@ -1499,7 +1508,6 @@ def _do_pull(model: str, token: Optional[str]) -> bool:
         warning = check_memory_warning(local_path)
         if warning:
             console.print(f"[yellow]{warning}[/yellow]")
-        return True
     except KeyboardInterrupt:
         console.print("\n[yellow]Download cancelled.[/yellow]")
         return False
@@ -1507,13 +1515,56 @@ def _do_pull(model: str, token: Optional[str]) -> bool:
         console.print(f"[red]Pull failed: {e}[/red]")
         return False
 
+    if do_quantize:
+        from ppmlx.quantize import (
+            quantize as run_quantize,
+            QuantizeConfig,
+            QuantizationError,
+        )
+
+        console.print(
+            f"[blue]Quantizing [bold]{model}[/bold] to {bits}-bit...[/blue]"
+        )
+        cfg = QuantizeConfig(bits=bits, hf_token=token)
+        try:
+            quantized_path = run_quantize(
+                model,
+                cfg,
+                progress_callback=lambda msg: console.print(
+                    f"  [dim]{msg}[/dim]"
+                ),
+                local_path=local_path,
+            )
+            console.print(
+                f"[green]✓ Quantized model saved to {quantized_path}[/green]"
+            )
+        except QuantizationError as e:
+            console.print(f"[red]Quantization failed: {e}[/red]")
+            return False
+
+        if not keep_original:
+            console.print(
+                f"[dim]Removing original download at {local_path}...[/dim]"
+            )
+            shutil.rmtree(local_path, ignore_errors=True)
+            console.print("[dim]Original removed.[/dim]")
+
+    return True
+
 
 @app.command()
 def pull(
     model: Optional[str] = typer.Argument(None, help="Model alias or HuggingFace repo ID (omit for interactive selector)"),
     token: Optional[str] = typer.Option(None, "--token", help="HuggingFace token"),
+    do_quantize: bool = typer.Option(False, "--quantize", "-q", help="Quantize the model after downloading"),
+    bits: int = typer.Option(4, "--bits", help="Quantization bit depth (2, 3, 4, 6, or 8)"),
+    keep_original: bool = typer.Option(False, "--keep-original", help="Keep the full-precision download after quantization"),
 ):
     """Download a model from HuggingFace Hub (interactive multiselect when no model given)."""
+    if do_quantize and bits not in _VALID_QUANTIZE_BITS:
+        console.print(f"[red]Invalid --bits value: {bits}. Must be one of {sorted(_VALID_QUANTIZE_BITS)}.[/red]")
+        raise typer.Exit(1)
+
     if model is None:
         import questionary
 
@@ -1537,10 +1588,10 @@ def pull(
             return
 
         for m in selected:
-            _do_pull(m, token)
+            _do_pull(m, token, do_quantize=do_quantize, bits=bits, keep_original=keep_original)
         return
 
-    if not _do_pull(model, token):
+    if not _do_pull(model, token, do_quantize=do_quantize, bits=bits, keep_original=keep_original):
         raise typer.Exit(1)
 
 
