@@ -324,9 +324,12 @@ async def health(request: Request):
     """Health check endpoint."""
     try:
         from ppmlx.engine import get_engine
-        loaded = get_engine().list_loaded()
+        engine = get_engine()
+        loaded = engine.list_loaded()
+        loaded_info = engine.list_loaded_info()
     except Exception:
         loaded = []
+        loaded_info = []
 
     try:
         from ppmlx.memory import get_system_ram_gb
@@ -345,6 +348,7 @@ async def health(request: Request):
         "status": "ok",
         "version": __version__,
         "loaded_models": loaded,
+        "loaded_models_info": loaded_info,
         "uptime_seconds": int(time.time() - _start_time),
         "system": {
             "memory_total_gb": round(ram_gb, 1),

@@ -395,3 +395,177 @@ def test_stream_generate_strip_thinking_false():
     ))
     assert "<think>" in result
     assert "reason" in result
+
+
+# ---------------------------------------------------------------------------
+# TTL / auto-unload tests
+# ---------------------------------------------------------------------------
+def test_last_used_at_updated_on_load():
+    """last_used_at is set when a model is loaded."""
+    import time
+    fake, _, _ = _make_fake_mlx_lm()
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    before = time.monotonic()
+    engine.load("model/a")
+    after = time.monotonic()
+
+    info = engine.list_loaded_info()
+    assert len(info) == 1
+    # last_used_at should be between before and after (within idle_seconds tolerance)
+    assert info[0]["idle_seconds"] >= 0
+    assert info[0]["idle_seconds"] < (after - before + 1)
+
+
+def test_last_used_at_updated_on_generate():
+    """last_used_at is updated when generate is called (re-load touches it)."""
+    import time
+    fake, _, _ = _make_fake_mlx_lm(generate_return="Hello!")
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    engine.load("model/a")
+    time.sleep(0.05)
+
+    before_gen = time.monotonic()
+    engine.generate("model/a", [{"role": "user", "content": "hi"}])
+    after_gen = time.monotonic()
+
+    info = engine.list_loaded_info()
+    assert len(info) == 1
+    # idle_seconds should be very small since we just used it
+    assert info[0]["idle_seconds"] < (after_gen - before_gen + 1)
+
+
+def test_reaper_unloads_idle_models():
+    """Reaper thread unloads models that have been idle longer than ttl_seconds."""
+    import time
+    fake, _, _ = _make_fake_mlx_lm()
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=1)
+    engine.stop_reaper()  # stop automatic reaper; we'll sweep manually
+
+    engine.load("model/a")
+    engine.load("model/b")
+    assert len(engine.list_loaded()) == 2
+
+    # Manually set last_used_at to the past to simulate idle
+    with engine._lock:
+        engine._models["model/a"].last_used_at = time.monotonic() - 100
+
+    expired = engine._reap_expired()
+    assert "model/a" in expired
+
+    loaded = engine.list_loaded()
+    assert "model/a" not in loaded, "idle model/a should have been unloaded"
+    assert "model/b" in loaded, "recently used model/b should still be loaded"
+
+
+def test_reaper_does_not_unload_recently_used():
+    """Reaper should not unload models that were recently used."""
+    fake, _, _ = _make_fake_mlx_lm()
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=3600)  # 1 hour TTL
+    engine.stop_reaper()  # stop automatic reaper
+
+    engine.load("model/a")
+
+    expired = engine._reap_expired()
+    assert expired == [], "recently loaded model should not be expired"
+    assert "model/a" in engine.list_loaded()
+
+
+def test_ttl_disabled_no_reaper_thread():
+    """When ttl_seconds=0, no reaper thread should be started."""
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=0)
+    assert engine._reaper_thread is None
+    engine.stop_reaper()
+
+
+def test_ttl_enabled_starts_reaper_thread():
+    """When ttl_seconds>0, a daemon reaper thread should be started."""
+    fake, _, _ = _make_fake_mlx_lm()
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=300)
+    assert engine._reaper_thread is not None
+    assert engine._reaper_thread.daemon is True
+    assert engine._reaper_thread.is_alive()
+    engine.stop_reaper()
+    assert engine._reaper_thread is None
+
+
+def test_list_loaded_info_with_ttl():
+    """list_loaded_info should include ttl_remaining_seconds when TTL is configured."""
+    fake, _, _ = _make_fake_mlx_lm()
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=300)
+    engine.stop_reaper()
+
+    engine.load("model/a")
+    info = engine.list_loaded_info()
+    assert len(info) == 1
+    assert "ttl_remaining_seconds" in info[0]
+    assert info[0]["ttl_remaining_seconds"] > 0
+    assert info[0]["ttl_remaining_seconds"] <= 300
+    engine.stop_reaper()
+
+
+def test_list_loaded_info_without_ttl():
+    """list_loaded_info should NOT include ttl_remaining_seconds when TTL is disabled."""
+    fake, _, _ = _make_fake_mlx_lm()
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=0)
+
+    engine.load("model/a")
+    info = engine.list_loaded_info()
+    assert len(info) == 1
+    assert "ttl_remaining_seconds" not in info[0]
+    assert "idle_seconds" in info[0]
+
+
+def test_reaper_thread_cleanup():
+    """stop_reaper should cleanly shut down the reaper thread."""
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+
+    engine = TextEngine(max_loaded=2, ttl_seconds=60)
+    thread = engine._reaper_thread
+    assert thread is not None
+    assert thread.is_alive()
+
+    engine.stop_reaper()
+    assert not thread.is_alive()
+    assert engine._reaper_thread is None
+
+    # Calling stop_reaper again should be safe (no-op)
+    engine.stop_reaper()

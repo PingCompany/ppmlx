@@ -15,6 +15,7 @@ class LoadedModel:
     tokenizer: Any      # mlx_lm tokenizer object
     loaded_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
+    last_used_at: float = field(default_factory=time.monotonic)
 
 
 _THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -83,10 +84,52 @@ class TextEngine:
     Multiple concurrent requests for the same loaded model are fine.
     """
 
-    def __init__(self, max_loaded: int = 2):
+    _REAPER_INTERVAL = 30  # seconds between TTL reaper sweeps
+
+    def __init__(self, max_loaded: int = 2, ttl_seconds: int = 0):
         self._max_loaded = max_loaded
+        self._ttl_seconds = ttl_seconds
         self._models: OrderedDict[str, LoadedModel] = OrderedDict()
         self._lock = threading.Lock()
+        self._reaper_stop = threading.Event()
+        self._reaper_thread: threading.Thread | None = None
+        if self._ttl_seconds > 0:
+            self._start_reaper()
+
+    def _start_reaper(self) -> None:
+        """Start the background TTL reaper thread."""
+        self._reaper_stop.clear()
+        t = threading.Thread(target=self._ttl_reaper, daemon=True, name="ppmlx-ttl-reaper")
+        t.start()
+        self._reaper_thread = t
+
+    def _ttl_reaper(self) -> None:
+        """Background loop that unloads models idle longer than ttl_seconds."""
+        while not self._reaper_stop.wait(timeout=self._REAPER_INTERVAL):
+            self._reap_expired()
+
+    def _reap_expired(self) -> list[str]:
+        """Single sweep: unload models idle longer than ttl_seconds. Returns expired IDs."""
+        if self._ttl_seconds <= 0:
+            return []
+        now = time.monotonic()
+        expired: list[str] = []
+        with self._lock:
+            for repo_id, lm in list(self._models.items()):
+                if (now - lm.last_used_at) >= self._ttl_seconds:
+                    expired.append(repo_id)
+            for repo_id in expired:
+                del self._models[repo_id]
+        for repo_id in expired:
+            self._emit_event("unload", repo_id)
+        return expired
+
+    def stop_reaper(self) -> None:
+        """Signal the reaper thread to stop and wait for it to finish."""
+        self._reaper_stop.set()
+        if self._reaper_thread is not None:
+            self._reaper_thread.join(timeout=5)
+            self._reaper_thread = None
 
     def _load_impl(self, repo_id: str) -> LoadedModel:
         """Actually load a model using mlx_lm.load. Called under lock."""
@@ -106,6 +149,7 @@ class TextEngine:
                 self._models.move_to_end(repo_id)
                 lm = self._models[repo_id]
                 lm.last_used = time.time()
+                lm.last_used_at = time.monotonic()
                 return lm
 
             # Evict LRU if at capacity
@@ -392,18 +436,37 @@ class TextEngine:
         with self._lock:
             return list(self._models.keys())
 
+    def list_loaded_info(self) -> list[dict]:
+        """Return detailed info for each loaded model (for ps command)."""
+        now = time.monotonic()
+        with self._lock:
+            result = []
+            for repo_id, lm in self._models.items():
+                idle_seconds = now - lm.last_used_at
+                info: dict = {
+                    "repo_id": repo_id,
+                    "loaded_at": lm.loaded_at,
+                    "last_used": lm.last_used,
+                    "idle_seconds": round(idle_seconds, 1),
+                }
+                if self._ttl_seconds > 0:
+                    remaining = max(0, self._ttl_seconds - idle_seconds)
+                    info["ttl_remaining_seconds"] = round(remaining, 1)
+                result.append(info)
+            return result
+
 
 _engine_instance: TextEngine | None = None
 _engine_lock = threading.Lock()
 
 
-def get_engine(max_loaded: int = 2) -> TextEngine:
+def get_engine(max_loaded: int = 2, ttl_seconds: int = 0) -> TextEngine:
     """Return the module-level singleton TextEngine."""
     global _engine_instance
     if _engine_instance is None:
         with _engine_lock:
             if _engine_instance is None:
-                _engine_instance = TextEngine(max_loaded=max_loaded)
+                _engine_instance = TextEngine(max_loaded=max_loaded, ttl_seconds=ttl_seconds)
     return _engine_instance
 
 
@@ -411,5 +474,6 @@ def reset_engine() -> None:
     """Reset singleton (for testing)."""
     global _engine_instance
     if _engine_instance is not None:
+        _engine_instance.stop_reaper()
         _engine_instance.unload_all()
     _engine_instance = None

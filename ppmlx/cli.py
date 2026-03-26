@@ -1721,6 +1721,18 @@ def favs():
     console.print(table)
 
 
+def _format_duration(seconds: float) -> str:
+    """Format seconds as a human-readable duration (e.g. '2m 30s')."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {secs}s"
+
+
 @app.command()
 def ps():
     """Show currently loaded models and memory usage."""
@@ -1734,6 +1746,7 @@ def ps():
         response = httpx.get(url, timeout=3.0)
         data = response.json()
         loaded = data.get("loaded_models", [])
+        loaded_info = data.get("loaded_models_info", [])
         uptime = data.get("uptime_seconds", 0)
 
         if not loaded:
@@ -1742,8 +1755,22 @@ def ps():
 
         table = Table(title="Loaded Models")
         table.add_column("Model", style="cyan")
+        table.add_column("Idle", style="dim")
+        table.add_column("TTL", style="yellow")
+
+        # Build a lookup from loaded_info if available
+        info_by_id = {info["repo_id"]: info for info in loaded_info} if loaded_info else {}
+
         for m in loaded:
-            table.add_row(m)
+            info = info_by_id.get(m, {})
+            idle = _format_duration(info["idle_seconds"]) if "idle_seconds" in info else "-"
+            ttl = (
+                _format_duration(info["ttl_remaining_seconds"])
+                if "ttl_remaining_seconds" in info
+                else "off"
+            )
+            table.add_row(m, idle, ttl)
+
         console.print(table)
         console.print(f"[dim]Server uptime: {uptime}s[/dim]")
     except Exception:
