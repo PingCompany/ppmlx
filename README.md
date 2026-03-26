@@ -59,6 +59,38 @@ ppmlx serve
 
 ---
 
+## Benchmarks
+
+Measured on a MacBook Pro M4 Pro (48 GB unified memory, macOS 15.x). Each scenario was run 3 times with `temperature=0` and `max_tokens=8192`; values below are averages.
+
+### GLM-4.7-Flash (4-bit, ~5 GB)
+
+| Scenario | Metric | ppmlx | Ollama | Delta |
+|---|---|---|---|---|
+| **Simple** (short prompt, short answer) | tok/s | 63.1 | 40.5 | **+56%** |
+| | TTFT | 374 ms | 832 ms | **-55%** |
+| **Complex** (short prompt, long answer) | tok/s | 55.6 | 38.8 | **+43%** |
+| | TTFT | 496 ms | 412 ms | +20% |
+| **Long context** (~4 K token prompt) | tok/s | 42.1 | 27.5 | **+53%** |
+| | TTFT | 6,792 ms | 8,401 ms | **-19%** |
+
+### Qwen 3.5 9B (4-bit, ~6 GB)
+
+| Scenario | Metric | ppmlx | Ollama | Delta |
+|---|---|---|---|---|
+| **Simple** | tok/s | 48.2 | 22.7 | **+112%** |
+| | TTFT | 537 ms | 324 ms | +66% |
+| **Complex** | tok/s | 47.2 | 23.0 | **+106%** |
+| | TTFT | 567 ms | 455 ms | +25% |
+| **Long context** | tok/s | 43.2 | 23.7 | **+82%** |
+| | TTFT | 9,212 ms | 11,461 ms | **-20%** |
+
+> **tok/s** = tokens per second (higher is better). **TTFT** = time to first token (lower is better). Delta is relative to Ollama.
+
+**Methodology.** Streaming chat completions over the OpenAI-compatible API; TTFT measured from request start to first SSE content chunk. See [`scripts/bench_common.sh`](scripts/bench_common.sh) and the per-model scripts in `scripts/` for the full, reproducible setup.
+
+---
+
 ## OpenAI SDK Example
 
 ```python
