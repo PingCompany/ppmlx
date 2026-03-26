@@ -317,6 +317,18 @@ def _normalize_tool_messages(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _speculative_kwargs(
+    draft_model: str | None, speculative_tokens: int | None,
+) -> dict:
+    """Build keyword arguments for speculative decoding (empty if disabled)."""
+    if draft_model is None:
+        return {}
+    kw: dict = {"draft_model": draft_model}
+    if speculative_tokens is not None:
+        kw["num_draft_tokens"] = speculative_tokens
+    return kw
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -463,11 +475,23 @@ async def chat_completions(request: Request):
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
 
+    # ppmlx extension: speculative decoding via draft model
+    draft_model = body.get("draft_model")
+    speculative_tokens = body.get("speculative_tokens")
+
     try:
         from ppmlx.models import resolve_alias
         repo_id = resolve_alias(model_name)
     except Exception:
         repo_id = model_name
+
+    # Resolve draft model alias (reuses same resolve_alias)
+    draft_repo_id: str | None = None
+    if draft_model:
+        try:
+            draft_repo_id = resolve_alias(draft_model)
+        except Exception:
+            draft_repo_id = draft_model
 
     has_imgs = _has_images(messages)
     engine_type = _route_engine(repo_id, has_imgs)
@@ -481,12 +505,16 @@ async def chat_completions(request: Request):
             request_id, created, model_name, repo_id, messages,
             engine_type, temperature, top_p, max_tokens, stop, seed,
             repetition_penalty, request, start_ts, tools,
+            draft_model=draft_repo_id,
+            speculative_tokens=speculative_tokens,
         )
     else:
         return await _nonstream_chat(
             request_id, created, model_name, repo_id, messages,
             engine_type, temperature, top_p, max_tokens, stop, seed,
             repetition_penalty, request, start_ts, tools,
+            draft_model=draft_repo_id,
+            speculative_tokens=speculative_tokens,
         )
 
 
@@ -494,6 +522,7 @@ def _stream_chat(
     request_id, created, model_name, repo_id, messages,
     engine_type, temperature, top_p, max_tokens, stop, seed,
     repetition_penalty, request, start_ts, tools=None,
+    draft_model=None, speculative_tokens=None,
 ):
     """Return streaming SSE response."""
     from fastapi.responses import StreamingResponse
@@ -513,6 +542,7 @@ def _stream_chat(
                     max_tokens=max_tokens,
                     seed=seed,
                     tools=tools,
+                    **_speculative_kwargs(draft_model, speculative_tokens),
                 )
                 async for chunk in _async_iter_sync_gen(gen):
                     full_text += chunk
@@ -610,6 +640,7 @@ async def _nonstream_chat(
     request_id, created, model_name, repo_id, messages,
     engine_type, temperature, top_p, max_tokens, stop, seed,
     repetition_penalty, request, start_ts, tools=None,
+    draft_model=None, speculative_tokens=None,
 ):
     """Return non-streaming JSON response."""
     try:
@@ -624,6 +655,7 @@ async def _nonstream_chat(
                 seed=seed,
                 repetition_penalty=repetition_penalty,
                 tools=tools,
+                **_speculative_kwargs(draft_model, speculative_tokens),
             )
         elif engine_type == "vision":
             from ppmlx.engine_vlm import get_vision_engine

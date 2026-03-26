@@ -21,6 +21,8 @@ class DefaultsConfig:
     temperature: float = 0.7
     top_p: float = 1.0
     max_tokens: int = 2048
+    draft_model: str | None = None
+    speculative_tokens: int = 5
 
 
 @dataclass
@@ -89,6 +91,8 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         if "temperature" in d: cfg.defaults.temperature = float(d["temperature"])
         if "top_p" in d: cfg.defaults.top_p = float(d["top_p"])
         if "max_tokens" in d: cfg.defaults.max_tokens = int(d["max_tokens"])
+        if "draft_model" in d: cfg.defaults.draft_model = str(d["draft_model"]) if d["draft_model"] else None
+        if "speculative_tokens" in d: cfg.defaults.speculative_tokens = int(d["speculative_tokens"])
     if "logging" in data:
         lg = data["logging"]
         if "enabled" in lg: cfg.logging.enabled = bool(lg["enabled"])
@@ -113,6 +117,8 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_TEMP": ("defaults", "temperature", float),
         "PPMLX_TOP_P": ("defaults", "top_p", float),
         "PPMLX_MAX_TOKENS": ("defaults", "max_tokens", int),
+        "PPMLX_DRAFT_MODEL": ("defaults", "draft_model", str),
+        "PPMLX_SPECULATIVE_TOKENS": ("defaults", "speculative_tokens", int),
         "PPMLX_LOG_ENABLED": ("logging", "enabled", _parse_bool),
         "PPMLX_LOG_SNAPSHOT_INTERVAL": ("logging", "snapshot_interval_seconds", int),
         "PPMLX_MEMORY_WIRED_LIMIT": ("memory", "wired_limit_mb", int),
@@ -137,3 +143,5 @@ def _apply_cli(cfg: Config, overrides: dict) -> None:
         elif key == "model": cfg.defaults.model = str(val)
         elif key == "temperature": cfg.defaults.temperature = float(val)
         elif key == "max_tokens": cfg.defaults.max_tokens = int(val)
+        elif key == "draft_model": cfg.defaults.draft_model = str(val) if val else None
+        elif key == "speculative_tokens": cfg.defaults.speculative_tokens = int(val)

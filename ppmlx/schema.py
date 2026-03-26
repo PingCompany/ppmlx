@@ -49,6 +49,8 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     seed: int | None = None
     repetition_penalty: float | None = None  # ppmlx extension
+    draft_model: str | None = None  # ppmlx extension: speculative decoding
+    speculative_tokens: int | None = None  # ppmlx extension: draft tokens per step
 
 
 # ── Chat completion response ────────────────────────────────────────────

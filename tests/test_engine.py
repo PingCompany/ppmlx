@@ -395,3 +395,161 @@ def test_stream_generate_strip_thinking_false():
     ))
     assert "<think>" in result
     assert "reason" in result
+
+
+# ---------------------------------------------------------------------------
+# 16. Speculative decoding: generate passes draft_model to mlx-lm
+# ---------------------------------------------------------------------------
+def test_generate_with_draft_model():
+    """When draft_model is specified, both models are loaded and
+    draft_model + num_draft_tokens are passed to mlx_lm.generate."""
+    fake, mock_model, mock_tokenizer = _make_fake_mlx_lm(generate_return="fast answer")
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=3)
+
+    text, reasoning, pt, ct = engine.generate(
+        "target/model",
+        [{"role": "user", "content": "hi"}],
+        draft_model="draft/model",
+        num_draft_tokens=4,
+    )
+
+    # mlx_lm.generate should have been called with draft_model and num_draft_tokens
+    call_kwargs = fake.generate.call_args
+    assert call_kwargs is not None
+    _, kwargs = call_kwargs
+    assert "draft_model" in kwargs
+    assert kwargs["num_draft_tokens"] == 4
+
+    # Both target and draft should be loaded in the engine cache
+    loaded = engine.list_loaded()
+    assert "target/model" in loaded
+    assert "draft/model" in loaded
+
+    # Result should still come through correctly
+    assert text == "fast answer"
+    assert reasoning is None
+
+
+# ---------------------------------------------------------------------------
+# 17. Speculative decoding: stream_generate passes draft_model to mlx-lm
+# ---------------------------------------------------------------------------
+def test_stream_generate_with_draft_model():
+    """When draft_model is specified, stream_generate passes it to mlx-lm."""
+    chunks = ["fast", " ", "stream"]
+    fake, mock_model, mock_tokenizer = _make_fake_mlx_lm(stream_chunks=chunks)
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=3)
+
+    result = list(engine.stream_generate(
+        "target/model",
+        [{"role": "user", "content": "hi"}],
+        draft_model="draft/model",
+        num_draft_tokens=3,
+    ))
+
+    # mlx_lm.stream_generate should have been called with draft_model
+    call_kwargs = fake.stream_generate.call_args
+    assert call_kwargs is not None
+    _, kwargs = call_kwargs
+    assert "draft_model" in kwargs
+    assert kwargs["num_draft_tokens"] == 3
+
+    assert result == chunks
+
+    # Both models should be in the cache
+    loaded = engine.list_loaded()
+    assert "target/model" in loaded
+    assert "draft/model" in loaded
+
+
+# ---------------------------------------------------------------------------
+# 18. No draft_model = normal generation (backward compatible)
+# ---------------------------------------------------------------------------
+def test_generate_without_draft_model_no_speculative_kwargs():
+    """Without draft_model, mlx_lm.generate should NOT receive speculative kwargs."""
+    fake, mock_model, mock_tokenizer = _make_fake_mlx_lm(generate_return="normal")
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    engine.generate(
+        "some/model",
+        [{"role": "user", "content": "hi"}],
+    )
+
+    call_kwargs = fake.generate.call_args
+    assert call_kwargs is not None
+    _, kwargs = call_kwargs
+    assert "draft_model" not in kwargs
+    assert "num_draft_tokens" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# 19. Draft model uses LRU cache (same model object returned)
+# ---------------------------------------------------------------------------
+def test_draft_model_uses_lru_cache():
+    """The draft model should be cached and reused across calls."""
+    fake, mock_model, mock_tokenizer = _make_fake_mlx_lm(generate_return="ok")
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=3)
+
+    engine.generate(
+        "target/model",
+        [{"role": "user", "content": "call 1"}],
+        draft_model="draft/model",
+    )
+
+    # mlx_lm.load was called twice (target + draft)
+    assert fake.load.call_count == 2
+
+    engine.generate(
+        "target/model",
+        [{"role": "user", "content": "call 2"}],
+        draft_model="draft/model",
+    )
+
+    # On second call, both models should be cached — no additional loads
+    assert fake.load.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# 20. Draft model participates in LRU eviction
+# ---------------------------------------------------------------------------
+def test_draft_model_lru_eviction():
+    """With max_loaded=2, loading target + draft fills the cache; loading a
+    third model evicts the LRU entry."""
+    fake, _, _ = _make_fake_mlx_lm(generate_return="ok")
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    # Load target and draft (fills cache to 2)
+    engine.generate(
+        "target/model",
+        [{"role": "user", "content": "hi"}],
+        draft_model="draft/model",
+    )
+    assert len(engine.list_loaded()) == 2
+
+    # Loading a third model should evict the LRU
+    engine.load("other/model")
+    loaded = engine.list_loaded()
+    assert len(loaded) == 2
+    assert "other/model" in loaded
+    # target/model was loaded first and not touched after draft, so it might be LRU
+    # depending on access pattern. The key point is the cache respects max_loaded.
+    assert "target/model" not in loaded or "draft/model" not in loaded
