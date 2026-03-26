@@ -1,0 +1,87 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const canonicalURL = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalURL} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content="43-112% faster than GGUF translation layers. OpenAI-compatible API on localhost." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://ppmlx.dev" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content="43-112% faster than GGUF. OpenAI-compatible API on localhost. 168+ models." />
+    <meta name="keywords" content="MLX, Apple Silicon, LLM, local inference, Ollama alternative, OpenAI API, macOS, M1, M2, M3, M4, Metal GPU, ppmlx" />
+    <script type="application/ld+json" set:html={JSON.stringify({
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "ppmlx",
+      "url": "https://ppmlx.dev",
+      "description": "MLX-native LLM inference server for Apple Silicon. OpenAI-compatible API. 168+ models. 43-112% faster than GGUF translation layers like Ollama.",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS (Apple Silicon)",
+      "license": "https://opensource.org/licenses/MIT",
+      "downloadUrl": "https://pypi.org/project/ppmlx/",
+      "codeRepository": "https://github.com/PingCompany/ppmlx",
+      "softwareVersion": "0.1.0",
+      "author": { "@type": "Organization", "name": "The Focus Company", "url": "https://thefocus.company" },
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "featureList": [
+        "MLX-native inference on Apple Silicon Metal GPU",
+        "OpenAI-compatible API (Chat Completions, Responses, Embeddings)",
+        "Anthropic Messages API support",
+        "168+ curated model registry with human aliases",
+        "Tool calling / function calling for coding agents",
+        "Vision model support via mlx-vlm",
+        "Interactive TUI model picker and chat REPL",
+        "43-112% faster than Ollama on Apple Silicon benchmarks"
+      ]
+    })} />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300&family=DM+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div class="grid-bg" aria-hidden="true"></div>
+    <slot />
+    <script>
+      // Reveal on scroll
+      const obs = new IntersectionObserver(
+        (entries) => entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("visible"); obs.unobserve(e.target); } }),
+        { threshold: 0.1, rootMargin: "0px 0px -40px 0px" }
+      );
+      document.querySelectorAll(".reveal").forEach((el) => obs.observe(el));
+
+      // Nav scroll effect
+      const nav = document.querySelector("nav");
+      if (nav) {
+        window.addEventListener("scroll", () => {
+          requestAnimationFrame(() => nav.classList.toggle("scrolled", scrollY > 40));
+        });
+      }
+
+      // Copy install command
+      document.querySelectorAll<HTMLElement>(".install-cmd").forEach((el) => {
+        el.addEventListener("click", () => {
+          navigator.clipboard.writeText(el.dataset.copy || "uv tool install ppmlx");
+          const t = el.querySelector(".tooltip");
+          if (t) { t.classList.add("show"); setTimeout(() => t.classList.remove("show"), 1500); }
+        });
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,122 @@
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg-deep: #07080a;
+  --bg-surface: #0d0f13;
+  --bg-elevated: #13161c;
+  --bg-card: #181b22;
+  --border: #1e2229;
+  --border-subtle: #15181e;
+  --text-primary: #e8eaed;
+  --text-secondary: #8b919e;
+  --text-dim: #545a66;
+  --accent: #d4833c;
+  --accent-bright: #e8a04c;
+  --accent-glow: rgba(212, 131, 60, 0.12);
+  --accent-glow-strong: rgba(212, 131, 60, 0.25);
+  --teal: #3db5a6;
+  --teal-dim: rgba(61, 181, 166, 0.15);
+  --blue: #5b8af5;
+  --rose: #e85d75;
+  --font-display: 'Crimson Pro', Georgia, serif;
+  --font-body: 'Outfit', system-ui, sans-serif;
+  --font-mono: 'DM Mono', 'SF Mono', 'Fira Code', monospace;
+  --section-gap: clamp(64px, 10vw, 120px);
+  --content-max: 1120px;
+  --content-wide: 1280px;
+}
+
+html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; }
+
+body {
+  font-family: var(--font-body); font-weight: 300; color: var(--text-primary);
+  background: var(--bg-deep); line-height: 1.65; overflow-x: hidden; font-size: 16px;
+}
+
+body::before {
+  content: ''; position: fixed; inset: 0; z-index: 9999; pointer-events: none; opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 256px;
+}
+
+.grid-bg {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background-image: linear-gradient(var(--border-subtle) 1px, transparent 1px), linear-gradient(90deg, var(--border-subtle) 1px, transparent 1px);
+  background-size: 80px 80px;
+  mask-image: radial-gradient(ellipse 70% 50% at 50% 30%, rgba(0,0,0,0.4) 0%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 50% at 50% 30%, rgba(0,0,0,0.4) 0%, transparent 100%);
+}
+
+::selection { background: var(--accent-glow-strong); color: var(--accent-bright); }
+.container { max-width: var(--content-max); margin: 0 auto; padding: 0 clamp(20px, 4vw, 48px); }
+.container--wide { max-width: var(--content-wide); }
+
+/* Reveal on scroll */
+.reveal {
+  opacity: 0; transform: translateY(24px);
+  transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal.visible { opacity: 1; transform: translateY(0); }
+.reveal-delay-1 { transition-delay: 0.08s; }
+.reveal-delay-2 { transition-delay: 0.16s; }
+.reveal-delay-3 { transition-delay: 0.24s; }
+
+/* Sections */
+.section { position: relative; z-index: 1; padding: var(--section-gap) 0; }
+.section-label {
+  font-family: var(--font-mono); font-size: 12px; color: var(--accent);
+  letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 12px;
+}
+.section-title {
+  font-family: var(--font-display); font-weight: 300;
+  font-size: clamp(30px, 4vw, 48px); line-height: 1.1;
+  letter-spacing: -0.02em; margin-bottom: 16px;
+}
+.section-sub {
+  font-size: 17px; color: var(--text-secondary); max-width: 540px;
+  font-weight: 300; line-height: 1.6;
+}
+
+/* Button */
+.btn-primary {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 12px 24px; background: var(--accent); color: var(--bg-deep);
+  border-radius: 8px; font-family: var(--font-mono); font-size: 14px; font-weight: 500;
+  text-decoration: none; transition: transform 0.15s, box-shadow 0.3s;
+}
+.btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 24px var(--accent-glow-strong); }
+
+/* Install command */
+.install-cmd {
+  display: inline-flex; align-items: center; gap: 12px;
+  padding: 12px 20px; background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: 8px; font-family: var(--font-mono); font-size: 14px;
+  color: var(--text-primary); cursor: pointer; transition: border-color 0.2s; position: relative;
+}
+.install-cmd:hover { border-color: var(--accent); }
+.install-cmd .prompt { color: var(--accent); user-select: none; }
+.install-cmd .copy-icon { color: var(--text-dim); flex-shrink: 0; }
+.install-cmd .tooltip {
+  position: absolute; top: -32px; left: 50%; transform: translateX(-50%);
+  padding: 4px 10px; background: var(--accent); color: var(--bg-deep);
+  font-size: 11px; border-radius: 4px; opacity: 0; transition: opacity 0.2s;
+  pointer-events: none;
+}
+.install-cmd .tooltip.show { opacity: 1; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-deep); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* Responsive */
+@media (max-width: 900px) {
+  .features-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .nav-links .hide-mobile { display: none; }
+  .hero-actions { flex-direction: column; align-items: flex-start; }
+  .footer-inner { flex-direction: column; gap: 24px; }
+  .demo-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .demo-tab { white-space: nowrap; padding: 10px 16px; font-size: 12px; }
+}

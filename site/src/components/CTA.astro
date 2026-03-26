@@ -1,0 +1,35 @@
+<section class="cta-section">
+  <div class="container container--wide">
+    <h2 class="reveal">Your Mac is faster<br>than you <em>think</em></h2>
+    <p class="reveal reveal-delay-1">Stop paying per token for local tasks.</p>
+    <div class="cta-actions reveal reveal-delay-2">
+      <div class="install-cmd" data-copy="uv tool install ppmlx" role="button" tabindex="0">
+        <span class="prompt">$</span><span>uv tool install ppmlx</span>
+        <svg class="copy-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        <span class="tooltip">Copied!</span>
+      </div>
+      <a href="https://github.com/PingCompany/ppmlx" class="btn-primary" target="_blank" rel="noopener">GitHub
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M7 17L17 7M17 7H7M17 7v10"/></svg>
+      </a>
+    </div>
+  </div>
+</section>
+
+<style>
+  .cta-section {
+    position: relative; text-align: center; padding: var(--section-gap) 0; z-index: 1;
+  }
+  .cta-section::before {
+    content: ''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+    width: 600px; height: 400px;
+    background: radial-gradient(ellipse, var(--accent-glow) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  h2 {
+    font-family: var(--font-display); font-weight: 300;
+    font-size: clamp(32px, 5vw, 52px); line-height: 1.1; letter-spacing: -0.02em; margin-bottom: 16px;
+  }
+  em { font-family: var(--font-display); font-style: italic; color: var(--accent-bright); }
+  p { font-size: 17px; color: var(--text-secondary); margin-bottom: 32px; font-weight: 300; }
+  .cta-actions { display: flex; align-items: center; justify-content: center; gap: 16px; flex-wrap: wrap; }
+</style>

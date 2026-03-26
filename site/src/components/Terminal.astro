@@ -1,0 +1,241 @@
+---
+const tabs = ["launch", "serve", "pull", "run", "quantize"];
+
+const insights: string[][] = [
+  [
+    "One command to spin up a coding agent on your local GPU. No API keys, no cloud costs, no latency.",
+    "Pick from 5 agent launchers: Claude Code, Codex, Opencode, Pi \u2014 or start a plain chat.",
+    "Model picker built in. Select, launch, code. Under 10 seconds from cold start.",
+  ],
+  [
+    "Drop-in replacement for any OpenAI-compatible tool. Just point to localhost:6767.",
+    "Supports Chat Completions, Responses API, Anthropic Messages \u2014 one server, every protocol.",
+    "Hot-swap models without restarting. LRU cache keeps your most-used models in memory.",
+  ],
+  [
+    "168+ models from the curated MLX registry. Human-friendly aliases, Apple Silicon optimised weights.",
+    "Multi-select download \u2014 queue up several models and grab them in one go.",
+    "Models are stored locally in ~/.ppmlx/models. No Docker, no containers, no overhead.",
+  ],
+  [
+    "Auto-downloads missing models on first use. Just type the name and start chatting.",
+    "Streaming REPL with token stats, timing, and slash commands built in.",
+    "Switch models mid-session with /model. No need to restart anything.",
+  ],
+  [
+    "Bring any HuggingFace model. Convert to MLX format and quantize to 4-bit in one step.",
+    "69% smaller models with minimal quality loss. Fits large models in unified memory.",
+    "Run your quantized model immediately \u2014 no extra setup, no config files.",
+  ],
+];
+---
+
+<section class="demo-section" id="demos">
+  <div class="container container--wide">
+    <div class="section-label reveal">CLI</div>
+    <h2 class="section-title reveal reveal-delay-1">Five commands, zero config</h2>
+    <p class="section-sub reveal reveal-delay-2" style="margin-bottom:32px">
+      Every workflow fits in one command. See the real CLI in action.
+    </p>
+
+    <div class="demo-layout reveal reveal-delay-3">
+      <div class="demo-sidebar" aria-live="polite">
+        {insights.map((group, tabIdx) =>
+          group.map((text, msgIdx) => (
+            <div
+              class:list={["demo-insight", { active: tabIdx === 0 && msgIdx === 0 }]}
+              data-tab={tabIdx}
+              data-msg={msgIdx}
+            >
+              <p>{text}</p>
+            </div>
+          ))
+        )}
+      </div>
+
+      <div class="demo-main">
+        <div class="demo-tabs" role="tablist">
+          {tabs.map((tab, i) => (
+            <button class:list={["demo-tab", { active: i === 0 }]} data-idx={i} role="tab">
+              {tab}
+            </button>
+          ))}
+        </div>
+        <div class="term" id="demo-term">
+          <div class="term-bar">
+            <div class="term-dot"></div><div class="term-dot"></div><div class="term-dot"></div>
+            <span class="term-title" id="demo-title">ppmlx launch</span>
+          </div>
+          <div class="term-body" id="demo-body" style="height:380px">
+            <div class="term-line"><span class="t-prompt">$ </span><span class="cursor"></span></div>
+          </div>
+        </div>
+        <div class="demo-desc" id="demo-desc">TUI launcher &mdash; pick action &amp; model, launch in one step</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  import { initTerminalDemo } from "./terminal-animations";
+  initTerminalDemo();
+
+  // Cycle through insights for the active tab
+  const CYCLE_MS = 4000;
+  let currentTab = 0;
+  let currentMsg = 0;
+  let cycleTimer: ReturnType<typeof setInterval> | null = null;
+
+  function showInsight(tab: number, msg: number) {
+    document.querySelectorAll(".demo-insight").forEach((el) => {
+      el.classList.remove("active");
+    });
+    const target = document.querySelector(
+      `.demo-insight[data-tab="${tab}"][data-msg="${msg}"]`
+    );
+    if (target) target.classList.add("active");
+  }
+
+  function countMessages(tab: number): number {
+    return document.querySelectorAll(`.demo-insight[data-tab="${tab}"]`).length;
+  }
+
+  function startCycle() {
+    if (cycleTimer) clearInterval(cycleTimer);
+    currentMsg = 0;
+    showInsight(currentTab, 0);
+    cycleTimer = setInterval(() => {
+      currentMsg = (currentMsg + 1) % countMessages(currentTab);
+      showInsight(currentTab, currentMsg);
+    }, CYCLE_MS);
+  }
+
+  // Watch for tab changes
+  const obs = new MutationObserver(() => {
+    const activeTab = document.querySelector(".demo-tab.active") as HTMLElement;
+    if (!activeTab) return;
+    const idx = parseInt(activeTab.dataset.idx || "0");
+    if (idx !== currentTab) {
+      currentTab = idx;
+      startCycle();
+    }
+  });
+  document.querySelectorAll(".demo-tab").forEach((tab) => {
+    obs.observe(tab, { attributes: true, attributeFilter: ["class"] });
+  });
+
+  startCycle();
+</script>
+
+<style>
+  .demo-section { position: relative; z-index: 1; padding-bottom: var(--section-gap); }
+
+  .demo-layout { margin-top: 32px; }
+  .demo-main { max-width: 100%; }
+
+  @media (min-width: 1080px) {
+    .demo-layout {
+      display: grid; grid-template-columns: 1fr 540px; gap: 48px; align-items: start;
+    }
+    .demo-main { max-width: 540px; }
+  }
+
+  .demo-sidebar { display: none; }
+  @media (min-width: 1080px) {
+    .demo-sidebar {
+      display: flex; flex-direction: column; justify-content: center;
+      min-height: 380px; padding: 40px 0; position: relative;
+    }
+  }
+
+  .demo-insight {
+    opacity: 0; transform: translateY(16px);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+    position: absolute; pointer-events: none; left: 0; right: 0;
+  }
+  .demo-insight.active {
+    opacity: 1; transform: translateY(0);
+    position: relative; pointer-events: auto;
+  }
+  .demo-insight p {
+    font-family: var(--font-body); font-size: 18px; font-weight: 300;
+    color: var(--text-secondary); line-height: 1.7;
+    border-left: 2px solid var(--accent); padding-left: 24px;
+    max-width: 420px;
+  }
+
+  .demo-tabs {
+    display: flex; gap: 0; border-bottom: 2px solid var(--border);
+    margin-bottom: 0; position: relative; z-index: 1;
+  }
+  .demo-tab {
+    padding: 12px 24px; font-family: var(--font-mono); font-size: 13px; font-weight: 400;
+    background: none; border: none; color: var(--text-dim); cursor: pointer;
+    position: relative; transition: color 0.2s;
+  }
+  .demo-tab:hover { color: var(--text-secondary); }
+  :global(.demo-tab.active) { color: var(--accent-bright); font-weight: 500; }
+  :global(.demo-tab.active::after) {
+    content: ''; position: absolute; bottom: -2px; left: 0; right: 0;
+    height: 2px; background: var(--accent);
+  }
+  .demo-main .term { border-radius: 0 0 12px 12px; border-top: none; }
+  .demo-desc {
+    margin-top: 12px; font-family: var(--font-mono); font-size: 12px; color: var(--text-dim);
+  }
+
+  .term {
+    background: var(--bg-surface); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 32px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 8px; position: relative;
+    padding: 8px 14px; background: var(--bg-elevated); border-bottom: 1px solid var(--border);
+  }
+  .term-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .term-dot:nth-child(1) { background: #e85d75; }
+  .term-dot:nth-child(2) { background: #d4833c; }
+  .term-dot:nth-child(3) { background: #3db5a6; }
+  .term-title {
+    position: absolute; left: 0; right: 0; text-align: center;
+    pointer-events: none; font-family: var(--font-mono);
+    font-size: 12px; color: var(--text-dim); transition: color 0.3s;
+  }
+  :global(.term-body) {
+    padding: 20px 24px; font-family: var(--font-mono); font-size: 13px;
+    line-height: 1.7; overflow: hidden; position: relative;
+  }
+  :global(.term-line) { white-space: pre-wrap; min-height: 1.7em; }
+  :global(.t-prompt) { color: var(--accent); user-select: none; }
+  :global(.t-cmd) { color: var(--text-primary); }
+  :global(.t-flag) { color: var(--teal); }
+  :global(.t-arg) { color: var(--accent-bright); }
+  :global(.t-ok) { color: var(--teal); }
+  :global(.t-val) { color: var(--accent-bright); font-weight: 500; }
+  :global(.t-blue) { color: var(--blue); }
+  :global(.t-dim) { color: var(--text-dim); }
+  :global(.t-bold) { font-weight: 500; color: var(--text-primary); }
+  :global(.t-green) { color: #4ade80; }
+
+  :global(.term-progress) { display: flex; align-items: center; gap: 10px; }
+  :global(.term-progress-bar) {
+    flex: 1; height: 6px; background: var(--bg-elevated); border-radius: 3px;
+    overflow: hidden; max-width: 260px;
+  }
+  :global(.term-progress-fill) {
+    height: 100%; border-radius: 3px; width: 0;
+    background: linear-gradient(90deg, var(--blue), var(--teal));
+    transition: width 2s ease-out;
+  }
+  :global(.cursor) {
+    display: inline-block; width: 8px; height: 15px; background: var(--accent);
+    animation: blink 1s step-end infinite; vertical-align: text-bottom; margin-left: 2px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  @media (max-width: 640px) {
+    .demo-tab { white-space: nowrap; padding: 10px 16px; font-size: 12px; }
+    .demo-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  }
+</style>
