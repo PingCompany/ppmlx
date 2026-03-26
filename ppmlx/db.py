@@ -272,6 +272,36 @@ class Database:
             print(f"[ppmlx db] Stats error: {e}", file=sys.stderr)
             return {"total_requests": 0, "avg_duration_ms": None, "by_model": []}
 
+    def query_time_series(self, since_hours: float = 1) -> list[dict[str, Any]]:
+        """Return per-minute request counts and avg latency for the given window."""
+        try:
+            since_param = f"-{since_hours} hours"
+            with sqlite3.connect(self._path) as conn:
+                rows = conn.execute(
+                    """SELECT
+                           strftime('%Y-%m-%dT%H:%M:00', timestamp) AS minute,
+                           COUNT(*) AS count,
+                           AVG(total_duration_ms) AS avg_latency_ms,
+                           AVG(tokens_per_second) AS avg_tps
+                       FROM requests
+                       WHERE timestamp >= datetime('now', ?)
+                       GROUP BY minute
+                       ORDER BY minute""",
+                    (since_param,),
+                ).fetchall()
+            return [
+                {
+                    "minute": r[0],
+                    "count": r[1],
+                    "avg_latency_ms": round(r[2], 1) if r[2] else None,
+                    "avg_tps": round(r[3], 1) if r[3] else None,
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[ppmlx db] Time series error: {e}", file=sys.stderr)
+            return []
+
     def flush(self) -> None:
         """Wait for the write queue to drain."""
         try:

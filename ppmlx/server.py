@@ -69,6 +69,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Dashboard ────────────────────────────────────────────────────────────
+from ppmlx.dashboard import router as dashboard_router
+app.include_router(dashboard_router)
+
 
 async def _snapshot_loop(interval_seconds: int) -> None:
     """Periodically log system snapshots to the database."""
