@@ -356,9 +356,12 @@ async def health(request: Request):
 @app.get("/metrics")
 async def metrics():
     """Metrics endpoint — returns JSON stats from the DB."""
+    db_metrics: dict = {}
     try:
         from ppmlx.db import get_db
-        stats = get_db().get_stats()
+        db = get_db()
+        stats = db.get_stats()
+        db_metrics = db.get_metrics()
     except Exception:
         stats = {"total_requests": 0, "avg_duration_ms": None, "by_model": []}
 
@@ -368,7 +371,7 @@ async def metrics():
     except Exception:
         loaded = []
 
-    return {**stats, "loaded_models": loaded}
+    return {**stats, **db_metrics, "loaded_models": loaded}
 
 
 def _model_metadata(model_id: str) -> dict:

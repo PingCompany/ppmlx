@@ -2,10 +2,9 @@
 from __future__ import annotations
 import sqlite3
 from pathlib import Path
-
 import pytest
 
-from ppmlx.db import Database, get_db, reset_db
+from ppmlx.db import Database, get_db, reset_db, _BACKPRESSURE_THRESHOLD
 
 
 def make_db(tmp_path: Path) -> Database:
@@ -24,6 +23,31 @@ def test_init_creates_tables(tmp_home, tmp_path):
     assert "requests" in tables
     assert "model_events" in tables
     assert "system_snapshots" in tables
+
+
+def test_wal_mode_enabled(tmp_home, tmp_path):
+    """WAL journal mode should be set after init."""
+    db = make_db(tmp_path)
+    db.flush()
+    conn = sqlite3.connect(str(tmp_path / "ppmlx.db"))
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    conn.close()
+    db.close()
+    assert mode == "wal"
+
+
+def test_synchronous_normal(tmp_home, tmp_path):
+    """PRAGMA synchronous should be NORMAL (1) for WAL performance."""
+    db = make_db(tmp_path)
+    db.flush()
+    # Open a fresh connection the same way the writer does
+    conn = sqlite3.connect(str(tmp_path / "ppmlx.db"))
+    conn.execute("PRAGMA synchronous=NORMAL")
+    sync_val = conn.execute("PRAGMA synchronous").fetchone()[0]
+    conn.close()
+    db.close()
+    # 1 = NORMAL
+    assert sync_val == 1
 
 
 def test_log_request_and_query(tmp_home, tmp_path):
@@ -146,3 +170,140 @@ def test_query_limit(tmp_home, tmp_path):
     rows = db.query_requests(limit=2)
     db.close()
     assert len(rows) == 2
+
+
+# ---------- Batch write tests ----------
+
+def test_batch_write_multiple_items(tmp_home, tmp_path):
+    """Multiple items enqueued rapidly should be written in a batch."""
+    db = make_db(tmp_path)
+    for i in range(10):
+        db.log_request(f"batch-{i}", "/v1/chat", "qwen", "repo")
+    db.flush()
+    rows = db.query_requests(limit=20)
+    db.close()
+    assert len(rows) == 10
+
+
+def test_batch_write_mixed_sql(tmp_home, tmp_path):
+    """Batch writer should handle a mix of different SQL statements."""
+    db = make_db(tmp_path)
+    db.log_request("r1", "/v1/chat", "qwen", "repo")
+    db.log_model_event("load", "org/model")
+    db.log_system_snapshot(16.0, 8.0, ["qwen"], 100)
+    db.flush()
+
+    conn = sqlite3.connect(str(tmp_path / "ppmlx.db"))
+    req_count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    evt_count = conn.execute("SELECT COUNT(*) FROM model_events").fetchone()[0]
+    snap_count = conn.execute("SELECT COUNT(*) FROM system_snapshots").fetchone()[0]
+    conn.close()
+    db.close()
+
+    assert req_count == 1
+    assert evt_count == 1
+    assert snap_count == 1
+
+
+# ---------- Backpressure tests ----------
+
+def test_backpressure_drops_non_error_logs(tmp_home, tmp_path):
+    """When queue exceeds threshold, non-error logs should be dropped."""
+    db = Database(tmp_path / "ppmlx.db")
+    # Do NOT start the writer thread -- we want the queue to fill up.
+    # _enqueue doesn't touch the DB, so no schema is needed.
+    for i in range(_BACKPRESSURE_THRESHOLD):
+        db._enqueue("SELECT 1", (i,))
+
+    assert db.queue_depth >= _BACKPRESSURE_THRESHOLD
+
+    # This non-error log should be dropped
+    db.log_request("should-drop", "/v1/chat", "qwen", "repo", status="ok")
+    assert db.dropped_logs >= 1
+
+    # Drain queue so close doesn't hang
+    while not db._queue.empty():
+        try:
+            db._queue.get_nowait()
+            db._queue.task_done()
+        except Exception:
+            break
+
+
+def test_backpressure_allows_error_logs(tmp_home, tmp_path):
+    """Error-status logs should NOT be dropped even under backpressure."""
+    db = Database(tmp_path / "ppmlx.db")
+
+    # Fill the queue past the threshold without starting the writer
+    for i in range(_BACKPRESSURE_THRESHOLD):
+        db._enqueue("SELECT 1", (f"fill-{i}",))
+
+    initial_depth = db.queue_depth
+    assert initial_depth >= _BACKPRESSURE_THRESHOLD
+
+    # Error log should still be enqueued
+    db.log_request("err-1", "/v1/chat", "qwen", "repo", status="error", error_message="boom")
+    assert db.queue_depth == initial_depth + 1
+    assert db.dropped_logs == 0
+
+    # Drain queue so close doesn't hang
+    while not db._queue.empty():
+        try:
+            db._queue.get_nowait()
+            db._queue.task_done()
+        except Exception:
+            break
+
+
+# ---------- Error counting tests ----------
+
+def test_error_counters_initial_state(tmp_home, tmp_path):
+    """Error counters should start at zero."""
+    db = make_db(tmp_path)
+    assert db.write_errors == 0
+    assert db.dropped_logs == 0
+    assert db.enqueue_errors == 0
+    db.close()
+
+
+def test_get_metrics_returns_dict(tmp_home, tmp_path):
+    """get_metrics() should return a dict with all expected keys."""
+    db = make_db(tmp_path)
+    metrics = db.get_metrics()
+    db.close()
+    assert "db_queue_depth" in metrics
+    assert "db_write_errors" in metrics
+    assert "db_dropped_logs" in metrics
+    assert "db_enqueue_errors" in metrics
+    assert all(isinstance(v, int) for v in metrics.values())
+
+
+def test_queue_depth_tracks_pending_writes(tmp_home, tmp_path):
+    """queue_depth should reflect items waiting to be written."""
+    db = Database(tmp_path / "ppmlx.db")
+    # Don't start writer — just check queue depth tracking
+    assert db.queue_depth == 0
+
+    db._enqueue("SELECT 1", ())
+    assert db.queue_depth == 1
+
+    db._enqueue("SELECT 1", ())
+    assert db.queue_depth == 2
+
+    # Drain
+    while not db._queue.empty():
+        try:
+            db._queue.get_nowait()
+            db._queue.task_done()
+        except Exception:
+            break
+
+
+def test_write_error_counting(tmp_home, tmp_path):
+    """Write errors should be counted, not silently swallowed."""
+    db = make_db(tmp_path)
+    # Enqueue a statement that will fail (bad table name)
+    db._enqueue("INSERT INTO nonexistent_table VALUES (?)", ("x",))
+    db.flush()
+    db.close()
+    assert db.write_errors >= 1

@@ -1,11 +1,13 @@
 from __future__ import annotations
 import json
+import logging
 import queue
 import sqlite3
-import sys
 import threading
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("ppmlx.db")
 
 # Import get_ppmlx_dir lazily to avoid circular imports at module level
 # but also provide a fallback for isolated testing
@@ -69,6 +71,13 @@ CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
 CREATE INDEX IF NOT EXISTS idx_model_events_timestamp ON model_events(timestamp);
 """
 
+# Backpressure threshold: if the queue exceeds this size, non-error logs are
+# dropped to avoid unbounded memory growth.
+_BACKPRESSURE_THRESHOLD = 1000
+
+# Maximum number of items to drain from the queue in a single batch write.
+_BATCH_SIZE = 50
+
 
 class Database:
     """Thread-safe SQLite database for ppmlx logging."""
@@ -78,17 +87,23 @@ class Database:
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Metrics counters (thread-safe via the GIL for simple increments)
+        self._write_errors: int = 0
+        self._dropped_logs: int = 0
+        self._enqueue_errors: int = 0
 
     def init(self) -> None:
         """Initialize the database schema and start background writer thread."""
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self._path))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(_SCHEMA)
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"[ppmlx db] Warning: failed to init database: {e}", file=sys.stderr)
+            log.warning("Failed to init database: %s", e)
 
         if self._thread is None or not self._thread.is_alive():
             self._stop_event.clear()
@@ -98,28 +113,42 @@ class Database:
             self._thread.start()
 
     def _writer_loop(self) -> None:
-        """Background thread: drain the queue and write to SQLite."""
+        """Background thread: drain the queue in batches and write to SQLite."""
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(str(self._path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             while not self._stop_event.is_set():
+                # Block waiting for at least one item
                 try:
-                    item = self._queue.get(timeout=0.5)
-                    if item is None:  # sentinel
-                        self._queue.task_done()
-                        break
-                    sql, params = item
-                    try:
-                        conn.execute(sql, params)
-                        conn.commit()
-                    except Exception as e:
-                        print(f"[ppmlx db] Write error: {e}", file=sys.stderr)
-                    finally:
-                        self._queue.task_done()
+                    first = self._queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
+
+                if first is None:  # sentinel
+                    self._queue.task_done()
+                    break
+
+                # Drain up to _BATCH_SIZE items (including the first)
+                batch: list[tuple[str, tuple]] = [first]
+                while len(batch) < _BATCH_SIZE:
+                    try:
+                        item = self._queue.get_nowait()
+                        if item is None:  # sentinel in batch
+                            self._queue.task_done()
+                            # Process what we have, then exit
+                            self._write_batch(conn, batch)
+                            return
+                        batch.append(item)
+                    except queue.Empty:
+                        break
+
+                self._write_batch(conn, batch)
+
         except Exception as e:
-            print(f"[ppmlx db] Writer thread error: {e}", file=sys.stderr)
+            self._write_errors += 1
+            log.error("Writer thread fatal error: %s", e)
         finally:
             # Drain remaining items so any flush() calls don't block forever
             while True:
@@ -134,12 +163,77 @@ class Database:
                 except Exception:
                     pass
 
-    def _enqueue(self, sql: str, params: tuple) -> None:
-        """Enqueue a write operation; never blocks, never raises."""
+    def _write_batch(self, conn: sqlite3.Connection, batch: list[tuple[str, tuple]]) -> None:
+        """Write a batch of (sql, params) items in a single transaction."""
+        # Group items by SQL statement for executemany where possible
+        groups: dict[str, list[tuple]] = {}
+        for sql, params in batch:
+            groups.setdefault(sql, []).append(params)
+
         try:
+            for sql, params_list in groups.items():
+                if len(params_list) == 1:
+                    conn.execute(sql, params_list[0])
+                else:
+                    conn.executemany(sql, params_list)
+            conn.commit()
+        except Exception as e:
+            self._write_errors += 1
+            log.error("Batch write error (%d items): %s", len(batch), e)
+        finally:
+            for _ in batch:
+                self._queue.task_done()
+
+    def _enqueue(self, sql: str, params: tuple, *, is_error: bool = False) -> None:
+        """Enqueue a write operation with backpressure.
+
+        If the queue exceeds the backpressure threshold, non-error logs are
+        dropped to prevent unbounded memory growth.
+        """
+        try:
+            qsize = self._queue.qsize()
+            if qsize >= _BACKPRESSURE_THRESHOLD and not is_error:
+                self._dropped_logs += 1
+                if self._dropped_logs % 100 == 1:
+                    log.warning(
+                        "DB queue backpressure: dropped %d non-error log(s) "
+                        "(queue size %d)",
+                        self._dropped_logs,
+                        qsize,
+                    )
+                return
             self._queue.put_nowait((sql, params))
         except Exception:
-            pass
+            self._enqueue_errors += 1
+
+    @property
+    def queue_depth(self) -> int:
+        """Current number of pending writes in the queue."""
+        return self._queue.qsize()
+
+    @property
+    def write_errors(self) -> int:
+        """Total number of write errors encountered by the writer thread."""
+        return self._write_errors
+
+    @property
+    def dropped_logs(self) -> int:
+        """Total number of logs dropped due to backpressure."""
+        return self._dropped_logs
+
+    @property
+    def enqueue_errors(self) -> int:
+        """Total number of enqueue failures."""
+        return self._enqueue_errors
+
+    def get_metrics(self) -> dict[str, int]:
+        """Return db-layer metrics for the /metrics endpoint."""
+        return {
+            "db_queue_depth": self.queue_depth,
+            "db_write_errors": self._write_errors,
+            "db_dropped_logs": self._dropped_logs,
+            "db_enqueue_errors": self._enqueue_errors,
+        }
 
     def log_request(
         self,
@@ -177,7 +271,7 @@ class Database:
             time_to_first_token_ms, total_duration_ms, tokens_per_second,
             temperature, top_p, max_tokens, repetition_penalty, client_ip, user_agent,
         )
-        self._enqueue(sql, params)
+        self._enqueue(sql, params, is_error=(status == "error"))
 
     def log_model_event(
         self,
@@ -211,7 +305,7 @@ class Database:
         errors_only: bool = False,
         min_duration_ms: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Synchronous query — safe to call from CLI."""
+        """Synchronous query -- safe to call from CLI."""
         try:
             conditions: list[str] = []
             params: list[Any] = []
@@ -235,7 +329,7 @@ class Database:
                 ).fetchall()
             return [dict(r) for r in rows]
         except Exception as e:
-            print(f"[ppmlx db] Query error: {e}", file=sys.stderr)
+            log.error("Query error: %s", e)
             return []
 
     def get_stats(self, since_hours: float = 24) -> dict[str, Any]:
@@ -269,7 +363,7 @@ class Database:
                 "by_model": model_rows,
             }
         except Exception as e:
-            print(f"[ppmlx db] Stats error: {e}", file=sys.stderr)
+            log.error("Stats error: %s", e)
             return {"total_requests": 0, "avg_duration_ms": None, "by_model": []}
 
     def flush(self) -> None:
