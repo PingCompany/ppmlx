@@ -3,10 +3,13 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.DS_Store
 .venv/
 venv/
 env/
 .env
+.claude/
+.webui_secret_key
 dist/
 build/
 *.egg-info/
