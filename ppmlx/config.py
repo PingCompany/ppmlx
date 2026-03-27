@@ -45,6 +45,15 @@ class ToolAwarenessConfig:
 
 
 @dataclass
+class AnalyticsConfig:
+    enabled: bool = True
+    provider: str = "posthog"
+    host: str = ""
+    project_api_key: str = ""
+    respect_do_not_track: bool = True
+
+
+@dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
@@ -52,6 +61,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
     tool_awareness: ToolAwarenessConfig = field(default_factory=ToolAwarenessConfig)
+    analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
 
 
 def get_ppmlx_dir() -> Path:
@@ -79,6 +89,13 @@ def _normalize_tool_awareness_mode(value: Any) -> str:
         "no_tools_only": "no_tools_only",
     }
     return aliases.get(raw, "no_tools_only")
+
+
+def _normalize_analytics_provider(value: Any) -> str:
+    raw = str(value).strip().lower()
+    if raw in {"", "posthog"}:
+        return "posthog"
+    return raw
 
 
 def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
@@ -126,6 +143,17 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         ta = data["tool_awareness"]
         if "mode" in ta:
             cfg.tool_awareness.mode = _normalize_tool_awareness_mode(ta["mode"])
+    if "analytics" in data:
+        an = data["analytics"]
+        if "enabled" in an: cfg.analytics.enabled = bool(an["enabled"])
+        if "provider" in an: cfg.analytics.provider = _normalize_analytics_provider(an["provider"])
+        if "host" in an: cfg.analytics.host = str(an["host"]).strip()
+        if "project_api_key" in an:
+            cfg.analytics.project_api_key = str(an["project_api_key"]).strip()
+        elif "website_id" in an:
+            cfg.analytics.project_api_key = str(an["website_id"]).strip()
+        if "respect_do_not_track" in an:
+            cfg.analytics.respect_do_not_track = bool(an["respect_do_not_track"])
 
 
 def _apply_env(cfg: Config) -> None:
@@ -144,6 +172,11 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_MEMORY_WIRED_LIMIT": ("memory", "wired_limit_mb", int),
         "PPMLX_REGISTRY_ENABLED": ("registry", "enabled", _parse_bool),
         "PPMLX_INJECT_TOOL_AWARENESS": ("tool_awareness", "mode", _normalize_tool_awareness_mode),
+        "PPMLX_ANALYTICS_ENABLED": ("analytics", "enabled", _parse_bool),
+        "PPMLX_ANALYTICS_PROVIDER": ("analytics", "provider", _normalize_analytics_provider),
+        "PPMLX_ANALYTICS_HOST": ("analytics", "host", str),
+        "PPMLX_ANALYTICS_PROJECT_API_KEY": ("analytics", "project_api_key", str),
+        "PPMLX_ANALYTICS_RESPECT_DNT": ("analytics", "respect_do_not_track", _parse_bool),
     }
     for env_key, (section, attr, coerce) in mapping.items():
         val = os.environ.get(env_key)
@@ -152,6 +185,9 @@ def _apply_env(cfg: Config) -> None:
                 setattr(getattr(cfg, section), attr, coerce(val))
             except (ValueError, AttributeError):
                 pass
+    legacy_website_id = os.environ.get("PPMLX_ANALYTICS_WEBSITE_ID")
+    if legacy_website_id and not cfg.analytics.project_api_key:
+        cfg.analytics.project_api_key = legacy_website_id.strip()
 
 
 def _apply_cli(cfg: Config, overrides: dict) -> None:

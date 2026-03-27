@@ -13,6 +13,8 @@ pip install ppmlx
 ```
 
 > Requires macOS on Apple Silicon (M1+) and Python 3.11+
+>
+> Privacy note: `ppmlx` never sends prompts, responses, file contents, paths, or tokens anywhere. Optional anonymous usage analytics can be disabled with `ppmlx config --no-analytics`.
 
 ## Get Started
 
@@ -66,10 +68,59 @@ Optional. `~/.ppmlx/config.toml`:
 host = "127.0.0.1"
 port = 6767
 
-[generation]
+[defaults]
 temperature = 0.7
 max_tokens = 2048
+
+[analytics]
+enabled = true
+provider = "posthog"
+respect_do_not_track = true
 ```
+
+## Anonymous Usage Analytics
+
+`ppmlx` supports privacy-preserving anonymous product analytics in an `opt-out` model.
+
+What is sent:
+- command and API event names such as `serve_started`, `model_pulled`, `api_chat_completions`
+- app version, Python minor version, OS family, CPU architecture
+- coarse booleans/counters such as `stream=true`, `tools=true`, `batch_size=4`
+
+What is never sent:
+- prompts, responses, tool arguments, file contents, file paths
+- HuggingFace tokens, API keys, repo IDs, model prompts, request bodies
+
+When events are sent:
+- when a CLI command starts
+- when OpenAI-compatible API endpoints are hit
+
+Why:
+- understand which workflows matter most
+- prioritize compatibility work across commands and API surfaces
+- measure adoption without collecting user content
+
+Opt out:
+
+```bash
+ppmlx config --no-analytics
+```
+
+or:
+
+```toml
+[analytics]
+enabled = false
+```
+
+For maintainer-operated analytics, the recommended sink is self-hosted PostHog. Configure it with:
+
+```bash
+export PPMLX_ANALYTICS_HOST="https://analytics.example.com"
+export PPMLX_ANALYTICS_PROJECT_API_KEY="your-posthog-project-api-key"
+```
+
+If you prefer, you can also set the same values in `~/.ppmlx/config.toml`.
 
 ## License
 

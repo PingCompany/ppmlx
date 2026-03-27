@@ -124,6 +124,15 @@ def _log_request(_, **kwargs) -> None:
         pass
 
 
+def _track_usage(event: str, data: dict | None = None, *, context: str = "server") -> None:
+    try:
+        from ppmlx.analytics import track_async
+
+        track_async(event, data, context=context)
+    except Exception:
+        pass
+
+
 def _merge_system_messages(messages: list[dict]) -> list[dict]:
     """Merge all system messages into a single one at the start.
 
@@ -300,11 +309,15 @@ def _parse_tool_calls_fallback(text: str) -> tuple[str, list[dict]]:
 
 
 # Core tools that Codex/Claude Code always need — everything else is optional.
+# Matched case-insensitively in _limit_tools.
 _CORE_TOOL_NAMES = {
+    # Codex tools
     "exec_command", "apply_patch", "write_stdin", "update_plan",
     "request_user_input", "view_image",
     # Anthropic / Claude Code tools
     "bash", "read", "edit", "write", "computer",
+    "glob", "grep", "agent", "askuserquestion",
+    "notebookedit", "webfetch", "websearch",
 }
 
 # Maximum estimated tokens for all tools combined.  Large tool lists
@@ -327,14 +340,14 @@ def _limit_tools(tools: list[dict] | None) -> list[dict] | None:
         return tools
 
     # Filter out non-function tools (e.g. web_search with name=None)
-    # and split into core vs non-core
+    # and split into core vs non-core (case-insensitive matching)
     core = []
     extra = []
     for t in tools:
         name = t.get("name") or t.get("function", {}).get("name", "")
         if not name:
             continue  # skip tools without a name
-        if name in _CORE_TOOL_NAMES:
+        if name.lower() in _CORE_TOOL_NAMES:
             core.append(t)
         else:
             extra.append(t)
@@ -506,24 +519,6 @@ async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
     body = await request.json()
 
-    # Append request summary for debugging (best-effort)
-    try:
-        import pathlib
-        _cc_log = pathlib.Path("/tmp/ppmlx_chatcompletions_debug.jsonl")
-        log_entry = {
-            "ts": time.time(),
-            "model": body.get("model"),
-            "stream": body.get("stream"),
-            "tools": len(body.get("tools") or []),
-            "tool_names": [t.get("function", {}).get("name") or t.get("name")
-                           for t in (body.get("tools") or [])],
-            "messages_count": len(body.get("messages", [])),
-        }
-        with open(_cc_log, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception:
-        pass
-
     model_name = body.get("model", "")
     messages = body.get("messages", [])
     # Normalize messages for model compatibility
@@ -546,6 +541,14 @@ async def chat_completions(request: Request):
     stop = body.get("stop")
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
+    _track_usage(
+        "api_chat_completions",
+        {
+            "stream": stream,
+            "tools": bool(tools),
+            "messages_count": len(messages),
+        },
+    )
 
     try:
         from ppmlx.models import resolve_alias
@@ -582,6 +585,16 @@ def _stream_chat(
     """Return streaming SSE response."""
     from fastapi.responses import StreamingResponse
 
+    def _get_tool_call_tags(engine, repo_id):
+        """Get model-specific tool call start/end tags for stream filtering."""
+        try:
+            tokenizer = engine.get_tokenizer(repo_id)
+            if getattr(tokenizer, "has_tool_calling", False):
+                return tokenizer.tool_call_start, tokenizer.tool_call_end or ""
+        except Exception:
+            pass
+        return "<tool_call>", "</tool_call>"
+
     async def event_generator():
         first_token_ts = None
         is_first_chunk = True
@@ -596,25 +609,133 @@ def _stream_chat(
                     top_p=1.0 if top_p is None else top_p,
                     max_tokens=max_tokens,
                     seed=seed,
+                    strip_thinking=bool(tools),  # Strip thinking when tools are present to avoid flooding clients
+                    enable_thinking=not bool(tools),  # Disable thinking phase for tool calls (avoids infinite thinking loops)
                     tools=tools,
                 )
-                async for chunk in _async_iter_sync_gen(gen):
-                    full_text += chunk
-                    if first_token_ts is None:
-                        first_token_ts = time.time()
-                    if is_first_chunk:
-                        delta = {"role": "assistant", "content": chunk}
-                        is_first_chunk = False
-                    else:
-                        delta = {"content": chunk}
-                    data = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(data)}\n\n"
+
+                # When tools are provided, buffer output and filter tool call
+                # markup so it doesn't leak to the client as content text.
+                if tools:
+                    tc_start, tc_end = _get_tool_call_tags(engine, repo_id)
+                    buf = ""
+                    inside_tc = False
+
+                    async for chunk in _async_iter_sync_gen(gen):
+                        if not chunk:
+                            yield ": keepalive\n\n"
+                            continue
+                        full_text += chunk
+                        if first_token_ts is None:
+                            first_token_ts = time.time()
+                        buf += chunk
+
+                        while buf:
+                            if inside_tc:
+                                if tc_end:
+                                    end_idx = buf.find(tc_end)
+                                    if end_idx != -1:
+                                        buf = buf[end_idx + len(tc_end):]
+                                        inside_tc = False
+                                        continue
+                                    # Partial end tag — keep buffering
+                                    partial = False
+                                    for i in range(1, min(len(tc_end), len(buf)) + 1):
+                                        if buf.endswith(tc_end[:i]):
+                                            partial = True
+                                            break
+                                    if partial:
+                                        break  # wait for more data
+                                    buf = ""  # no end tag match, discard tool call content
+                                else:
+                                    buf = ""  # no end tag defined, consume rest
+                                break
+                            else:
+                                start_idx = buf.find(tc_start)
+                                if start_idx != -1:
+                                    # Yield text before tool call tag
+                                    safe = buf[:start_idx]
+                                    if safe:
+                                        if is_first_chunk:
+                                            delta = {"role": "assistant", "content": safe}
+                                            is_first_chunk = False
+                                        else:
+                                            delta = {"content": safe}
+                                        data = {
+                                            "id": request_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model_name,
+                                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                                        }
+                                        yield f"data: {json.dumps(data)}\n\n"
+                                    buf = buf[start_idx + len(tc_start):]
+                                    inside_tc = True
+                                    continue
+                                # Check for partial start tag at end of buffer
+                                keep = 0
+                                for i in range(1, min(len(tc_start), len(buf)) + 1):
+                                    if buf.endswith(tc_start[:i]):
+                                        keep = i
+                                if keep:
+                                    safe = buf[:-keep]
+                                    buf = buf[-keep:]
+                                else:
+                                    safe = buf
+                                    buf = ""
+                                if safe:
+                                    if is_first_chunk:
+                                        delta = {"role": "assistant", "content": safe}
+                                        is_first_chunk = False
+                                    else:
+                                        delta = {"content": safe}
+                                    data = {
+                                        "id": request_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_name,
+                                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(data)}\n\n"
+                                break
+
+                    # Flush remaining buffer (only if outside tool call)
+                    if buf and not inside_tc:
+                        if is_first_chunk:
+                            delta = {"role": "assistant", "content": buf}
+                            is_first_chunk = False
+                        else:
+                            delta = {"content": buf}
+                        data = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+                else:
+                    # No tools — stream directly without filtering
+                    async for chunk in _async_iter_sync_gen(gen):
+                        if not chunk:
+                            yield ": keepalive\n\n"  # SSE comment to prevent timeout
+                            continue
+                        full_text += chunk
+                        if first_token_ts is None:
+                            first_token_ts = time.time()
+                        if is_first_chunk:
+                            delta = {"role": "assistant", "content": chunk}
+                            is_first_chunk = False
+                        else:
+                            delta = {"content": chunk}
+                        data = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
             elif engine_type == "vision":
                 from ppmlx.engine_vlm import get_vision_engine
                 engine = get_vision_engine()
@@ -708,6 +829,7 @@ async def _nonstream_chat(
                 max_tokens=max_tokens,
                 seed=seed,
                 repetition_penalty=repetition_penalty,
+                enable_thinking=not bool(tools),  # Disable thinking for tool calls (avoids infinite loops)
                 tools=tools,
             )
         elif engine_type == "vision":
@@ -793,6 +915,7 @@ async def completions(request: Request):
     max_tokens = body.get("max_tokens")
     temperature = body.get("temperature", 0.7)
     stream = body.get("stream", False)
+    _track_usage("api_completions", {"stream": stream})
 
     messages = [{"role": "user", "content": prompt}]
 
@@ -842,6 +965,7 @@ async def embeddings(request: Request):
         texts = [input_text]
     else:
         texts = list(input_text)
+    _track_usage("api_embeddings", {"batch_size": len(texts)})
 
     try:
         from ppmlx.models import resolve_alias
@@ -918,39 +1042,14 @@ def _responses_input_to_messages(input_data) -> list[dict]:
 async def responses(request: Request):
     """OpenAI Responses API endpoint (used by Codex and newer OpenAI tools)."""
     body = await request.json()
-
-    # Append each request to a debug log (best-effort)
-    try:
-        import pathlib
-        _log_path = pathlib.Path("/tmp/ppmlx_responses_debug.jsonl")
-        input_data_raw = body.get("input", "")
-        # Summarize input for logging
-        if isinstance(input_data_raw, list):
-            input_summary = []
-            for item in input_data_raw:
-                role = item.get("role", "?")
-                content = item.get("content", "")
-                if isinstance(content, list):
-                    text = " ".join(p.get("text", "")[:200] for p in content if isinstance(p, dict))
-                elif isinstance(content, str):
-                    text = content[:200]
-                else:
-                    text = str(content)[:200]
-                input_summary.append({"role": role, "text": text[:200]})
-        else:
-            input_summary = str(input_data_raw)[:200]
-        log_entry = {
-            "ts": time.time(),
-            "model": body.get("model"),
-            "stream": body.get("stream"),
-            "tools": len(body.get("tools") or []),
-            "input_summary": input_summary,
-            "instructions_len": len(body.get("instructions", "") or ""),
-        }
-        with open(_log_path, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-    except Exception:
-        pass
+    _track_usage(
+        "api_responses",
+        {
+            "stream": bool(body.get("stream", False)),
+            "tools": bool(body.get("tools")),
+            "instructions": bool(body.get("instructions")),
+        },
+    )
 
     model_name = body.get("model", "")
     input_data = body.get("input", "")
@@ -1039,7 +1138,11 @@ async def _async_iter_sync_gen(sync_gen, loop=None):
     t.start()
 
     while True:
-        item = await q.get()
+        try:
+            item = await asyncio.wait_for(q.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            yield ""  # keep-alive: generator still working (e.g. thinking)
+            continue
         if item is _SENTINEL:
             break
         if isinstance(item, Exception):
@@ -1108,6 +1211,7 @@ def _stream_responses(
                     max_tokens=max_tokens,
                     tools=tools,
                     strip_thinking=False,  # Handle thinking in server
+                    enable_thinking=not bool(tools),  # Disable thinking for tool calls
                 )
 
                 # Qwen3 template injects <think> into the prompt, so model
@@ -1125,6 +1229,9 @@ def _stream_responses(
                 }, seq)
 
                 async for chunk in _async_iter_sync_gen(gen):
+                    if not chunk:
+                        yield _sse("keepalive", {})
+                        continue
                     buf += chunk
                     while buf:
                         if not in_thinking:
@@ -1368,6 +1475,7 @@ async def _nonstream_responses(
                 top_p=1.0 if top_p is None else top_p,
                 max_tokens=max_tokens,
                 tools=tools,
+                enable_thinking=not bool(tools),  # Disable thinking for tool calls
             )
         elif engine_type == "vision":
             from ppmlx.engine_vlm import get_vision_engine
@@ -1578,6 +1686,7 @@ def _stream_anthropic(
                 max_tokens=max_tokens,
                 tools=oai_tools,
                 strip_thinking=False,  # We handle thinking/text separation here
+                enable_thinking=not bool(oai_tools),  # Disable thinking for tool calls
             )
 
             # Emit thinking block start immediately
@@ -1588,6 +1697,9 @@ def _stream_anthropic(
             })
 
             async for chunk in _async_iter_sync_gen(gen):
+                if not chunk:
+                    yield _sse("keepalive", {})
+                    continue
                 buf += chunk
 
                 # Detect transitions between thinking and text
@@ -1833,6 +1945,7 @@ async def _nonstream_anthropic(
             temperature=0.7 if temperature is None else temperature,
             max_tokens=max_tokens,
             tools=oai_tools,
+            enable_thinking=not bool(oai_tools),  # Disable thinking for tool calls
         )
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -1951,6 +2064,7 @@ async def responses_ws(websocket: WebSocket):
                             top_p=1.0 if top_p is None else top_p,
                             max_tokens=max_tokens,
                             tools=tools,
+                            enable_thinking=False,  # Disable thinking for tool calls
                         )
                         full_text = text
                     else:
@@ -1959,6 +2073,7 @@ async def responses_ws(websocket: WebSocket):
                             temperature=0.7 if temperature is None else temperature,
                             top_p=1.0 if top_p is None else top_p,
                             max_tokens=max_tokens,
+                            strip_thinking=False,
                         ):
                             full_text += chunk
                 elif engine_type == "vision":

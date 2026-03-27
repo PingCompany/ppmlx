@@ -1,10 +1,13 @@
 from __future__ import annotations
+import logging
 import re
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+
+log = logging.getLogger("ppmlx.engine")
 
 
 @dataclass
@@ -20,7 +23,8 @@ class LoadedModel:
 _THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # Sanity cap: never auto-set max_tokens above this even on huge-context models.
-_MAX_AUTO_TOKENS = 32_768
+# 4096 matches GPT-4o / Claude defaults; clients can always request more explicitly.
+_MAX_AUTO_TOKENS = 4_096
 
 
 def _context_size(lm: "LoadedModel") -> int:
@@ -158,6 +162,12 @@ class TextEngine:
             except TypeError:
                 # Tokenizer doesn't support 'tools' kwarg — retry without it
                 if tools and "tools" in kwargs:
+                    log.warning(
+                        "Tokenizer for %s does not support 'tools' kwarg — "
+                        "%d tools dropped from chat template. "
+                        "Tool calling may not work with this model.",
+                        lm.repo_id, len(tools),
+                    )
                     del kwargs["tools"]
                     return tokenizer.apply_chat_template(messages, **kwargs)
                 raise
@@ -316,7 +326,7 @@ class TextEngine:
         # are detected by a token budget: if we suppress more than
         # _THINK_PASSTHROUGH_TOKENS chars without finding </think>, we assume the
         # model doesn't use think-tag pairs and switch to pass-through mode.
-        _THINK_PASSTHROUGH_TOKENS = 50  # ~50 tokens worth of chars before giving up
+        _THINK_PASSTHROUGH_TOKENS = 10_000  # chars before assuming model never closes </think>
 
         inside_think = bool(re.search(r"<think>\s*$", prompt))
         buf = ""
