@@ -342,3 +342,87 @@ def test_responses_with_tool_calls(client):
     assert len(fc_items) == 1
     assert fc_items[0]["name"] == "exec_command"
     assert '"cmd"' in fc_items[0]["arguments"]
+
+
+# ---------------------------------------------------------------------------
+# Thinking model support (non-streaming)
+# ---------------------------------------------------------------------------
+def test_nonstream_chat_think_true(client):
+    """Explicit think=True passes enable_thinking=True to engine."""
+    mock_engine.generate.return_value = ("Hello!", None, 10, 5)
+    mock_engine.generate.reset_mock()
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+        "think": True,
+    })
+    assert response.status_code == 200
+    call_kwargs = mock_engine.generate.call_args.kwargs
+    assert call_kwargs["enable_thinking"] is True
+
+
+def test_nonstream_chat_think_false(client):
+    """Explicit think=False passes enable_thinking=False to engine."""
+    mock_engine.generate.return_value = ("Hello!", None, 10, 5)
+    mock_engine.generate.reset_mock()
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+        "think": False,
+    })
+    assert response.status_code == 200
+    call_kwargs = mock_engine.generate.call_args.kwargs
+    assert call_kwargs["enable_thinking"] is False
+
+
+def test_nonstream_chat_think_default_with_tools(client):
+    """Without think param but with tools, enable_thinking defaults to False."""
+    mock_engine.generate.return_value = ("Hello!", None, 10, 5)
+    mock_engine.generate.reset_mock()
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run shell commands",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+    })
+    assert response.status_code == 200
+    call_kwargs = mock_engine.generate.call_args.kwargs
+    assert call_kwargs["enable_thinking"] is False
+
+
+def test_nonstream_chat_completion_tokens_details(client):
+    """Response includes completion_tokens_details with reasoning_tokens."""
+    mock_engine.generate.return_value = ("Hello!", None, 10, 5)
+    mock_engine.generate.reset_mock()
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+    })
+    assert response.status_code == 200
+    data = response.json()
+    usage = data["usage"]
+    assert "completion_tokens_details" in usage
+    assert "reasoning_tokens" in usage["completion_tokens_details"]
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == 0
