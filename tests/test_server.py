@@ -1,5 +1,6 @@
 """Tests for ppmlx.server — FastAPI OpenAI-compatible API."""
 from __future__ import annotations
+import json
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -342,3 +343,118 @@ def test_responses_with_tool_calls(client):
     assert len(fc_items) == 1
     assert fc_items[0]["name"] == "exec_command"
     assert '"cmd"' in fc_items[0]["arguments"]
+
+
+# ---------------------------------------------------------------------------
+# Streaming thinking/reasoning tests
+# ---------------------------------------------------------------------------
+
+def _parse_sse_chunks(response_text):
+    """Parse SSE text into a list of decoded JSON data objects."""
+    chunks = []
+    for line in response_text.splitlines():
+        if line.startswith("data: ") and line != "data: [DONE]":
+            chunks.append(json.loads(line[len("data: "):]))
+    return chunks
+
+
+def test_stream_chat_emits_reasoning_delta(client):
+    """When model emits <think>reasoning</think>answer, streaming should
+    produce reasoning deltas followed by content deltas."""
+    def thinking_stream(*args, **kwargs):
+        return iter(["<think>", "deep thought", "</think>", "the answer"])
+    mock_engine.stream_generate = thinking_stream
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert response.status_code == 200
+    chunks = _parse_sse_chunks(response.text)
+
+    # Collect reasoning and content from deltas
+    reasoning_parts = []
+    content_parts = []
+    for c in chunks:
+        if "choices" not in c:
+            continue
+        delta = c["choices"][0].get("delta", {})
+        if "reasoning" in delta and delta["reasoning"]:
+            reasoning_parts.append(delta["reasoning"])
+        if "content" in delta and delta["content"]:
+            content_parts.append(delta["content"])
+
+    assert "".join(reasoning_parts) == "deep thought"
+    assert "".join(content_parts) == "the answer"
+
+
+def test_stream_chat_think_false_no_reasoning(client):
+    """With think=False, no reasoning deltas should be emitted — thinking
+    tags are stripped by engine."""
+    def plain_stream(*args, **kwargs):
+        return iter(["just", " content"])
+    mock_engine.stream_generate = plain_stream
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+        "think": False,
+    })
+    assert response.status_code == 200
+    chunks = _parse_sse_chunks(response.text)
+
+    for c in chunks:
+        if "choices" not in c:
+            continue
+        delta = c["choices"][0].get("delta", {})
+        assert "reasoning" not in delta or delta.get("reasoning") is None
+
+    # Should have content
+    content_parts = []
+    for c in chunks:
+        if "choices" not in c:
+            continue
+        delta = c["choices"][0].get("delta", {})
+        if "content" in delta and delta["content"]:
+            content_parts.append(delta["content"])
+    assert "".join(content_parts) == "just content"
+
+
+def test_stream_chat_no_think_tags_just_content(client):
+    """Model without thinking tags should emit only content deltas."""
+    def plain_stream(*args, **kwargs):
+        return iter(["Hello", " world"])
+    mock_engine.stream_generate = plain_stream
+    sys.modules["ppmlx.engine"].get_engine = MagicMock(return_value=mock_engine)
+    mock_config.tool_awareness.mode = "no_tools_only"
+
+    response = client.post("/v1/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+    assert response.status_code == 200
+    chunks = _parse_sse_chunks(response.text)
+
+    reasoning_parts = []
+    content_parts = []
+    for c in chunks:
+        if "choices" not in c:
+            continue
+        delta = c["choices"][0].get("delta", {})
+        if "reasoning" in delta and delta["reasoning"]:
+            reasoning_parts.append(delta["reasoning"])
+        if "content" in delta and delta["content"]:
+            content_parts.append(delta["content"])
+
+    # State machine starts inside_think=True (Qwen3 template assumption),
+    # so without </think> all output is emitted as reasoning.
+    total = "".join(reasoning_parts) + "".join(content_parts)
+    assert "Hello" in total
+    assert "world" in total

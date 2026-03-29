@@ -556,6 +556,8 @@ async def chat_completions(request: Request):
     stop = body.get("stop")
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
+    think = body.get("think")  # bool | None
+    reasoning_budget = body.get("reasoning_budget")  # int | None
     _track_usage(
         "api_chat_completions",
         {
@@ -583,6 +585,7 @@ async def chat_completions(request: Request):
             request_id, created, model_name, repo_id, messages,
             engine_type, temperature, top_p, max_tokens, stop, seed,
             repetition_penalty, request, start_ts, tools,
+            think=think, reasoning_budget=reasoning_budget,
         )
     else:
         return await _nonstream_chat(
@@ -596,6 +599,7 @@ def _stream_chat(
     request_id, created, model_name, repo_id, messages,
     engine_type, temperature, top_p, max_tokens, stop, seed,
     repetition_penalty, request, start_ts, tools=None,
+    think=None, reasoning_budget=None,
 ):
     """Return streaming SSE response."""
     from fastapi.responses import StreamingResponse
@@ -610,23 +614,63 @@ def _stream_chat(
             pass
         return "<tool_call>", "</tool_call>"
 
+    def _make_chunk_sse(delta):
+        """Build an SSE line for a chat.completion.chunk."""
+        data = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+        return f"data: {json.dumps(data)}\n\n"
+
     async def event_generator():
         first_token_ts = None
-        is_first_chunk = True
+        is_first_chunk = [True]  # mutable so nested helpers can update
         full_text = ""
+        thinking_duration_ms = None
+        reasoning_chars_count = 0
+
+        def _delta(key, text):
+            """Build a delta dict, adding role on the first chunk."""
+            d = {key: text}
+            if is_first_chunk[0]:
+                d["role"] = "assistant"
+                is_first_chunk[0] = False
+            return d
+
         try:
             if engine_type == "text":
                 from ppmlx.engine import get_engine
                 engine = get_engine()
+
+                # Determine whether to enable thinking
+                if think is not None:
+                    enable_thinking = think
+                elif tools:
+                    enable_thinking = False
+                else:
+                    enable_thinking = True
+
+                # When thinking is enabled and no tools, we parse
+                # <think> tags ourselves; otherwise let engine strip them.
+                strip_thinking = not enable_thinking or bool(tools)
+
+                extra_kwargs = {}
+                if reasoning_budget is not None:
+                    extra_kwargs["reasoning_budget"] = reasoning_budget
+
                 gen = engine.stream_generate(
                     repo_id, messages,
                     temperature=0.7 if temperature is None else temperature,
                     top_p=1.0 if top_p is None else top_p,
                     max_tokens=max_tokens,
                     seed=seed,
-                    strip_thinking=bool(tools),  # Strip thinking when tools are present to avoid flooding clients
-                    enable_thinking=not bool(tools),  # Disable thinking phase for tool calls (avoids infinite thinking loops)
+                    strip_thinking=strip_thinking,
+                    enable_thinking=enable_thinking,
                     tools=tools,
+                    **extra_kwargs,
                 )
 
                 # When tools are provided, buffer output and filter tool call
@@ -671,19 +715,7 @@ def _stream_chat(
                                     # Yield text before tool call tag
                                     safe = buf[:start_idx]
                                     if safe:
-                                        if is_first_chunk:
-                                            delta = {"role": "assistant", "content": safe}
-                                            is_first_chunk = False
-                                        else:
-                                            delta = {"content": safe}
-                                        data = {
-                                            "id": request_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created,
-                                            "model": model_name,
-                                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                                        }
-                                        yield f"data: {json.dumps(data)}\n\n"
+                                        yield _make_chunk_sse(_delta("content", safe))
                                     buf = buf[start_idx + len(tc_start):]
                                     inside_tc = True
                                     continue
@@ -699,58 +731,101 @@ def _stream_chat(
                                     safe = buf
                                     buf = ""
                                 if safe:
-                                    if is_first_chunk:
-                                        delta = {"role": "assistant", "content": safe}
-                                        is_first_chunk = False
-                                    else:
-                                        delta = {"content": safe}
-                                    data = {
-                                        "id": request_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model_name,
-                                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                                    }
-                                    yield f"data: {json.dumps(data)}\n\n"
+                                    yield _make_chunk_sse(_delta("content", safe))
                                 break
 
                     # Flush remaining buffer (only if outside tool call)
                     if buf and not inside_tc:
-                        if is_first_chunk:
-                            delta = {"role": "assistant", "content": buf}
-                            is_first_chunk = False
-                        else:
-                            delta = {"content": buf}
-                        data = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                else:
-                    # No tools — stream directly without filtering
+                        yield _make_chunk_sse(_delta("content", buf))
+                elif enable_thinking and not tools:
+                    # No tools, thinking enabled — parse <think> tags
+                    # and emit reasoning vs content deltas.
+                    # Qwen3 templates inject <think> so model output
+                    # typically starts inside a thinking block.
+                    inside_think = True
+                    buf = ""
+                    thinking_start_ts = time.time()
+
                     async for chunk in _async_iter_sync_gen(gen):
                         if not chunk:
-                            yield ": keepalive\n\n"  # SSE comment to prevent timeout
+                            yield ": keepalive\n\n"
                             continue
                         full_text += chunk
                         if first_token_ts is None:
                             first_token_ts = time.time()
-                        if is_first_chunk:
-                            delta = {"role": "assistant", "content": chunk}
-                            is_first_chunk = False
-                        else:
-                            delta = {"content": chunk}
-                        data = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
+                        buf += chunk
+
+                        while buf:
+                            if inside_think:
+                                # Strip leading <think> tag (engine may emit
+                                # it even though template already injected one)
+                                if buf.startswith("<think>"):
+                                    buf = buf[len("<think>"):]
+                                    continue
+                                end_idx = buf.find("</think>")
+                                if end_idx != -1:
+                                    think_chunk = buf[:end_idx]
+                                    if think_chunk:
+                                        reasoning_chars_count += len(think_chunk)
+                                        yield _make_chunk_sse(_delta("reasoning", think_chunk))
+                                    buf = buf[end_idx + len("</think>"):]
+                                    inside_think = False
+                                    if thinking_start_ts:
+                                        thinking_duration_ms = (time.time() - thinking_start_ts) * 1000
+                                    continue
+                                # Check for partial </think> tag at end
+                                partial_len = 0
+                                for i in range(1, len("</think>")):
+                                    if buf.endswith("</think>"[:i]):
+                                        partial_len = i
+                                        break
+                                safe = buf[:len(buf) - partial_len] if partial_len else buf
+                                buf = buf[len(safe):] if partial_len else ""
+                                if safe:
+                                    reasoning_chars_count += len(safe)
+                                    yield _make_chunk_sse(_delta("reasoning", safe))
+                                break
+                            else:
+                                start_idx = buf.find("<think>")
+                                if start_idx != -1:
+                                    before = buf[:start_idx]
+                                    if before:
+                                        yield _make_chunk_sse(_delta("content", before))
+                                    buf = buf[start_idx + len("<think>"):]
+                                    inside_think = True
+                                    thinking_start_ts = time.time()
+                                    continue
+                                # Check for partial <think> tag at end
+                                keep = 0
+                                for i in range(1, min(len("<think>"), len(buf)) + 1):
+                                    if buf.endswith("<think>"[:i]):
+                                        keep = i
+                                if keep:
+                                    safe = buf[:-keep]
+                                    buf = buf[-keep:]
+                                else:
+                                    safe = buf
+                                    buf = ""
+                                if safe:
+                                    yield _make_chunk_sse(_delta("content", safe))
+                                break
+
+                    # Flush remaining buffer
+                    if buf:
+                        key = "reasoning" if inside_think else "content"
+                        if inside_think:
+                            reasoning_chars_count += len(buf)
+                        yield _make_chunk_sse(_delta(key, buf))
+                else:
+                    # No tools, thinking disabled — stream directly
+                    async for chunk in _async_iter_sync_gen(gen):
+                        if not chunk:
+                            yield ": keepalive\n\n"
+                            continue
+                        full_text += chunk
+                        if first_token_ts is None:
+                            first_token_ts = time.time()
+                        yield _make_chunk_sse(_delta("content", chunk))
             elif engine_type == "vision":
                 from ppmlx.engine_vlm import get_vision_engine
                 engine = get_vision_engine()
@@ -758,16 +833,7 @@ def _stream_chat(
                 full_text = text
                 if first_token_ts is None:
                     first_token_ts = time.time()
-                delta = {"role": "assistant", "content": text} if is_first_chunk else {"content": text}
-                is_first_chunk = False
-                data = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(data)}\n\n"
+                yield _make_chunk_sse(_delta("content", text))
         except Exception:
             log.exception("Chat completion stream error")
             err = {"error": {"message": "Model generation failed", "type": "server_error"}}
@@ -813,6 +879,11 @@ def _stream_chat(
 
         total_dur = (time.time() - start_ts) * 1000
         ttft = (first_token_ts - start_ts) * 1000 if first_token_ts else None
+        log_extra = {}
+        if thinking_duration_ms is not None:
+            log_extra["thinking_duration_ms"] = thinking_duration_ms
+        if reasoning_chars_count:
+            log_extra["reasoning_chars"] = reasoning_chars_count
         _log_request(
             request,
             request_id=request_id,
@@ -823,6 +894,7 @@ def _stream_chat(
             total_duration_ms=total_dur,
             time_to_first_token_ms=ttft,
             messages_count=len(messages),
+            **log_extra,
         )
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
