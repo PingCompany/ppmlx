@@ -1434,5 +1434,160 @@ def config_cmd(
     config_menu()
 
 
+_NO_DB_MSG = "[yellow]No database found. Start the server with `ppmlx serve` to begin logging.[/yellow]"
+_NO_REQUESTS_MSG = "[yellow]No requests logged yet. Start the server with `ppmlx serve` to begin logging.[/yellow]"
+
+
+def _open_log_db():
+    """Return the log Database, or print a message and raise typer.Exit if DB doesn't exist."""
+    from ppmlx.db import get_db
+    from ppmlx.config import get_ppmlx_dir
+
+    db_path = get_ppmlx_dir() / "ppmlx.db"
+    if not db_path.exists():
+        console.print(_NO_DB_MSG)
+        raise typer.Exit()
+    return get_db(db_path)
+
+
+@app.command()
+def logs(
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of requests to show"),
+    model: str = typer.Option(None, "--model", "-m", help="Filter by model alias"),
+    since: float = typer.Option(None, "--since", "-s", help="Hours to look back"),
+    errors: bool = typer.Option(False, "--errors", "-e", help="Show only errors"),
+    slow: float = typer.Option(None, "--slow", help="Min duration in ms"),
+    thinking: bool = typer.Option(False, "--thinking", "-t", help="Show only thinking-enabled requests"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """Query and display request history from the log database."""
+    from rich.table import Table
+
+    db = _open_log_db()
+    rows = db.query_requests(
+        limit=limit, model=model, since_hours=since,
+        errors_only=errors, min_duration_ms=slow,
+    )
+
+    if thinking:
+        rows = [r for r in rows if r.get("thinking_enabled")]
+
+    if not rows:
+        console.print(_NO_REQUESTS_MSG)
+        raise typer.Exit()
+
+    if json_output:
+        console.print(json.dumps(rows, indent=2, default=str))
+        raise typer.Exit()
+
+    has_reasoning = any(r.get("reasoning_tokens") for r in rows)
+
+    table = Table(title="Request History")
+    table.add_column("Timestamp", style="dim")
+    table.add_column("Model")
+    table.add_column("Duration (ms)", justify="right")
+    table.add_column("Tok/s", justify="right")
+    table.add_column("TTFT (ms)", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Status")
+    if has_reasoning:
+        table.add_column("Reasoning", justify="right")
+
+    for r in rows:
+        ts = str(r.get("timestamp", ""))[:16]
+        model_alias = r.get("model_alias", "")
+
+        dur = r.get("total_duration_ms")
+        if dur is not None:
+            dur_val = float(dur)
+            if dur_val < 1000:
+                dur_str = f"[green]{dur_val:.0f}[/green]"
+            elif dur_val < 5000:
+                dur_str = f"[yellow]{dur_val:.0f}[/yellow]"
+            else:
+                dur_str = f"[red]{dur_val:.0f}[/red]"
+        else:
+            dur_str = "-"
+
+        tps = r.get("tokens_per_second")
+        tps_str = f"{float(tps):.1f}" if tps is not None else "-"
+
+        ttft = r.get("time_to_first_token_ms")
+        ttft_str = f"{float(ttft):.0f}" if ttft is not None else "-"
+
+        prompt_t = r.get("prompt_tokens", 0) or 0
+        comp_t = r.get("completion_tokens", 0) or 0
+        tok_str = f"{prompt_t}/{comp_t}"
+
+        status = r.get("status", "ok")
+        status_str = "[green]ok[/green]" if status == "ok" else f"[red]{status}[/red]"
+
+        row_cells = [ts, model_alias, dur_str, tps_str, ttft_str, tok_str, status_str]
+        if has_reasoning:
+            rt = r.get("reasoning_tokens")
+            row_cells.append(str(rt) if rt else "-")
+        table.add_row(*row_cells)
+
+    console.print(table)
+
+    durations = [float(r["total_duration_ms"]) for r in rows if r.get("total_duration_ms") is not None]
+    tps_vals = [float(r["tokens_per_second"]) for r in rows if r.get("tokens_per_second") is not None]
+    avg_dur = f"{sum(durations) / len(durations):.0f}ms" if durations else "N/A"
+    avg_tps = f"{sum(tps_vals) / len(tps_vals):.1f}" if tps_vals else "N/A"
+    console.print(f"\nShowing {len(rows)} requests | Avg duration: {avg_dur} | Avg tok/s: {avg_tps}")
+
+
+@app.command()
+def stats(
+    since: float = typer.Option(24, "--since", "-s", help="Hours to look back"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """Display aggregated statistics from the log database."""
+    from rich.table import Table
+
+    db = _open_log_db()
+    s = db.get_stats(since_hours=since)
+
+    if s["total_requests"] == 0:
+        console.print(_NO_REQUESTS_MSG)
+        raise typer.Exit()
+
+    if json_output:
+        console.print(json.dumps(s, indent=2, default=str))
+        raise typer.Exit()
+
+    avg_dur = f"{s['avg_duration_ms']:.0f}ms" if s.get("avg_duration_ms") is not None else "N/A"
+
+    console.print(Panel(
+        f"Total requests: [bold]{s['total_requests']}[/bold]  |  Avg duration: [bold]{avg_dur}[/bold]",
+        title=f"ppmlx Stats (last {since}h)",
+    ))
+
+    if s.get("by_model"):
+        table = Table(title="Per-Model Breakdown")
+        table.add_column("Model")
+        table.add_column("Requests", justify="right")
+        table.add_column("Avg Tok/s", justify="right")
+        table.add_column("Avg TTFT (ms)", justify="right")
+        table.add_column("Errors", justify="right")
+
+        for m in s["by_model"]:
+            tps = f"{m['avg_tps']:.1f}" if m.get("avg_tps") is not None else "-"
+            ttft = f"{m['avg_ttft']:.0f}" if m.get("avg_ttft") is not None else "-"
+            errs = str(m.get("errors", 0))
+            table.add_row(m["model"], str(m["count"]), tps, ttft, errs)
+
+        console.print(table)
+
+    if s.get("thinking"):
+        t = s["thinking"]
+        console.print(Panel(
+            f"Thinking requests: [bold]{t.get('count', 0)}[/bold]  |  "
+            f"% thinking: [bold]{t.get('pct', 0):.1f}%[/bold]  |  "
+            f"Avg reasoning tokens: [bold]{t.get('avg_reasoning_tokens', 'N/A')}[/bold]",
+            title="Thinking Stats",
+        ))
+
+
 if __name__ == "__main__":
     app()

@@ -133,3 +133,76 @@ def test_serve_help():
     assert result.exit_code == 0
     assert "--host" in result.output or "host" in result.output
     assert "--port" in result.output or "port" in result.output
+
+
+def _make_real_db(tmp_path):
+    """Create a real ppmlx Database for testing logs/stats commands."""
+    import importlib
+    # The db module may have been replaced with a MagicMock; reload the real one.
+    import ppmlx.db
+    importlib.reload(ppmlx.db)
+    db = ppmlx.db.Database(tmp_path / "ppmlx.db")
+    db.init()
+    return db
+
+
+def test_logs_command_empty_db(tmp_path):
+    """logs command with empty DB prints a friendly message and doesn't crash."""
+    from unittest.mock import patch
+
+    db = _make_real_db(tmp_path)
+    db.flush()
+
+    with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
+         patch("ppmlx.db.get_db", return_value=db):
+        result = runner.invoke(app, ["logs"])
+    assert result.exit_code == 0
+    assert "No requests" in result.output or "no" in result.output.lower()
+    db.close()
+
+
+def test_stats_command_empty_db(tmp_path):
+    """stats command with empty DB prints a friendly message and doesn't crash."""
+    from unittest.mock import patch
+
+    db = _make_real_db(tmp_path)
+    db.flush()
+
+    with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
+         patch("ppmlx.db.get_db", return_value=db):
+        result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 0
+    assert "No requests" in result.output or "no" in result.output.lower()
+    db.close()
+
+
+def test_logs_json_output(tmp_path):
+    """logs --json produces valid JSON output when there are requests."""
+    import json as json_mod
+    from unittest.mock import patch
+
+    db = _make_real_db(tmp_path)
+    db.log_request(
+        request_id="test-1",
+        endpoint="/v1/chat/completions",
+        model_alias="llama3",
+        model_repo="mlx-community/Meta-Llama-3-8B-Instruct-4bit",
+        status="ok",
+        prompt_tokens=10,
+        completion_tokens=20,
+        total_tokens=30,
+        total_duration_ms=500.0,
+        tokens_per_second=40.0,
+        time_to_first_token_ms=50.0,
+    )
+    db.flush()
+
+    with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
+         patch("ppmlx.db.get_db", return_value=db):
+        result = runner.invoke(app, ["logs", "--json"])
+    assert result.exit_code == 0
+    parsed = json_mod.loads(result.output)
+    assert isinstance(parsed, list)
+    assert len(parsed) >= 1
+    assert parsed[0]["model_alias"] == "llama3"
+    db.close()
