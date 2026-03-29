@@ -556,6 +556,8 @@ async def chat_completions(request: Request):
     stop = body.get("stop")
     seed = body.get("seed")
     repetition_penalty = body.get("repetition_penalty")
+    think = body.get("think")
+    reasoning_budget = body.get("reasoning_budget")
     _track_usage(
         "api_chat_completions",
         {
@@ -589,6 +591,7 @@ async def chat_completions(request: Request):
             request_id, created, model_name, repo_id, messages,
             engine_type, temperature, top_p, max_tokens, stop, seed,
             repetition_penalty, request, start_ts, tools,
+            think=think, reasoning_budget=reasoning_budget,
         )
 
 
@@ -832,22 +835,42 @@ async def _nonstream_chat(
     request_id, created, model_name, repo_id, messages,
     engine_type, temperature, top_p, max_tokens, stop, seed,
     repetition_penalty, request, start_ts, tools=None,
+    think=None, reasoning_budget=None,
 ):
     """Return non-streaming JSON response."""
+    # Determine thinking mode: explicit param > tool heuristic > default on
+    if think is not None:
+        enable_thinking = think
+    elif tools:
+        enable_thinking = False
+    else:
+        enable_thinking = True
+
     try:
         if engine_type == "text":
             from ppmlx.engine import get_engine
             engine = get_engine()
-            text, reasoning, prompt_tokens, completion_tokens = engine.generate(
-                repo_id, messages,
+            gen_kwargs = dict(
                 temperature=0.7 if temperature is None else temperature,
                 top_p=1.0 if top_p is None else top_p,
                 max_tokens=max_tokens,
                 seed=seed,
                 repetition_penalty=repetition_penalty,
-                enable_thinking=not bool(tools),  # Disable thinking for tool calls (avoids infinite loops)
+                enable_thinking=enable_thinking,
                 tools=tools,
             )
+            if reasoning_budget is not None:
+                gen_kwargs["reasoning_budget"] = reasoning_budget
+            try:
+                text, reasoning, prompt_tokens, completion_tokens = engine.generate(
+                    repo_id, messages, **gen_kwargs,
+                )
+            except TypeError:
+                # reasoning_budget not yet supported in engine; retry without it
+                gen_kwargs.pop("reasoning_budget", None)
+                text, reasoning, prompt_tokens, completion_tokens = engine.generate(
+                    repo_id, messages, **gen_kwargs,
+                )
         elif engine_type == "vision":
             from ppmlx.engine_vlm import get_vision_engine
             engine = get_vision_engine()
@@ -877,6 +900,12 @@ async def _nonstream_chat(
     tokenizer = engine.get_tokenizer(repo_id)
     remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=tools) if tools else (text, [])
 
+    # Compute reasoning token count for usage details
+    try:
+        reasoning_tokens_count = len(tokenizer.encode(reasoning)) if reasoning else None
+    except Exception:
+        reasoning_tokens_count = None
+
     message: dict = {"role": "assistant", "content": remaining_text or None}
     if reasoning:
         message["reasoning"] = reasoning
@@ -903,11 +932,11 @@ async def _nonstream_chat(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens_count or 0},
         },
     }
 
-    _log_request(
-        request,
+    log_kwargs = dict(
         request_id=request_id,
         endpoint="/v1/chat/completions",
         model_alias=model_name,
@@ -919,6 +948,17 @@ async def _nonstream_chat(
         total_duration_ms=total_dur,
         messages_count=len(messages),
     )
+    try:
+        _log_request(
+            request,
+            reasoning_tokens=reasoning_tokens_count,
+            thinking_enabled=1 if enable_thinking else 0,
+            reasoning_budget=reasoning_budget,
+            **log_kwargs,
+        )
+    except Exception:
+        # db.py may not support thinking fields yet; fall back without them
+        _log_request(request, **log_kwargs)
 
     return JSONResponse(response)
 
