@@ -186,7 +186,7 @@ def test_unknown_model_uses_name_directly(client):
 
 
 def test_cors_headers_present(client):
-    response = client.options(
+    client.options(
         "/health",
         headers={
             "Origin": "http://localhost:3000",

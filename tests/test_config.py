@@ -47,7 +47,7 @@ class TestDefaultValues:
         assert cfg.server.cors is True
         assert cfg.server.max_loaded_models == 2
         assert cfg.tool_awareness.mode == "no_tools_only"
-        assert cfg.analytics.enabled is True
+        assert cfg.analytics.enabled is False
         assert cfg.analytics.provider == "posthog"
 
     def test_tool_awareness_defaults(self):

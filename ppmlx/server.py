@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -58,16 +59,29 @@ app = FastAPI(
     title="ppmlx",
     version=__version__,
     description="OpenAI-compatible LLM API for Apple Silicon via MLX",
+    docs_url="/docs", redoc_url="/redoc",
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _cors_origins() -> list[str]:
+    try:
+        from ppmlx.config import load_config
+        cfg = load_config()
+        if not cfg.server.cors:
+            return []
+    except Exception:
+        pass
+    raw = os.environ.get("PPMLX_CORS_ORIGINS", "*")
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+_origins = _cors_origins()
+if _origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 async def _snapshot_loop(interval_seconds: int) -> None:
@@ -220,7 +234,7 @@ _TOOL_CALL_FALLBACK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _TC_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 def _parse_tool_calls(
-    text: str, tokenizer: Any = None, tools: list[dict] | None = None,
+    text: str, tokenizer: object = None, tools: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     """Extract tool-call blocks from model output.
 
@@ -239,7 +253,7 @@ def _parse_tool_calls(
 
 
 def _parse_tool_calls_mlx(
-    text: str, tokenizer: Any, tools: list[dict] | None,
+    text: str, tokenizer: object, tools: list[dict] | None,
 ) -> tuple[str, list[dict]]:
     """Parse tool calls using mlx_lm's model-specific parser."""
     start_tag = tokenizer.tool_call_start
@@ -518,6 +532,7 @@ async def list_models():
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
     body = await request.json()
+    from ppmlx.schema import ChatCompletionRequest as _CCReq; _CCReq.model_validate(body)
 
     model_name = body.get("model", "")
     messages = body.get("messages", [])
@@ -753,8 +768,9 @@ def _stream_chat(
                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(data)}\n\n"
-        except Exception as e:
-            err = {"error": {"message": str(e), "type": "server_error"}}
+        except Exception:
+            log.exception("Chat completion stream error")
+            err = {"error": {"message": "Model generation failed", "type": "server_error"}}
             yield f"data: {json.dumps(err)}\n\n"
 
         # Parse tool calls if tools were provided
@@ -841,7 +857,7 @@ async def _nonstream_chat(
             raise HTTPException(status_code=400, detail=f"Model '{model_name}' is an embedding model.")
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as exc:
         _log_request(
             request,
             request_id=request_id,
@@ -850,9 +866,10 @@ async def _nonstream_chat(
             model_repo=repo_id,
             stream=False,
             status="error",
-            error_message=str(e),
+            error_message=str(exc),
         )
-        raise HTTPException(status_code=503, detail=str(e))
+        log.exception("Chat completion generation failed")
+        raise HTTPException(status_code=503, detail="Model generation failed")
 
     total_dur = (time.time() - start_ts) * 1000
 
@@ -910,6 +927,7 @@ async def _nonstream_chat(
 async def completions(request: Request):
     """OpenAI-compatible text completions endpoint."""
     body = await request.json()
+    from ppmlx.schema import CompletionRequest as _CReq; _CReq.model_validate(body)
     model_name = body.get("model", "")
     prompt = body.get("prompt", "")
     max_tokens = body.get("max_tokens")
@@ -927,7 +945,6 @@ async def completions(request: Request):
 
     request_id = "cmpl-" + uuid.uuid4().hex[:12]
     created = int(time.time())
-    start_ts = time.time()
 
     try:
         from ppmlx.engine import get_engine
@@ -937,8 +954,9 @@ async def completions(request: Request):
             temperature=0.7 if temperature is None else temperature,
             max_tokens=max_tokens,
         )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        log.exception("Text completion generation failed")
+        raise HTTPException(status_code=503, detail="Model generation failed")
 
     return JSONResponse({
         "id": request_id,
@@ -958,6 +976,7 @@ async def completions(request: Request):
 async def embeddings(request: Request):
     """OpenAI-compatible embeddings endpoint."""
     body = await request.json()
+    from ppmlx.schema import EmbeddingRequest as _EReq; _EReq.model_validate(body)
     model_name = body.get("model", "")
     input_text = body.get("input", "")
 
@@ -982,8 +1001,9 @@ async def embeddings(request: Request):
             status_code=501,
             detail="Embeddings require the 'mlx-embeddings' package. Install with: pip install ppmlx[embeddings]",
         )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        log.exception("Embedding generation failed")
+        raise HTTPException(status_code=503, detail="Embedding generation failed")
 
     data = [{"object": "embedding", "embedding": vec, "index": i} for i, vec in enumerate(vectors)]
     total_tokens = sum(len(t.split()) for t in texts)
@@ -1218,7 +1238,6 @@ def _stream_responses(
                 # output starts inside a thinking block.  Start in thinking
                 # mode and emit a reasoning output item immediately.
                 in_thinking = True
-                msg_item_emitted = False
                 buf = ""
                 reasoning_idx = 0
                 msg_output_idx = 1
@@ -1338,11 +1357,11 @@ def _stream_responses(
                     "content_index": 0,
                     "delta": text,
                 }, seq)
-        except Exception as e:
+        except Exception:
             log.exception("responses stream error")
             yield _sse("error", {
                 "type": "server_error",
-                "message": str(e),
+                "message": "Model generation failed",
             }, seq)
             return
 
@@ -1485,8 +1504,9 @@ async def _nonstream_responses(
             raise HTTPException(status_code=400, detail=f"Model '{model_name}' is an embedding model.")
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        log.exception("Responses generation failed")
+        raise HTTPException(status_code=503, detail="Model generation failed")
 
     tokenizer = engine.get_tokenizer(repo_id)
     remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=tools)
@@ -1869,10 +1889,11 @@ def _stream_anthropic(
                 yield _anthropic_sse({"type": "content_block_stop", "index": content_idx})
                 content_idx += 1
 
-        except Exception as e:
+        except Exception:
+            log.exception("Anthropic stream error")
             yield _anthropic_sse({
                 "type": "error",
-                "error": {"type": "server_error", "message": str(e)},
+                "error": {"type": "server_error", "message": "Model generation failed"},
             })
             return
 
@@ -1947,8 +1968,9 @@ async def _nonstream_anthropic(
             tools=oai_tools,
             enable_thinking=not bool(oai_tools),  # Disable thinking for tool calls
         )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        log.exception("Anthropic messages generation failed")
+        raise HTTPException(status_code=503, detail="Model generation failed")
 
     tokenizer = engine.get_tokenizer(repo_id)
     remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=oai_tools)
@@ -2084,10 +2106,11 @@ async def responses_ws(websocket: WebSocket):
                         max_tokens=max_tokens,
                     )
                     full_text = text
-            except Exception as e:
+            except Exception:
+                log.exception("WebSocket generation error")
                 await websocket.send_json({
                     "type": "error",
-                    "error": {"type": "server_error", "message": str(e)},
+                    "error": {"type": "server_error", "message": "Model generation failed"},
                 })
                 continue
 

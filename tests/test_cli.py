@@ -16,10 +16,11 @@ runner = CliRunner()
 
 
 def test_version():
-    """--version returns 0.2.0 and exits 0."""
+    """--version returns current version and exits 0."""
+    from ppmlx import __version__
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "0.2.0" in result.output
+    assert __version__ in result.output
 
 
 def test_help():
@@ -63,7 +64,9 @@ def test_list_command_empty():
 
 
 def test_list_command_with_model():
-    """list command renders a table when models are present."""
+    """list command opens TUI browser when models are present."""
+    from unittest.mock import patch
+
     mock_models = [
         {
             "name": "Meta-Llama-3-8B-Instruct-4bit",
@@ -78,9 +81,13 @@ def test_list_command_with_model():
         local_models=mock_models,
     )
 
-    result = runner.invoke(app, ["list"])
-    assert result.exit_code == 0
-    assert "llama3" in result.output
+    with patch("ppmlx.tui.browse_models") as mock_browse:
+        result = runner.invoke(app, ["list"])
+        assert result.exit_code == 0
+        mock_browse.assert_called_once()
+        rows = mock_browse.call_args[0][0]
+        aliases = [r.alias for r in rows if r.section_header is None]
+        assert "llama3" in aliases
 
 
 def test_pull_command():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,7 +47,7 @@ class ToolAwarenessConfig:
 
 @dataclass
 class AnalyticsConfig:
-    enabled: bool = True
+    enabled: bool = False
     provider: str = "posthog"
     host: str = ""
     project_api_key: str = ""
@@ -200,3 +201,42 @@ def _apply_cli(cfg: Config, overrides: dict) -> None:
         elif key == "model": cfg.defaults.model = str(val)
         elif key == "temperature": cfg.defaults.temperature = float(val)
         elif key == "max_tokens": cfg.defaults.max_tokens = int(val)
+
+
+def check_first_run() -> None:
+    """Show analytics opt-in prompt on first run."""
+    try:
+        marker = get_ppmlx_dir() / ".first_run_done"
+        if marker.exists():
+            return
+        if not sys.stdin.isatty():
+            marker.touch()
+            return
+        from rich.console import Console
+        console = Console()
+        console.print(
+            "\n[bold]ppmlx[/bold] can collect anonymous usage statistics "
+            "(command names, version, OS — never prompts or model outputs).\n"
+            "This helps improve ppmlx.\n"
+        )
+        answer = input("Enable anonymous analytics? [y/N] ").strip().lower()
+        enabled = answer in ("y", "yes")
+        _save_analytics_preference(enabled)
+        marker.touch()
+    except Exception:
+        pass
+
+
+def _save_analytics_preference(enabled: bool) -> None:
+    """Save analytics preference to config.toml."""
+    import tomli_w
+    cfg_path = get_ppmlx_dir() / "config.toml"
+    data: dict = {}
+    try:
+        with open(cfg_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        pass
+    data.setdefault("analytics", {})["enabled"] = enabled
+    with open(cfg_path, "wb") as f:
+        tomli_w.dump(data, f)

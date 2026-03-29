@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 import uuid
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def make_request_id() -> str:
@@ -32,7 +32,8 @@ class ContentPart(BaseModel):
 # ── Chat messages ───────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
+    model_config = {"extra": "allow"}
+    role: Literal["system", "user", "assistant", "tool", "developer"]
     content: str | list[ContentPart] | None = None
     reasoning: str | None = None  # ppmlx extension: populated for <think> models
 
@@ -40,15 +41,23 @@ class ChatMessage(BaseModel):
 # ── Chat completion request ─────────────────────────────────────────────
 
 class ChatCompletionRequest(BaseModel):
+    model_config = {"extra": "allow"}
     model: str
     messages: list[ChatMessage]
-    temperature: float | None = None
-    top_p: float | None = None
-    max_tokens: int | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
     stream: bool = False
     stop: str | list[str] | None = None
     seed: int | None = None
-    repetition_penalty: float | None = None  # ppmlx extension
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)  # ppmlx extension
+
+    @field_validator("messages")
+    @classmethod
+    def at_least_one_message(cls, v: list[ChatMessage]) -> list[ChatMessage]:
+        if not v:
+            raise ValueError("messages must contain at least one message")
+        return v
 
 
 # ── Chat completion response ────────────────────────────────────────────
@@ -101,14 +110,16 @@ class ChatCompletionChunk(BaseModel):
 # ── Text completion (legacy) ────────────────────────────────────────────
 
 class CompletionRequest(BaseModel):
+    model_config = {"extra": "allow"}
     model: str
     prompt: str
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
+    max_tokens: int | None = Field(default=None, ge=1, le=131072)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     stream: bool = False
     stop: str | list[str] | None = None
     seed: int | None = None
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
 class CompletionChoice(BaseModel):
@@ -130,9 +141,17 @@ class CompletionResponse(BaseModel):
 # ── Embeddings ──────────────────────────────────────────────────────────
 
 class EmbeddingRequest(BaseModel):
+    model_config = {"extra": "allow"}
     model: str
     input: str | list[str]
     encoding_format: Literal["float", "base64"] = "float"
+
+    @field_validator("input")
+    @classmethod
+    def batch_size_limit(cls, v: str | list[str]) -> str | list[str]:
+        if isinstance(v, list) and len(v) > 2048:
+            raise ValueError("batch size must not exceed 2048")
+        return v
 
 
 class EmbeddingData(BaseModel):

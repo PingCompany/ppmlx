@@ -2,6 +2,8 @@
 
 **Run LLMs on your Mac.** OpenAI-compatible API powered by Apple Silicon.
 
+[![CI](https://github.com/the-focus-company/ppmlx/actions/workflows/tests.yml/badge.svg)](https://github.com/the-focus-company/ppmlx/actions)
+[![PyPI](https://img.shields.io/pypi/v/ppmlx)](https://pypi.org/project/ppmlx/)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -80,7 +82,7 @@ respect_do_not_track = true
 
 ## Anonymous Usage Analytics
 
-`ppmlx` supports privacy-preserving anonymous product analytics in an `opt-out` model.
+`ppmlx` supports privacy-preserving anonymous product analytics, disabled by default — you are asked to opt in on first run.
 
 What is sent:
 - command and API event names such as `serve_started`, `model_pulled`, `api_chat_completions`
@@ -121,6 +123,32 @@ export PPMLX_ANALYTICS_PROJECT_API_KEY="your-posthog-project-api-key"
 ```
 
 If you prefer, you can also set the same values in `~/.ppmlx/config.toml`.
+
+## API Documentation
+
+When the server is running, interactive API docs are available at:
+
+- **Swagger UI**: [http://localhost:6767/docs](http://localhost:6767/docs)
+- **ReDoc**: [http://localhost:6767/redoc](http://localhost:6767/redoc)
+
+## Requirements
+
+- macOS on Apple Silicon (M1 or later)
+- Python 3.11+
+- At least 8 GB unified memory (16 GB+ recommended for larger models)
+
+## ppmlx vs Ollama
+
+| | ppmlx | Ollama |
+|---|---|---|
+| Runtime | MLX (Apple-native) | llama.cpp (cross-platform) |
+| Platform | macOS Apple Silicon only | macOS, Linux, Windows |
+| GPU backend | Metal (unified memory) | Metal / CUDA / ROCm |
+| API | OpenAI-compatible | Ollama + OpenAI-compatible |
+| Language | Python | Go + C++ |
+| Quantization | MLX format | GGUF format |
+
+Choose **ppmlx** if you want maximum Apple Silicon performance with a pure-Python, MLX-native stack. Choose **Ollama** if you need cross-platform support or GGUF models.
 
 ## License
 

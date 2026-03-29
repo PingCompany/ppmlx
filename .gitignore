@@ -17,6 +17,6 @@ build/
 .mypy_cache/
 .ruff_cache/
 *.pyc
-uv.lock
 *.html
 .claire/
+site/dist/
