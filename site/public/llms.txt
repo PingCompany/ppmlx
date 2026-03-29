@@ -37,9 +37,9 @@ Then connect any OpenAI-compatible client to http://localhost:6767/v1 with any A
 ## Links
 
 - Website: https://ppmlx.dev
-- GitHub: https://github.com/PingCompany/ppmlx
+- GitHub: https://github.com/the-focus-company/ppmlx
 - PyPI: https://pypi.org/project/ppmlx/
-- Issues: https://github.com/PingCompany/ppmlx/issues
+- Issues: https://github.com/the-focus-company/ppmlx/issues
 
 ## Benchmarks (GLM-4.7-Flash, MacBook Pro M4 Pro 48GB, 3 runs averaged)
 

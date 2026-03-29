@@ -43,9 +43,9 @@ embeddings = ["mlx-embeddings>=0.0.5 ; sys_platform == 'darwin'"]
 
 [project.urls]
 Homepage = "https://ppmlx.dev"
-Repository = "https://github.com/PingCompany/ppmlx"
-Issues = "https://github.com/PingCompany/ppmlx/issues"
-Documentation = "https://github.com/PingCompany/ppmlx#readme"
+Repository = "https://github.com/the-focus-company/ppmlx"
+Issues = "https://github.com/the-focus-company/ppmlx/issues"
+Documentation = "https://github.com/the-focus-company/ppmlx#readme"
 
 [project.scripts]
 ppmlx = "ppmlx.cli:app"
