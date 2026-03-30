@@ -1,0 +1,49 @@
+name: Bug Report
+description: Report a bug in ppmlx
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: ppmlx version
+      description: Output of `ppmlx --version`
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Which model were you using?
+      placeholder: "qwen3.5:9b"
+  - type: input
+    id: os
+    attributes:
+      label: macOS version & chip
+      placeholder: "macOS 15.3, M4 Pro"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Run `ppmlx serve`
+        2. Send request with ...
+        3. See error ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any relevant terminal output or error messages
+      render: shell

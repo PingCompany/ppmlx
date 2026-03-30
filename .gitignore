@@ -1,19 +1,42 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyc
 .Python
+.DS_Store
+
+# Virtual environments
 .venv/
 venv/
 env/
 .env
+
+# Build / packaging
+.claude/
+.webui_secret_key
 dist/
 build/
 *.egg-info/
+
+# Linting / testing caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.pyc
+
+# IDE / OS artifacts
+*.DS_Store
+
+# Tool-specific
+.claire/
 uv.lock
 *.html
-.claire/
+
+# Benchmarks & generated output
+benchmark_results/
+
+# Site / docs build artifacts
+site/dist/
+site/node_modules/
+site/.astro/
