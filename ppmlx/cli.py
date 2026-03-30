@@ -1678,6 +1678,8 @@ def history_list(
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Filter by model"),
 ):
     """List recent conversations."""
+    from rich.table import Table
+
     from ppmlx.history import get_history
 
     hm = get_history()
@@ -1709,6 +1711,8 @@ def history_search(
     limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
 ):
     """Full-text search across all conversations."""
+    from rich.table import Table
+
     from ppmlx.history import get_history
 
     hm = get_history()
