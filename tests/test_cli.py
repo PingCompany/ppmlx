@@ -1,11 +1,10 @@
 import sys
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import MagicMock
 from typer.testing import CliRunner
 
 # Mock all ppmlx modules before importing cli
 for mod_name in ["ppmlx.models", "ppmlx.engine", "ppmlx.db",
-                  "ppmlx.config", "ppmlx.memory", "ppmlx.modelfile",
+                  "ppmlx.config", "ppmlx.memory",
                   "ppmlx.quantize", "ppmlx.engine_embed", "ppmlx.engine_vlm",
                   "ppmlx.registry"]:
     if mod_name not in sys.modules:
@@ -17,10 +16,11 @@ runner = CliRunner()
 
 
 def test_version():
-    """--version returns 0.1.0 and exits 0."""
+    """--version returns current version and exits 0."""
+    from ppmlx import __version__
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert __version__ in result.output
 
 
 def test_help():
@@ -54,20 +54,6 @@ def _setup_model_mocks(
     sys.modules["ppmlx.registry"].registry_entries = MagicMock(return_value={})
 
 
-def test_aliases_command():
-    """aliases command renders a table with alias/repo columns."""
-    _setup_model_mocks(defaults={
-        "llama3": "mlx-community/Meta-Llama-3-8B-Instruct-4bit",
-        "mistral": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
-    })
-
-    result = runner.invoke(app, ["aliases"])
-    assert result.exit_code == 0
-    assert "llama3" in result.output
-    assert "mistral" in result.output
-    assert "built-in" in result.output
-
-
 def test_list_command_empty():
     """list command shows 'No models' message when no models are downloaded."""
     _setup_model_mocks()
@@ -78,7 +64,9 @@ def test_list_command_empty():
 
 
 def test_list_command_with_model():
-    """list command renders a table when models are present."""
+    """list command opens TUI browser when models are present."""
+    from unittest.mock import patch
+
     mock_models = [
         {
             "name": "Meta-Llama-3-8B-Instruct-4bit",
@@ -93,9 +81,13 @@ def test_list_command_with_model():
         local_models=mock_models,
     )
 
-    result = runner.invoke(app, ["list"])
-    assert result.exit_code == 0
-    assert "llama3" in result.output
+    with patch("ppmlx.tui.browse_models") as mock_browse:
+        result = runner.invoke(app, ["list"])
+        assert result.exit_code == 0
+        mock_browse.assert_called_once()
+        rows = mock_browse.call_args[0][0]
+        aliases = [r.alias for r in rows if r.section_header is None]
+        assert "llama3" in aliases
 
 
 def test_pull_command():
@@ -135,29 +127,82 @@ def test_rm_with_force():
     sys.modules["ppmlx.models"].remove_model.assert_called_once_with("some-model")
 
 
-def test_add_alias():
-    """alias command calls save_user_alias with correct (name, repo) args."""
-    sys.modules["ppmlx.models"].save_user_alias = MagicMock()
-
-    result = runner.invoke(app, ["alias", "my-model", "org/my-hf-model"])
-    assert result.exit_code == 0
-    sys.modules["ppmlx.models"].save_user_alias.assert_called_once_with("my-model", "org/my-hf-model")
-
-
-def test_logs_command():
-    """logs command shows 'No log entries' when database is empty."""
-    mock_db = MagicMock()
-    mock_db.query_requests.return_value = []
-    sys.modules["ppmlx.db"].get_db = MagicMock(return_value=mock_db)
-
-    result = runner.invoke(app, ["logs"])
-    assert result.exit_code == 0
-    assert "No log entries" in result.output
-
-
 def test_serve_help():
     """serve --help shows available options."""
     result = runner.invoke(app, ["serve", "--help"])
     assert result.exit_code == 0
     assert "--host" in result.output or "host" in result.output
     assert "--port" in result.output or "port" in result.output
+
+
+def _make_real_db(tmp_path):
+    """Create a real ppmlx Database for testing logs/stats commands."""
+    import importlib
+    # The db module may have been replaced with a MagicMock; reload the real one.
+    import ppmlx.db
+    importlib.reload(ppmlx.db)
+    db = ppmlx.db.Database(tmp_path / "ppmlx.db")
+    db.init()
+    return db
+
+
+def test_logs_command_empty_db(tmp_path):
+    """logs command with empty DB prints a friendly message and doesn't crash."""
+    from unittest.mock import patch
+
+    db = _make_real_db(tmp_path)
+    db.flush()
+
+    with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
+         patch("ppmlx.db.get_db", return_value=db):
+        result = runner.invoke(app, ["logs"])
+    assert result.exit_code == 0
+    assert "No requests" in result.output or "no" in result.output.lower()
+    db.close()
+
+
+def test_stats_command_empty_db(tmp_path):
+    """stats command with empty DB prints a friendly message and doesn't crash."""
+    from unittest.mock import patch
+
+    db = _make_real_db(tmp_path)
+    db.flush()
+
+    with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
+         patch("ppmlx.db.get_db", return_value=db):
+        result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 0
+    assert "No requests" in result.output or "no" in result.output.lower()
+    db.close()
+
+
+def test_logs_json_output(tmp_path):
+    """logs --json produces valid JSON output when there are requests."""
+    import json as json_mod
+    from unittest.mock import patch
+
+    db = _make_real_db(tmp_path)
+    db.log_request(
+        request_id="test-1",
+        endpoint="/v1/chat/completions",
+        model_alias="llama3",
+        model_repo="mlx-community/Meta-Llama-3-8B-Instruct-4bit",
+        status="ok",
+        prompt_tokens=10,
+        completion_tokens=20,
+        total_tokens=30,
+        total_duration_ms=500.0,
+        tokens_per_second=40.0,
+        time_to_first_token_ms=50.0,
+    )
+    db.flush()
+
+    with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
+         patch("ppmlx.db.get_db", return_value=db):
+        result = runner.invoke(app, ["logs", "--json"])
+    assert result.exit_code == 0
+    parsed = json_mod.loads(result.output)
+    assert isinstance(parsed, list)
+    assert len(parsed) >= 1
+    assert parsed[0]["model_alias"] == "llama3"
+    db.close()

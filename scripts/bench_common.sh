@@ -80,9 +80,10 @@ start_ns  = time.time_ns()
 ttft_ns   = None
 chunks    = 0
 full_text = []
+usage     = {}  # from final chunk with usage info
 
 try:
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=600) as resp:
         buf = b''
         while True:
             chunk = resp.read(1)
@@ -99,6 +100,9 @@ try:
                     break
                 try:
                     obj     = json.loads(payload)
+                    # Capture usage from any chunk that has it
+                    if 'usage' in obj and obj['usage']:
+                        usage = obj['usage']
                     delta   = obj.get('choices', [{}])[0].get('delta', {})
                     # Some backends (ollama+GLM) put thinking in delta.reasoning
                     # and only surface final answer in delta.content.
@@ -118,114 +122,122 @@ except Exception as e:
 end_ns     = time.time_ns()
 elapsed_ms = round((end_ns - start_ns) / 1_000_000)
 ttft_ms    = round((ttft_ns - start_ns) / 1_000_000) if ttft_ns else 0
-tokens     = chunks
-tok_s      = round(tokens / (elapsed_ms / 1000), 2) if elapsed_ms > 0 and tokens > 0 else 0
+# Prefer real token count from usage; fall back to chunk count
+completion_tokens = usage.get('completion_tokens', 0) or chunks
+tok_s      = round(completion_tokens / (elapsed_ms / 1000), 2) if elapsed_ms > 0 and completion_tokens > 0 else 0
 
-print(json.dumps({'ms': elapsed_ms, 'tokens': tokens, 'tok_s': tok_s,
+print(json.dumps({'ms': elapsed_ms, 'tokens': completion_tokens, 'tok_s': tok_s,
                   'ttft_ms': ttft_ms, 'error': False}))
 " "$url" "$body" 2>/dev/null
 }
 
-# ── pi agentic call helper ────────────────────────────────────────────────
+# ── Agentic call helper (direct API, multi-turn with tools) ────────────────
 #
-# Runs pi with --mode json and extracts:
-#   ms, ttft_ms, tokens (≈message_update count), tok_s,
-#   chars_total, think_chars, answer_chars, turns, tool_calls
+# Makes non-streaming API calls with tools defined.  When the model responds
+# with finish_reason=tool_calls, provides a simulated tool result and
+# continues.  Measures: ms, turns, tool_calls, answer_chars.
 #
-# Returns JSON with all fields above + error flag.
+# Returns JSON: {ms, tokens, turns, tool_calls, tool_names, answer_chars, error}
 
-call_pi() {
-    local pi_model="$1"
-    local prompt="$2"
+call_agentic() {
+    local url="$1"
+    local model="$2"
+    local prompt="$3"
 
-    # Pass model/prompt via env vars to avoid all shell quoting issues with
-    # newlines, backticks and quotes inside the prompt string.
-    _BENCH_PI_MODEL="$pi_model" _BENCH_PI_PROMPT="$prompt" \
+    _BENCH_AG_URL="$url" _BENCH_AG_MODEL="$model" _BENCH_AG_PROMPT="$prompt" \
     python3 - 2>/dev/null << 'PYEOF'
-import os, sys, json, time, subprocess, re
+import os, sys, json, time, urllib.request
 
-EMPTY = {'ms':0,'ttft_ms':0,'tokens':0,'tok_s':0,'chars_total':0,
-         'think_chars':0,'answer_chars':0,'turns':0,
-         'tool_calls':0,'tool_names':[],'error':True}
+EMPTY = {'ms':0,'tokens':0,'turns':0,
+         'tool_calls':0,'tool_names':[],'answer_chars':0,'error':True}
 
-pi_model = os.environ.get('_BENCH_PI_MODEL', '')
-prompt   = os.environ.get('_BENCH_PI_PROMPT', '')
-if not pi_model or not prompt:
+url    = os.environ.get('_BENCH_AG_URL', '')
+model  = os.environ.get('_BENCH_AG_MODEL', '')
+prompt = os.environ.get('_BENCH_AG_PROMPT', '')
+if not url or not model or not prompt:
     print(json.dumps(EMPTY)); sys.exit(0)
 
+MAX_TURNS = 5
+
+tools = [
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read a file from disk",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+]
+
+# Simulated tool results (realistic enough for the model to continue)
+TOOL_RESULTS = {
+    "bash": '{"stdout": "total 48\\ndrwxr-xr-x  12 user staff  384 Mar 25 10:00 .\\n-rw-r--r--   1 user staff 1234 Mar 25 09:55 server.py\\n-rw-r--r--   1 user staff  890 Mar 25 09:50 engine.py\\n-rw-r--r--   1 user staff  456 Mar 25 09:45 config.py", "exit_code": 0}',
+    "read_file": '{"content": "from fastapi import FastAPI, Request\\nimport json\\n\\napp = FastAPI()\\n\\n@app.post(\\"/v1/chat/completions\\")\\nasync def chat(request: Request):\\n    body = await request.json()\\n    # TODO: validate input\\n    model = body.get(\\"model\\")\\n    messages = body.get(\\"messages\\", [])\\n    return {\\"choices\\": [{\\"message\\": {\\"content\\": \\"hello\\"}}]}\\n"}',
+}
+
+messages = [{"role": "user", "content": prompt}]
+total_tokens = 0
+all_tool_calls = []
+answer_text = ""
+
+start_ns = time.time_ns()
 try:
-    start_ns = time.time_ns()
-    proc = subprocess.run(
-        ['pi', '--model', pi_model, '--mode', 'json', '--print', prompt],
-        capture_output=True, text=True, timeout=300,
-    )
-    end_ns = time.time_ns()
-except Exception:
+    for turn in range(MAX_TURNS):
+        body = json.dumps({
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "max_tokens": 2048,
+            "temperature": 0.0,
+            "stream": False,
+        }).encode()
+
+        req = urllib.request.Request(url, data=body, headers={
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer local',
+        })
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+
+        choice = data.get("choices", [{}])[0]
+        msg = choice.get("message", {})
+        usage = data.get("usage", {})
+        total_tokens += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+
+        # Append assistant message to history
+        messages.append(msg)
+
+        finish = choice.get("finish_reason", "stop")
+        if finish == "tool_calls" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                all_tool_calls.append(name)
+                result = TOOL_RESULTS.get(name, '{"result": "ok"}')
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result,
+                })
+        else:
+            # Model finished — extract answer
+            answer_text = msg.get("content", "") or ""
+            break
+
+except Exception as e:
     print(json.dumps(EMPTY)); sys.exit(0)
 
-elapsed_ms   = round((end_ns - start_ns) / 1_000_000)
-tokens       = 0
-ttft_ms      = 0
-turns        = 0
-tool_calls   = []
-first_tok_ns = None
-answer_text  = ''
-
-for line in proc.stdout.splitlines():
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    t = obj.get('type', '')
-    if t == 'turn_start':
-        turns += 1
-    elif t == 'message_update':
-        ev      = obj.get('assistantMessageEvent', {})
-        partial = ev.get('partial', {})
-        ts_ms   = partial.get('timestamp')
-        for c in partial.get('content', []):
-            if c.get('text', ''):
-                if first_tok_ns is None and ts_ms:
-                    first_tok_ns = ts_ms * 1_000_000
-                tokens += 1
-    elif t == 'tool_call':
-        tool = obj.get('tool', {})
-        tool_calls.append({'name': tool.get('name',''),
-                           'input': str(tool.get('input',''))[:120]})
-    elif t == 'agent_end':
-        for msg in obj.get('messages', []):
-            if msg.get('role') == 'assistant':
-                for c in msg.get('content', []):
-                    answer_text = c.get('text', '')
-
-if first_tok_ns:
-    ttft_ms = round((first_tok_ns - start_ns) / 1_000_000)
-
-think_match = re.search(r'(.*?)</think>(.*)', answer_text, re.DOTALL)
-if think_match:
-    think_chars  = len(think_match.group(1))
-    answer_chars = len(think_match.group(2).strip())
-else:
-    think_chars  = 0
-    answer_chars = len(answer_text)
-
-tok_s = round(tokens / (elapsed_ms / 1000), 2) if elapsed_ms > 0 and tokens > 0 else 0
+end_ns = time.time_ns()
+elapsed_ms = round((end_ns - start_ns) / 1_000_000)
+turns_count = len([m for m in messages if m.get("role") == "assistant"])
 
 print(json.dumps({
     'ms':           elapsed_ms,
-    'ttft_ms':      ttft_ms,
-    'tokens':       tokens,
-    'tok_s':        tok_s,
-    'chars_total':  len(answer_text),
-    'think_chars':  think_chars,
-    'answer_chars': answer_chars,
-    'turns':        turns,
-    'tool_calls':   len(tool_calls),
-    'tool_names':   [tc['name'] for tc in tool_calls],
-    'error':        proc.returncode != 0 or tokens == 0,
+    'tokens':       total_tokens,
+    'turns':        turns_count,
+    'tool_calls':   len(all_tool_calls),
+    'tool_names':   all_tool_calls,
+    'answer_chars': len(answer_text),
+    'error':        turns_count == 0,
 }))
 PYEOF
 }
@@ -274,7 +286,7 @@ get_memory_mb() {
 # Outer loop: runs (R=1..RUNS)
 # Inner order: S1 → S2 → S3 → S4
 # S1-S3: direct API calls (fair tok/s comparison)
-# S4: real agentic via pi (wall-time only comparison)
+# S4: multi-turn agentic via direct API with tools (non-streaming)
 # Prints one-line result per scenario immediately after it completes.
 # Final block shows per-scenario stats across runs.
 
@@ -282,7 +294,7 @@ run_full_benchmark() {
     local model="$1"
     local backend="$2"
     local api_url="$3"
-    local pi_model="$4"
+    # $4 is unused (was pi_model)
 
     local outfile="$RESULTS_DIR/${backend}_${model//[:\/]/_}.json"
     local timestamp
@@ -292,6 +304,11 @@ run_full_benchmark() {
     printf "${BOLD}  %s — %s${RESET}\n" "$backend" "$model"
     printf "${BOLD}════════════════════════════════════════${RESET}\n"
     printf "Runs: %d | Max tokens (S1-S3): %d\n\n" "$RUNS" "$MAX_TOKENS"
+
+    # ── Warmup (load model, fill caches — result discarded) ──────────
+    printf "  ${DIM}Warmup...${RESET}"
+    call_api "$api_url" "$model" "Say hello." "warmup" >/dev/null 2>&1 || true
+    printf "\r  ${GREEN}Warmup done${RESET}\n\n"
 
     # Raw data arrays (space-separated strings)
     local s1_ms_v="" s1_tps_v="" s1_tok_v="" s1_ttft_v=""
@@ -364,28 +381,24 @@ run_full_benchmark() {
             printf "\r  ${RED}S3 LongCtx    FAILED${RESET}\n"
         fi
 
-        # ── Scenario 4: Agentic (pi — real tool use, wall-time) ───────
+        # ── Scenario 4: Agentic (direct API, multi-turn with tools) ──
         printf "  ${DIM}S4 Agentic...${RESET}"
         local r4
-        r4=$(call_pi "$pi_model" "$AGENTIC_PROMPT") || true
+        r4=$(call_agentic "$api_url" "$model" "$AGENTIC_PROMPT") || true
         if [[ "$(echo "$r4" | jq -r '.error')" == "false" ]]; then
-            local r4_ms r4_ttft r4_tok r4_tps r4_chars r4_think r4_ans r4_turns r4_tools
+            local r4_ms r4_tok r4_ans r4_turns r4_tools
             r4_ms=$(echo    "$r4" | jq -r '.ms')
-            r4_ttft=$(echo  "$r4" | jq -r '.ttft_ms')
             r4_tok=$(echo   "$r4" | jq -r '.tokens')
-            r4_tps=$(echo   "$r4" | jq -r '.tok_s')
-            r4_chars=$(echo "$r4" | jq -r '.chars_total')
-            r4_think=$(echo "$r4" | jq -r '.think_chars')
             r4_ans=$(echo   "$r4" | jq -r '.answer_chars')
             r4_turns=$(echo "$r4" | jq -r '.turns')
             r4_tools=$(echo "$r4" | jq -r '.tool_calls')
-            s4_ms_v="$s4_ms_v $r4_ms";     s4_ttft_v="$s4_ttft_v $r4_ttft"
-            s4_tok_v="$s4_tok_v $r4_tok";   s4_tps_v="$s4_tps_v $r4_tps"
-            s4_chars_v="$s4_chars_v $r4_chars"
-            s4_think_v="$s4_think_v $r4_think"; s4_ans_v="$s4_ans_v $r4_ans"
+            s4_ms_v="$s4_ms_v $r4_ms";     s4_ttft_v="$s4_ttft_v 0"
+            s4_tok_v="$s4_tok_v $r4_tok";   s4_tps_v="$s4_tps_v 0"
+            s4_chars_v="$s4_chars_v 0"
+            s4_think_v="$s4_think_v 0"; s4_ans_v="$s4_ans_v $r4_ans"
             s4_turns_v="$s4_turns_v $r4_turns"; s4_tools_v="$s4_tools_v $r4_tools"
-            printf "\r  ${GREEN}S4 Agentic    %6dms | TTFT %4dms | %4d tok | turns %d | tools %d | ans %d chars${RESET}\n" \
-                "$r4_ms" "$r4_ttft" "$r4_tok" "$r4_turns" "$r4_tools" "$r4_ans"
+            printf "\r  ${GREEN}S4 Agentic    %6dms | %4d tok | turns %d | tools %d | ans %d chars${RESET}\n" \
+                "$r4_ms" "$r4_tok" "$r4_turns" "$r4_tools" "$r4_ans"
         else
             printf "\r  ${RED}S4 Agentic    FAILED${RESET}\n"
             s4_ms_v="$s4_ms_v 0"; s4_ttft_v="$s4_ttft_v 0"; s4_tok_v="$s4_tok_v 0"
@@ -496,4 +509,14 @@ PYEOF
     local saved_to
     saved_to=$(cat /tmp/_bench_outfile 2>/dev/null || echo "$outfile")
     printf "${GREEN}Results saved → %s${RESET}\n" "$outfile"
+
+    # ── Cleanup: free GPU/memory after benchmark ──────────────────────
+    printf "\n${DIM}Cleaning up %s...${RESET}" "$backend"
+    if [[ "$backend" == "ppmlx" ]]; then
+        pkill -f "ppmlx serve" 2>/dev/null || true
+    elif [[ "$backend" == "ollama" ]]; then
+        ollama stop "$model" 2>/dev/null || true
+    fi
+    sleep 2
+    printf " ${GREEN}done${RESET}\n"
 }

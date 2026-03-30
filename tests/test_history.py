@@ -9,7 +9,7 @@ import pytest
 
 # Ensure ppmlx modules are mocked for CLI tests
 for mod_name in ["ppmlx.models", "ppmlx.engine", "ppmlx.db",
-                  "ppmlx.config", "ppmlx.memory", "ppmlx.modelfile",
+                  "ppmlx.config", "ppmlx.memory",
                   "ppmlx.quantize", "ppmlx.engine_embed", "ppmlx.engine_vlm",
                   "ppmlx.registry"]:
     if mod_name not in sys.modules:

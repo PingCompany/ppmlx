@@ -1,10 +1,13 @@
 from __future__ import annotations
+import logging
 import re
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
+
+log = logging.getLogger("ppmlx.engine")
 
 
 @dataclass
@@ -17,10 +20,27 @@ class LoadedModel:
     last_used: float = field(default_factory=time.time)
 
 
+class GenerateResult(NamedTuple):
+    """Result of a non-streaming generation.
+
+    Five fields; callers that previously unpacked four should use
+    ``text, reasoning, pt, ct, *_ = engine.generate(...)`` or named access.
+    """
+    text: str
+    reasoning: str | None
+    prompt_tokens: int
+    completion_tokens: int
+    reasoning_tokens: int = 0
+
+
 _THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # Sanity cap: never auto-set max_tokens above this even on huge-context models.
-_MAX_AUTO_TOKENS = 32_768
+# 4096 matches GPT-4o / Claude defaults; clients can always request more explicitly.
+_MAX_AUTO_TOKENS = 4_096
+
+# Thinking models get a higher default budget so reasoning doesn't exhaust all tokens.
+_MAX_AUTO_TOKENS_THINKING = 8_192
 
 
 def _context_size(lm: "LoadedModel") -> int:
@@ -32,6 +52,20 @@ def _context_size(lm: "LoadedModel") -> int:
         if val and isinstance(val, int) and val < 10 ** 9:
             return val
     return 4096  # conservative fallback
+
+
+def _is_thinking_model(tokenizer: Any) -> bool:
+    """Return True if the tokenizer's chat template contains ``<think>``."""
+    template = getattr(tokenizer, "chat_template", None)
+    if template and isinstance(template, str):
+        return "<think>" in template
+    return False
+
+
+def _auto_max_tokens(lm: "LoadedModel") -> int:
+    """Choose a default max_tokens based on model context size and type."""
+    cap = _MAX_AUTO_TOKENS_THINKING if _is_thinking_model(lm.tokenizer) else _MAX_AUTO_TOKENS
+    return min(_context_size(lm) // 2, cap)
 
 
 def _strip_thinking(text: str) -> tuple[str, str | None]:
@@ -158,6 +192,12 @@ class TextEngine:
             except TypeError:
                 # Tokenizer doesn't support 'tools' kwarg — retry without it
                 if tools and "tools" in kwargs:
+                    log.warning(
+                        "Tokenizer for %s does not support 'tools' kwarg — "
+                        "%d tools dropped from chat template. "
+                        "Tool calling may not work with this model.",
+                        lm.repo_id, len(tools),
+                    )
                     del kwargs["tools"]
                     return tokenizer.apply_chat_template(messages, **kwargs)
                 raise
@@ -187,21 +227,24 @@ class TextEngine:
         strip_thinking: bool = True,
         enable_thinking: bool = True,
         tools: list[dict] | None = None,
-    ) -> tuple[str, str | None, int, int]:
+        reasoning_budget: int | None = None,
+    ) -> GenerateResult:
         """
         Generate a response.
-        Returns (answer_text, reasoning_text | None, prompt_tokens, completion_tokens).
+        Returns a ``GenerateResult`` (backward-compatible with 4-tuple unpacking).
 
         reasoning_text is populated for <think>...</think> models.
         prompt_tokens and completion_tokens are estimates (token count from encode).
         enable_thinking=False suppresses the thinking phase for models that support it (e.g. Qwen3).
-        max_tokens=None means 50% of the model's context window (capped at _MAX_AUTO_TOKENS).
+        max_tokens=None means 50% of the model's context window (capped at _MAX_AUTO_TOKENS,
+        or _MAX_AUTO_TOKENS_THINKING for thinking models).
+        reasoning_budget limits how many tokens the model may spend on reasoning.
         """
         from mlx_lm import generate as mlx_generate
 
         lm = self._get_or_load(repo_id)
         if max_tokens is None:
-            max_tokens = min(_context_size(lm) // 2, _MAX_AUTO_TOKENS)
+            max_tokens = _auto_max_tokens(lm)
         prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking, tools=tools)
 
         try:
@@ -218,6 +261,14 @@ class TextEngine:
             kwargs["sampler"] = sampler
         if seed is not None:
             kwargs["seed"] = seed
+        if repetition_penalty is not None and repetition_penalty != 1.0:
+            try:
+                from mlx_lm.sample_utils import make_logits_processors
+                kwargs["logits_processors"] = make_logits_processors(
+                    repetition_penalty=repetition_penalty,
+                )
+            except (ImportError, TypeError):
+                pass
 
         text = mlx_generate(lm.model, lm.tokenizer, **kwargs)
 
@@ -229,12 +280,34 @@ class TextEngine:
             prompt_tokens = len(prompt.split())
             completion_tokens = len(text.split())
 
+        reasoning_tokens = 0
         if strip_thinking:
             text, reasoning = _strip_thinking(text)
+            if reasoning is not None:
+                try:
+                    reasoning_tokens = len(lm.tokenizer.encode(reasoning))
+                except Exception:
+                    reasoning_tokens = len(reasoning.split())
+
+            # Bug fix: if the model spent all tokens on thinking and returned an
+            # empty answer, retry once with thinking disabled.
+            if text == "" and reasoning is not None and enable_thinking:
+                log.info("Empty answer after thinking — retrying with enable_thinking=False")
+                retry_prompt = self._apply_chat_template(
+                    lm, messages, enable_thinking=False, tools=tools,
+                )
+                retry_kwargs = {**kwargs, "prompt": retry_prompt}
+                text = mlx_generate(lm.model, lm.tokenizer, **retry_kwargs)
+                try:
+                    completion_tokens = len(lm.tokenizer.encode(text))
+                except Exception:
+                    completion_tokens = len(text.split())
+                text, reasoning = _strip_thinking(text)
+                reasoning_tokens = 0
         else:
             reasoning = None
 
-        return text, reasoning, prompt_tokens, completion_tokens
+        return GenerateResult(text, reasoning, prompt_tokens, completion_tokens, reasoning_tokens)
 
     def stream_generate(
         self,
@@ -249,19 +322,22 @@ class TextEngine:
         enable_thinking: bool = True,
         strip_thinking: bool = True,
         tools: list[dict] | None = None,
+        reasoning_budget: int | None = None,
     ) -> Iterator[str]:
         """
         Stream token-by-token generation.
         Yields text chunks. When strip_thinking=True (default), <think>...</think>
         blocks are silently consumed and not yielded.
         enable_thinking=False suppresses the thinking phase for models that support it (e.g. Qwen3).
-        max_tokens=None means 50% of the model's context window (capped at _MAX_AUTO_TOKENS).
+        max_tokens=None means 50% of the model's context window (capped at _MAX_AUTO_TOKENS,
+        or _MAX_AUTO_TOKENS_THINKING for thinking models).
+        reasoning_budget limits how many tokens (approximate) the model may spend on reasoning.
         """
         from mlx_lm import stream_generate as mlx_stream
 
         lm = self._get_or_load(repo_id)
         if max_tokens is None:
-            max_tokens = min(_context_size(lm) // 2, _MAX_AUTO_TOKENS)
+            max_tokens = _auto_max_tokens(lm)
         prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking, tools=tools)
 
         try:
@@ -277,6 +353,14 @@ class TextEngine:
             kwargs["sampler"] = sampler
         if seed is not None:
             kwargs["seed"] = seed
+        if repetition_penalty is not None and repetition_penalty != 1.0:
+            try:
+                from mlx_lm.sample_utils import make_logits_processors
+                kwargs["logits_processors"] = make_logits_processors(
+                    repetition_penalty=repetition_penalty,
+                )
+            except (ImportError, TypeError):
+                pass
 
         if not strip_thinking:
             for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
@@ -300,7 +384,7 @@ class TextEngine:
         # are detected by a token budget: if we suppress more than
         # _THINK_PASSTHROUGH_TOKENS chars without finding </think>, we assume the
         # model doesn't use think-tag pairs and switch to pass-through mode.
-        _THINK_PASSTHROUGH_TOKENS = 50  # ~50 tokens worth of chars before giving up
+        _THINK_PASSTHROUGH_TOKENS = 10_000  # chars before assuming model never closes </think>
 
         inside_think = bool(re.search(r"<think>\s*$", prompt))
         buf = ""
@@ -329,6 +413,14 @@ class TextEngine:
                     suppressed = buf[:-keep] if keep else buf
                     think_chars += len(suppressed)
                     buf = buf[-keep:] if keep else ""
+
+                    # If a reasoning_budget was set and we've exceeded it
+                    # (rough char-to-token estimate: 4 chars per token), force
+                    # the end of the thinking phase and start yielding text.
+                    if reasoning_budget is not None and think_chars > reasoning_budget * 4:
+                        inside_think = False
+                        think_chars = 0
+                        continue
 
                     # If we've suppressed too much without a close tag, this
                     # model doesn't use proper think-tag pairs — yield as plain text.
@@ -369,6 +461,10 @@ class TextEngine:
         # Flush any remaining buffer outside think blocks
         if buf and not inside_think:
             yield buf
+
+    def get_tokenizer(self, repo_id: str) -> Any:
+        """Return the tokenizer for a model (loads if needed)."""
+        return self._get_or_load(repo_id).tokenizer
 
     def unload(self, repo_id: str) -> bool:
         """Unload a specific model from cache. Returns True if it was loaded."""
