@@ -24,17 +24,17 @@ for _p in [
 # replace them with MagicMock (both files guard injection with
 # `if mod not in sys.modules`, so pre-importing here wins).
 # This runs at collection time — before any test file is collected.
-import ppmlx.config        # noqa: E402
-import ppmlx.schema        # noqa: E402
-import ppmlx.db            # noqa: E402
-import ppmlx.models        # noqa: E402
-import ppmlx.memory        # noqa: E402
-import ppmlx.modelfile     # noqa: E402
-import ppmlx.quantize      # noqa: E402
-import ppmlx.engine        # noqa: E402
-import ppmlx.engine_embed  # noqa: E402
-import ppmlx.engine_vlm    # noqa: E402
-import ppmlx.playground    # noqa: E402
+import ppmlx.config        # noqa: F401, E402
+import ppmlx.schema        # noqa: F401, E402
+import ppmlx.db            # noqa: F401, E402
+import ppmlx.models        # noqa: F401, E402
+import ppmlx.memory        # noqa: F401, E402
+import ppmlx.modelfile     # noqa: F401, E402
+import ppmlx.quantize      # noqa: F401, E402
+import ppmlx.engine        # noqa: F401, E402
+import ppmlx.engine_embed  # noqa: F401, E402
+import ppmlx.engine_vlm    # noqa: F401, E402
+import ppmlx.playground    # noqa: F401, E402
 
 # Snapshot real module attributes HERE (module level) — before any test file
 # is collected.  test_server.py's module-level code runs at collection time and
