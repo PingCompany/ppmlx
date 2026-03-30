@@ -146,3 +146,168 @@ def test_query_limit(tmp_home, tmp_path):
     rows = db.query_requests(limit=2)
     db.close()
     assert len(rows) == 2
+
+
+def test_migration_adds_columns(tmp_home, tmp_path):
+    """Create a DB with old schema (no thinking columns), re-init, verify columns added."""
+    db_path = tmp_path / "ppmlx.db"
+    # Create DB without thinking columns using a trimmed schema
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+            request_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            model_alias TEXT NOT NULL,
+            model_repo TEXT NOT NULL,
+            stream INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'ok',
+            error_message TEXT,
+            prompt_tokens INTEGER,
+            messages_count INTEGER,
+            system_prompt TEXT,
+            completion_tokens INTEGER,
+            total_tokens INTEGER,
+            time_to_first_token_ms REAL,
+            total_duration_ms REAL,
+            tokens_per_second REAL,
+            temperature REAL,
+            top_p REAL,
+            max_tokens INTEGER,
+            repetition_penalty REAL,
+            client_ip TEXT,
+            user_agent TEXT
+        );
+        CREATE TABLE IF NOT EXISTS model_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+            event TEXT NOT NULL,
+            model_repo TEXT NOT NULL,
+            model_alias TEXT,
+            duration_ms REAL,
+            details TEXT
+        );
+        CREATE TABLE IF NOT EXISTS system_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+            memory_total_gb REAL,
+            memory_used_gb REAL,
+            loaded_models TEXT,
+            uptime_seconds INTEGER
+        );
+    """)
+    conn.commit()
+    # Verify thinking columns are absent
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    assert "reasoning_tokens" not in existing
+    conn.close()
+
+    # Now init via Database — migration should add the columns
+    db = Database(db_path)
+    db.init()
+    db.flush()
+
+    conn = sqlite3.connect(str(db_path))
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)").fetchall()}
+    conn.close()
+    db.close()
+
+    for col in ("reasoning_tokens", "thinking_duration_ms", "answer_duration_ms",
+                "thinking_enabled", "reasoning_budget"):
+        assert col in cols, f"Column {col} missing after migration"
+
+
+def test_log_request_with_thinking_fields(tmp_home, tmp_path):
+    db = make_db(tmp_path)
+    db.log_request(
+        "req-think", "/v1/chat", "qwen", "repo",
+        reasoning_tokens=500,
+        thinking_duration_ms=3000.0,
+        answer_duration_ms=1200.0,
+        thinking_enabled=True,
+        reasoning_budget=1024,
+    )
+    db.flush()
+    rows = db.query_requests()
+    db.close()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["reasoning_tokens"] == 500
+    assert r["thinking_duration_ms"] == pytest.approx(3000.0)
+    assert r["answer_duration_ms"] == pytest.approx(1200.0)
+    assert r["thinking_enabled"] == 1
+    assert r["reasoning_budget"] == 1024
+
+
+def test_log_request_without_thinking_fields(tmp_home, tmp_path):
+    db = make_db(tmp_path)
+    db.log_request("req-plain", "/v1/chat", "qwen", "repo")
+    db.flush()
+    rows = db.query_requests()
+    db.close()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["reasoning_tokens"] is None
+    assert r["thinking_duration_ms"] is None
+    assert r["answer_duration_ms"] is None
+    assert r["thinking_enabled"] is None
+    assert r["reasoning_budget"] is None
+
+
+def test_query_thinking_stats_empty(tmp_home, tmp_path):
+    db = make_db(tmp_path)
+    db.flush()
+    stats = db.query_thinking_stats()
+    db.close()
+    assert stats["total_thinking_requests"] == 0
+    assert stats["avg_reasoning_tokens"] is None
+    assert stats["avg_thinking_duration_ms"] is None
+    assert stats["avg_answer_duration_ms"] is None
+    assert stats["thinking_percentage"] == 0.0
+    assert stats["by_model"] == []
+
+
+def test_query_thinking_stats_with_data(tmp_home, tmp_path):
+    db = make_db(tmp_path)
+    # Two thinking requests for model-a
+    db.log_request("r1", "/v1/chat", "model-a", "repo-a",
+                   reasoning_tokens=400, thinking_duration_ms=2000.0,
+                   answer_duration_ms=1000.0, thinking_enabled=True, reasoning_budget=800)
+    db.log_request("r2", "/v1/chat", "model-a", "repo-a",
+                   reasoning_tokens=600, thinking_duration_ms=4000.0,
+                   answer_duration_ms=2000.0, thinking_enabled=True, reasoning_budget=800)
+    # One thinking request for model-b
+    db.log_request("r3", "/v1/chat", "model-b", "repo-b",
+                   reasoning_tokens=100, thinking_duration_ms=500.0,
+                   answer_duration_ms=300.0, thinking_enabled=True)
+    # One non-thinking request
+    db.log_request("r4", "/v1/chat", "model-a", "repo-a")
+    db.flush()
+
+    stats = db.query_thinking_stats(since_hours=1)
+    db.close()
+
+    assert stats["total_thinking_requests"] == 3
+    assert stats["avg_reasoning_tokens"] == pytest.approx((400 + 600 + 100) / 3)
+    assert stats["avg_thinking_duration_ms"] == pytest.approx((2000 + 4000 + 500) / 3)
+    assert stats["avg_answer_duration_ms"] == pytest.approx((1000 + 2000 + 300) / 3)
+    assert stats["thinking_percentage"] == pytest.approx(75.0)  # 3 out of 4
+
+    by_model = {m["model"]: m for m in stats["by_model"]}
+    assert by_model["model-a"]["count"] == 2
+    assert by_model["model-a"]["avg_reasoning_tokens"] == pytest.approx(500.0)
+    assert by_model["model-b"]["count"] == 1
+
+
+def test_get_stats_includes_thinking(tmp_home, tmp_path):
+    db = make_db(tmp_path)
+    db.log_request("r1", "/v1/chat", "qwen", "repo",
+                   reasoning_tokens=200, thinking_enabled=True)
+    db.log_request("r2", "/v1/chat", "qwen", "repo")
+    db.flush()
+    stats = db.get_stats(since_hours=1)
+    db.close()
+    assert "thinking" in stats
+    assert stats["thinking"]["thinking_request_count"] == 1
+    assert stats["thinking"]["avg_reasoning_tokens"] == pytest.approx(200.0)

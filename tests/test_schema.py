@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import pytest
+from pydantic import ValidationError
 
 from ppmlx.schema import (
     ChatMessage,
@@ -12,6 +13,7 @@ from ppmlx.schema import (
     ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
+    CompletionTokensDetails,
     DeltaMessage,
     Usage,
     CompletionRequest,
@@ -230,3 +232,77 @@ def test_make_request_id():
 def test_usage_total_tokens():
     usage = Usage(prompt_tokens=15, completion_tokens=35, total_tokens=50)
     assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+
+
+# ── Thinking model support ─────────────────────────────────────────────
+
+
+def test_think_param_accepted():
+    req = ChatCompletionRequest(
+        model="llama3",
+        messages=[ChatMessage(role="user", content="hi")],
+        think=True,
+    )
+    assert req.think is True
+
+
+def test_think_param_default_none():
+    req = ChatCompletionRequest(
+        model="llama3",
+        messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert req.think is None
+
+
+def test_reasoning_budget_validation():
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(
+            model="llama3",
+            messages=[ChatMessage(role="user", content="hi")],
+            reasoning_budget=0,
+        )
+    req = ChatCompletionRequest(
+        model="llama3",
+        messages=[ChatMessage(role="user", content="hi")],
+        reasoning_budget=1000,
+    )
+    assert req.reasoning_budget == 1000
+
+
+def test_reasoning_budget_max():
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(
+            model="llama3",
+            messages=[ChatMessage(role="user", content="hi")],
+            reasoning_budget=131073,
+        )
+
+
+def test_usage_with_completion_tokens_details():
+    details = CompletionTokensDetails(reasoning_tokens=50)
+    usage = Usage(
+        prompt_tokens=10,
+        completion_tokens=100,
+        total_tokens=110,
+        completion_tokens_details=details,
+    )
+    data = json.loads(usage.model_dump_json())
+    assert data["completion_tokens_details"]["reasoning_tokens"] == 50
+
+
+def test_usage_without_completion_tokens_details():
+    usage = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+    assert usage.completion_tokens_details is None
+    data = json.loads(usage.model_dump_json())
+    assert data["completion_tokens_details"] is None
+
+
+def test_completion_request_think_param():
+    req = CompletionRequest(
+        model="llama3",
+        prompt="Once upon a time",
+        think=True,
+        reasoning_budget=500,
+    )
+    assert req.think is True
+    assert req.reasoning_budget == 500

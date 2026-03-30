@@ -5,12 +5,56 @@ on:
     workflows: ["Release"]
     types: [completed]
 
+permissions:
+  contents: read
+
 jobs:
-  update-formula:
+  update-tap:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Homebrew tap update
+      - uses: actions/checkout@v4
+
+      - name: Get version from pyproject.toml
+        id: version
         run: |
-          echo "TODO: Update homebrew-ppmlx tap formula with new version"
-          echo "Steps: download sdist, run brew update-python-resources, update formula sha256"
+          VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Get sdist URL and SHA256 from PyPI
+        id: sha
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          JSON=$(curl -sSf "https://pypi.org/pypi/ppmlx/${VERSION}/json")
+          URL=$(echo "$JSON" | python3 -c "import sys,json; [print(u['url']) for u in json.load(sys.stdin)['urls'] if u['filename'].endswith('.tar.gz')]")
+          SHA=$(echo "$JSON" | python3 -c "import sys,json; [print(u['digests']['sha256']) for u in json.load(sys.stdin)['urls'] if u['filename'].endswith('.tar.gz')]")
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula and open PR on tap repo
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          SHA=${{ steps.sha.outputs.sha256 }}
+          URL=${{ steps.sha.outputs.url }}
+          TAP_REPO="the-focus-company/homebrew-ppmlx"
+
+          gh repo clone "$TAP_REPO" tap -- --depth 1
+          cd tap
+
+          sed -i "s|url \".*\"|url \"${URL}\"|" Formula/ppmlx.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/ppmlx.rb
+
+          BRANCH="auto/v${VERSION}"
+          git checkout -b "$BRANCH"
+          git add Formula/ppmlx.rb
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -m "ppmlx ${VERSION}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --repo "$TAP_REPO" \
+            --title "ppmlx ${VERSION}" \
+            --body "Automated update from [ppmlx v${VERSION}](https://github.com/the-focus-company/ppmlx/releases/tag/v${VERSION})." \
+            --head "$BRANCH"
