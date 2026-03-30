@@ -620,6 +620,167 @@ def launch(
 
 
 @app.command()
+def arena(
+    model_a: str = typer.Argument(..., help="First model name or alias"),
+    model_b: str = typer.Argument(..., help="Second model name or alias"),
+    host: Optional[str] = typer.Option("127.0.0.1", help="ppmlx server host"),
+    port: Optional[int] = typer.Option(6767, help="ppmlx server port"),
+    temperature: float = typer.Option(0.7, "--temperature", "-t", help="Sampling temperature"),
+):
+    """Side-by-side model comparison arena with ELO scoring.
+
+    Send the same prompt to two models, compare responses, and vote.
+    Requires a running ppmlx server (`ppmlx serve`).
+    """
+    from ppmlx.arena import ArenaDB, run_arena_match
+
+    base_url = f"http://{host}:{port}"
+    db = ArenaDB()
+
+    # Verify server is reachable
+    import httpx
+    try:
+        r = httpx.get(f"{base_url}/health", timeout=3.0)
+        r.raise_for_status()
+    except Exception:
+        console.print(
+            f"[red]Cannot reach ppmlx server at {base_url}[/red]\n"
+            "[dim]Start one with: ppmlx serve[/dim]"
+        )
+        raise typer.Exit(1)
+
+    console.print(Panel(
+        f"[bold]Arena: [cyan]{model_a}[/cyan] vs [green]{model_b}[/green][/bold]\n"
+        f"Server: {base_url}\n"
+        "Type a prompt and press Enter. Commands: /score, /history, /quit",
+        title="ppmlx Arena",
+        border_style="blue",
+    ))
+
+    round_num = 0
+    while True:
+        try:
+            prompt = console.input("\n[bold blue]Prompt>[/bold blue] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not prompt:
+            continue
+        if prompt.lower() in ("/quit", "/q", "/exit"):
+            break
+        if prompt.lower() in ("/score", "/scores", "/leaderboard"):
+            entries = db.get_all_elos()
+            if not entries:
+                console.print("[dim]No scores yet.[/dim]")
+                continue
+            table = Table(title="ELO Leaderboard", show_header=True)
+            table.add_column("#", width=3)
+            table.add_column("Model", style="cyan")
+            table.add_column("ELO", justify="right", style="bold")
+            table.add_column("W", justify="right", style="green")
+            table.add_column("L", justify="right", style="red")
+            table.add_column("D", justify="right")
+            for i, e in enumerate(entries, 1):
+                table.add_row(
+                    str(i), e.model, f"{e.score:.1f}",
+                    str(e.wins), str(e.losses), str(e.draws),
+                )
+            console.print(table)
+            continue
+        if prompt.lower() in ("/history", "/h"):
+            matches = db.get_recent_matches(10)
+            if not matches:
+                console.print("[dim]No matches yet.[/dim]")
+                continue
+            table = Table(title="Recent Matches", show_header=True)
+            table.add_column("Time", style="dim")
+            table.add_column("Model A", style="cyan")
+            table.add_column("Model B", style="green")
+            table.add_column("Winner")
+            for m in matches:
+                winner_display = {
+                    "a": f"[bold cyan]{m['model_a']}[/bold cyan]",
+                    "b": f"[bold green]{m['model_b']}[/bold green]",
+                    "draw": "[yellow]Draw[/yellow]",
+                }.get(m.get("winner", ""), "?")
+                table.add_row(
+                    str(m.get("timestamp", ""))[:19],
+                    m.get("model_a", ""),
+                    m.get("model_b", ""),
+                    winner_display,
+                )
+            console.print(table)
+            continue
+
+        round_num += 1
+        console.print(f"\n[dim]Round {round_num}: Querying both models...[/dim]")
+
+        match = run_arena_match(model_a, model_b, prompt, base_url, temperature)
+
+        # Display side-by-side results
+        panel_a_content = match.result_a.response or "[dim]No response[/dim]"
+        if match.result_a.error:
+            panel_a_content = f"[red]Error: {match.result_a.error}[/red]"
+        panel_b_content = match.result_b.response or "[dim]No response[/dim]"
+        if match.result_b.error:
+            panel_b_content = f"[red]Error: {match.result_b.error}[/red]"
+
+        time_a = f"{match.result_a.elapsed_ms / 1000:.1f}s"
+        time_b = f"{match.result_b.elapsed_ms / 1000:.1f}s"
+
+        console.print()
+        console.print(
+            Panel(
+                panel_a_content,
+                title=f"[A] {model_a} ({time_a})",
+                border_style="cyan",
+            )
+        )
+        console.print(
+            Panel(
+                panel_b_content,
+                title=f"[B] {model_b} ({time_b})",
+                border_style="green",
+            )
+        )
+
+        # Voting
+        console.print(
+            "\n[bold]Vote:[/bold] [cyan][a][/cyan] A is better  "
+            "[yellow][d][/yellow] Draw  "
+            "[green][b][/green] B is better  "
+            "[dim][s][/dim] Skip"
+        )
+        while True:
+            try:
+                vote = console.input("[bold]> [/bold]").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                vote = "s"
+            if vote in ("a", "b", "d", "draw", "s", "skip"):
+                break
+            console.print("[dim]Enter a, b, d (draw), or s (skip)[/dim]")
+
+        if vote in ("s", "skip"):
+            console.print("[dim]Skipped.[/dim]")
+            continue
+
+        winner = "draw" if vote in ("d", "draw") else vote
+        new_a, new_b = db.record_match(match, winner)
+
+        winner_label = {
+            "a": f"[bold cyan]{model_a}[/bold cyan]",
+            "b": f"[bold green]{model_b}[/bold green]",
+            "draw": "[bold yellow]Draw[/bold yellow]",
+        }[winner]
+        console.print(
+            f"\nWinner: {winner_label}\n"
+            f"  {model_a}: {new_a:.1f} ELO  |  {model_b}: {new_b:.1f} ELO"
+        )
+
+    console.print("\n[dim]Arena session ended.[/dim]")
+
+
+@app.command()
 def serve(
     host: Optional[str] = typer.Option(None, help="Bind host"),
     port: Optional[int] = typer.Option(None, help="Bind port (default: 6767)"),

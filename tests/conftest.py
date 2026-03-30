@@ -30,6 +30,7 @@ import ppmlx.db            # noqa: F401, E402
 import ppmlx.models        # noqa: F401, E402
 import ppmlx.memory        # noqa: F401, E402
 import ppmlx.quantize      # noqa: F401, E402
+import ppmlx.arena         # noqa: F401, E402
 import ppmlx.engine        # noqa: F401, E402
 import ppmlx.engine_embed  # noqa: F401, E402
 import ppmlx.engine_vlm    # noqa: F401, E402
