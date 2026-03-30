@@ -1,0 +1,64 @@
+# ppmlx
+
+> MLX-native LLM inference server for Apple Silicon. Open source. MIT license.
+
+ppmlx runs large language models natively on Apple Silicon using Apple's MLX framework. It provides an OpenAI-compatible API on localhost, making it a drop-in replacement for any tool that speaks the OpenAI protocol.
+
+## Key facts
+
+- 47-125% faster than Ollama (GGUF translation layer) on Apple Silicon benchmarks
+- 168+ curated models with human aliases (Llama, Qwen, Mistral, Phi, Gemma, DeepSeek, etc.)
+- OpenAI Chat Completions API, Responses API, Completions API, Embeddings API
+- Anthropic Messages API (for Claude Code compatibility)
+- Tool calling / function calling support (XML and JSON formats)
+- Vision model support via mlx-vlm
+- Interactive TUI model picker and chat REPL
+- Modelfile support (Ollama-compatible syntax)
+- SQLite request logging
+- Zero config required. Runs on localhost:6767.
+
+## Install
+
+```
+uv tool install ppmlx
+```
+
+Requires macOS on Apple Silicon (M1/M2/M3/M4), Python 3.11+.
+
+## Quick start
+
+```
+ppmlx pull qwen3.5
+ppmlx serve --model qwen3.5
+```
+
+Then connect any OpenAI-compatible client to http://localhost:6767/v1 with any API key.
+
+## Links
+
+- Website: https://ppmlx.dev
+- GitHub: https://github.com/the-focus-company/ppmlx
+- PyPI: https://pypi.org/project/ppmlx/
+- Issues: https://github.com/the-focus-company/ppmlx/issues
+
+## Benchmarks (GLM-4.7-Flash, MacBook Pro M4 Pro 48GB, 3 runs averaged)
+
+| Scenario | ppmlx tok/s | Ollama tok/s | Delta |
+|----------|-------------|--------------|-------|
+| Simple   | 61.6        | 41.8         | +47%  |
+| Complex  | 56.1        | 38.7         | +45%  |
+| Agentic  | 46.7        | 20.8         | +125% |
+
+## API Endpoints
+
+- POST /v1/chat/completions — Chat with streaming, tools, vision
+- POST /v1/responses — Responses API (Codex, newer OpenAI tools)
+- POST /v1/messages — Anthropic Messages API (Claude Code)
+- POST /v1/embeddings — Vector embeddings
+- POST /v1/completions — Text completion
+- GET /v1/models — List available models
+- GET /health — Server health and memory usage
+
+## Built by
+
+The Focus Company (https://thefocus.company)
