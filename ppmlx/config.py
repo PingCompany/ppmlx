@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +16,7 @@ class ServerConfig:
     max_loaded_models: int = 2
     max_request_body_mb: int = 10
     max_tokens_cap: int = 32768
+    max_tools_tokens: int = 12000
 
 
 @dataclass
@@ -43,12 +45,42 @@ class RegistryConfig:
 
 
 @dataclass
+class ToolAwarenessConfig:
+    mode: str = "no_tools_only"
+
+
+@dataclass
+class ThinkingConfig:
+    enabled: bool = True
+    default_reasoning_budget: int = 2048
+    effort_base: int = 256
+
+    def effort_to_budget(self, effort: str) -> int | None:
+        """Map reasoning_effort (low/medium/high) to token budget using effort_base."""
+        multipliers = {"low": 1, "medium": 4, "high": 32}
+        m = multipliers.get(effort.lower())
+        return self.effort_base * m if m is not None else None
+
+
+@dataclass
+class AnalyticsConfig:
+    enabled: bool = False
+    provider: str = "posthog"
+    host: str = ""
+    project_api_key: str = ""
+    respect_do_not_track: bool = True
+
+
+@dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
+    tool_awareness: ToolAwarenessConfig = field(default_factory=ToolAwarenessConfig)
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
+    analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
 
 
 def get_ppmlx_dir() -> Path:
@@ -60,6 +92,29 @@ def get_ppmlx_dir() -> Path:
 
 def _parse_bool(v: str) -> bool:
     return v.lower() not in ("0", "false", "no")
+
+
+def _normalize_tool_awareness_mode(value: Any) -> str:
+    raw = str(value).strip().lower()
+    aliases = {
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "off": "off",
+        "1": "all",
+        "true": "all",
+        "yes": "all",
+        "all": "all",
+        "no_tools_only": "no_tools_only",
+    }
+    return aliases.get(raw, "no_tools_only")
+
+
+def _normalize_analytics_provider(value: Any) -> str:
+    raw = str(value).strip().lower()
+    if raw in {"", "posthog"}:
+        return "posthog"
+    return raw
 
 
 def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
@@ -91,6 +146,7 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         if "max_loaded_models" in s: cfg.server.max_loaded_models = int(s["max_loaded_models"])
         if "max_request_body_mb" in s: cfg.server.max_request_body_mb = int(s["max_request_body_mb"])
         if "max_tokens_cap" in s: cfg.server.max_tokens_cap = int(s["max_tokens_cap"])
+        if "max_tools_tokens" in s: cfg.server.max_tools_tokens = int(s["max_tools_tokens"])
     if "defaults" in data:
         d = data["defaults"]
         if "model" in d: cfg.defaults.model = str(d["model"])
@@ -109,6 +165,26 @@ def _apply_toml(cfg: Config, data: dict) -> None:
     if "registry" in data:
         r = data["registry"]
         if "enabled" in r: cfg.registry.enabled = bool(r["enabled"])
+    if "tool_awareness" in data:
+        ta = data["tool_awareness"]
+        if "mode" in ta:
+            cfg.tool_awareness.mode = _normalize_tool_awareness_mode(ta["mode"])
+    if "thinking" in data:
+        th = data["thinking"]
+        if "enabled" in th: cfg.thinking.enabled = bool(th["enabled"])
+        if "default_reasoning_budget" in th: cfg.thinking.default_reasoning_budget = int(th["default_reasoning_budget"])
+        if "effort_base" in th: cfg.thinking.effort_base = int(th["effort_base"])
+    if "analytics" in data:
+        an = data["analytics"]
+        if "enabled" in an: cfg.analytics.enabled = bool(an["enabled"])
+        if "provider" in an: cfg.analytics.provider = _normalize_analytics_provider(an["provider"])
+        if "host" in an: cfg.analytics.host = str(an["host"]).strip()
+        if "project_api_key" in an:
+            cfg.analytics.project_api_key = str(an["project_api_key"]).strip()
+        elif "website_id" in an:
+            cfg.analytics.project_api_key = str(an["website_id"]).strip()
+        if "respect_do_not_track" in an:
+            cfg.analytics.respect_do_not_track = bool(an["respect_do_not_track"])
 
 
 def _apply_env(cfg: Config) -> None:
@@ -117,6 +193,7 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_PORT": ("server", "port", int),
         "PPMLX_CORS": ("server", "cors", _parse_bool),
         "PPMLX_MAX_LOADED_MODELS": ("server", "max_loaded_models", int),
+        "PPMLX_MAX_TOOLS_TOKENS": ("server", "max_tools_tokens", int),
         "PPMLX_DEFAULT_MODEL": ("defaults", "model", str),
         "PPMLX_DEFAULT_EMBED_MODEL": ("defaults", "embed_model", str),
         "PPMLX_TEMP": ("defaults", "temperature", float),
@@ -126,6 +203,15 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_LOG_SNAPSHOT_INTERVAL": ("logging", "snapshot_interval_seconds", int),
         "PPMLX_MEMORY_WIRED_LIMIT": ("memory", "wired_limit_mb", int),
         "PPMLX_REGISTRY_ENABLED": ("registry", "enabled", _parse_bool),
+        "PPMLX_INJECT_TOOL_AWARENESS": ("tool_awareness", "mode", _normalize_tool_awareness_mode),
+        "PPMLX_THINKING_ENABLED": ("thinking", "enabled", _parse_bool),
+        "PPMLX_THINKING_BUDGET": ("thinking", "default_reasoning_budget", int),
+        "PPMLX_EFFORT_BASE": ("thinking", "effort_base", int),
+        "PPMLX_ANALYTICS_ENABLED": ("analytics", "enabled", _parse_bool),
+        "PPMLX_ANALYTICS_PROVIDER": ("analytics", "provider", _normalize_analytics_provider),
+        "PPMLX_ANALYTICS_HOST": ("analytics", "host", str),
+        "PPMLX_ANALYTICS_PROJECT_API_KEY": ("analytics", "project_api_key", str),
+        "PPMLX_ANALYTICS_RESPECT_DNT": ("analytics", "respect_do_not_track", _parse_bool),
     }
     for env_key, (section, attr, coerce) in mapping.items():
         val = os.environ.get(env_key)
@@ -134,6 +220,9 @@ def _apply_env(cfg: Config) -> None:
                 setattr(getattr(cfg, section), attr, coerce(val))
             except (ValueError, AttributeError):
                 pass
+    legacy_website_id = os.environ.get("PPMLX_ANALYTICS_WEBSITE_ID")
+    if legacy_website_id and not cfg.analytics.project_api_key:
+        cfg.analytics.project_api_key = legacy_website_id.strip()
 
 
 def _apply_cli(cfg: Config, overrides: dict) -> None:
@@ -146,3 +235,42 @@ def _apply_cli(cfg: Config, overrides: dict) -> None:
         elif key == "model": cfg.defaults.model = str(val)
         elif key == "temperature": cfg.defaults.temperature = float(val)
         elif key == "max_tokens": cfg.defaults.max_tokens = int(val)
+
+
+def check_first_run() -> None:
+    """Show analytics opt-in prompt on first run."""
+    try:
+        marker = get_ppmlx_dir() / ".first_run_done"
+        if marker.exists():
+            return
+        if not sys.stdin.isatty():
+            marker.touch()
+            return
+        from rich.console import Console
+        console = Console()
+        console.print(
+            "\n[bold]ppmlx[/bold] can collect anonymous usage statistics "
+            "(command names, version, OS — never prompts or model outputs).\n"
+            "This helps improve ppmlx.\n"
+        )
+        answer = input("Enable anonymous analytics? [y/N] ").strip().lower()
+        enabled = answer in ("y", "yes")
+        _save_analytics_preference(enabled)
+        marker.touch()
+    except Exception:
+        pass
+
+
+def _save_analytics_preference(enabled: bool) -> None:
+    """Save analytics preference to config.toml."""
+    import tomli_w
+    cfg_path = get_ppmlx_dir() / "config.toml"
+    data: dict = {}
+    try:
+        with open(cfg_path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        pass
+    data.setdefault("analytics", {})["enabled"] = enabled
+    with open(cfg_path, "wb") as f:
+        tomli_w.dump(data, f)
