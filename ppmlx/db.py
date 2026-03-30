@@ -41,7 +41,12 @@ CREATE TABLE IF NOT EXISTS requests (
     max_tokens              INTEGER,
     repetition_penalty      REAL,
     client_ip               TEXT,
-    user_agent              TEXT
+    user_agent              TEXT,
+    reasoning_tokens        INTEGER,
+    thinking_duration_ms    REAL,
+    answer_duration_ms      REAL,
+    thinking_enabled        INTEGER,
+    reasoning_budget        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS model_events (
@@ -70,6 +75,26 @@ CREATE INDEX IF NOT EXISTS idx_model_events_timestamp ON model_events(timestamp)
 """
 
 
+_THINKING_COLUMNS: dict[str, str] = {
+    "reasoning_tokens": "INTEGER",
+    "thinking_duration_ms": "REAL",
+    "answer_duration_ms": "REAL",
+    "thinking_enabled": "INTEGER",
+    "reasoning_budget": "INTEGER",
+}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add any missing columns to the requests table (non-destructive)."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(requests)").fetchall()
+    }
+    for col, col_type in _THINKING_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE requests ADD COLUMN {col} {col_type}")
+    conn.commit()
+
+
 class Database:
     """Thread-safe SQLite database for ppmlx logging."""
 
@@ -85,7 +110,7 @@ class Database:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self._path))
             conn.executescript(_SCHEMA)
-            conn.commit()
+            _migrate_schema(conn)
             conn.close()
         except Exception as e:
             print(f"[ppmlx db] Warning: failed to init database: {e}", file=sys.stderr)
@@ -164,18 +189,28 @@ class Database:
         repetition_penalty: float | None = None,
         client_ip: str | None = None,
         user_agent: str | None = None,
+        reasoning_tokens: int | None = None,
+        thinking_duration_ms: float | None = None,
+        answer_duration_ms: float | None = None,
+        thinking_enabled: bool | None = None,
+        reasoning_budget: int | None = None,
     ) -> None:
         sql = """INSERT INTO requests (
             request_id, endpoint, model_alias, model_repo, stream, status, error_message,
             prompt_tokens, messages_count, system_prompt, completion_tokens, total_tokens,
             time_to_first_token_ms, total_duration_ms, tokens_per_second,
-            temperature, top_p, max_tokens, repetition_penalty, client_ip, user_agent
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+            temperature, top_p, max_tokens, repetition_penalty, client_ip, user_agent,
+            reasoning_tokens, thinking_duration_ms, answer_duration_ms,
+            thinking_enabled, reasoning_budget
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
         params = (
             request_id, endpoint, model_alias, model_repo, int(stream), status, error_message,
             prompt_tokens, messages_count, system_prompt, completion_tokens, total_tokens,
             time_to_first_token_ms, total_duration_ms, tokens_per_second,
             temperature, top_p, max_tokens, repetition_penalty, client_ip, user_agent,
+            reasoning_tokens, thinking_duration_ms, answer_duration_ms,
+            int(thinking_enabled) if thinking_enabled is not None else None,
+            reasoning_budget,
         )
         self._enqueue(sql, params)
 
@@ -263,14 +298,101 @@ class Database:
                 {"model": r[0], "count": r[1], "avg_tps": r[2], "avg_ttft": r[3], "errors": r[4]}
                 for r in by_model
             ]
+            # Thinking aggregates
+            thinking_stats: dict[str, Any] = {
+                "avg_reasoning_tokens": None,
+                "thinking_request_count": 0,
+            }
+            try:
+                row = conn.execute(
+                    """SELECT AVG(reasoning_tokens), COUNT(*)
+                       FROM requests
+                       WHERE timestamp >= datetime('now', ?)
+                         AND thinking_enabled = 1""",
+                    (since_param,),
+                ).fetchone()
+                if row and row[1]:
+                    thinking_stats["avg_reasoning_tokens"] = row[0]
+                    thinking_stats["thinking_request_count"] = row[1]
+            except Exception:
+                pass  # columns may not exist in very old DBs
+
             return {
                 "total_requests": sum(m["count"] for m in model_rows),
                 "avg_duration_ms": avg_duration,
                 "by_model": model_rows,
+                "thinking": thinking_stats,
             }
         except Exception as e:
             print(f"[ppmlx db] Stats error: {e}", file=sys.stderr)
-            return {"total_requests": 0, "avg_duration_ms": None, "by_model": []}
+            return {"total_requests": 0, "avg_duration_ms": None, "by_model": [],
+                    "thinking": {"avg_reasoning_tokens": None, "thinking_request_count": 0}}
+
+    def query_thinking_stats(self, since_hours: float = 24) -> dict[str, Any]:
+        """Return aggregate statistics about thinking/reasoning requests."""
+        empty: dict[str, Any] = {
+            "total_thinking_requests": 0,
+            "avg_reasoning_tokens": None,
+            "avg_thinking_duration_ms": None,
+            "avg_answer_duration_ms": None,
+            "thinking_percentage": 0.0,
+            "by_model": [],
+        }
+        try:
+            since_param = f"-{since_hours} hours"
+            with sqlite3.connect(self._path) as conn:
+                # Total requests in window
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM requests WHERE timestamp >= datetime('now', ?)",
+                    (since_param,),
+                ).fetchone()[0] or 0
+
+                # Thinking aggregates
+                row = conn.execute(
+                    """SELECT COUNT(*),
+                              AVG(reasoning_tokens),
+                              AVG(thinking_duration_ms),
+                              AVG(answer_duration_ms)
+                       FROM requests
+                       WHERE timestamp >= datetime('now', ?)
+                         AND thinking_enabled = 1""",
+                    (since_param,),
+                ).fetchone()
+                thinking_count = row[0] or 0
+
+                # By-model breakdown
+                by_model_rows = conn.execute(
+                    """SELECT model_alias,
+                              COUNT(*) as count,
+                              AVG(reasoning_tokens) as avg_reasoning_tokens,
+                              AVG(thinking_duration_ms) as avg_thinking_duration_ms
+                       FROM requests
+                       WHERE timestamp >= datetime('now', ?)
+                         AND thinking_enabled = 1
+                       GROUP BY model_alias
+                       ORDER BY count DESC""",
+                    (since_param,),
+                ).fetchall()
+
+            return {
+                "total_thinking_requests": thinking_count,
+                "avg_reasoning_tokens": row[1],
+                "avg_thinking_duration_ms": row[2],
+                "avg_answer_duration_ms": row[3],
+                "thinking_percentage": (thinking_count / total * 100) if total else 0.0,
+                "by_model": [
+                    {
+                        "model": r[0],
+                        "count": r[1],
+                        "avg_reasoning_tokens": r[2],
+                        "avg_thinking_duration_ms": r[3],
+                    }
+                    for r in by_model_rows
+                ],
+            }
+        except Exception as e:
+            print(f"[ppmlx db] Thinking stats error: {e}", file=sys.stderr)
+            return empty
 
     def flush(self) -> None:
         """Wait for the write queue to drain."""
