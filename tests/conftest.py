@@ -30,10 +30,15 @@ except ImportError:
     _mcp_server = _stub("mcp.server")
     _mcp_fastmcp = _stub("mcp.server.fastmcp")
 
+    class _StubToolManager:
+        def __init__(self):
+            self._tools = {}
+
     class _StubFastMCP:
         """Minimal stand-in for mcp.server.fastmcp.FastMCP."""
         def __init__(self, *a, **kw):
-            self._tools = {}
+            self._tool_manager = _StubToolManager()
+            self._tools = self._tool_manager._tools
 
         def tool(self, name=None, **kw):
             def decorator(fn):
@@ -50,17 +55,16 @@ except ImportError:
 # replace them with MagicMock (both files guard injection with
 # `if mod not in sys.modules`, so pre-importing here wins).
 # This runs at collection time — before any test file is collected.
-import ppmlx.config        # noqa: E402
-import ppmlx.schema        # noqa: E402
-import ppmlx.db            # noqa: E402
-import ppmlx.models        # noqa: E402
-import ppmlx.memory        # noqa: E402
-import ppmlx.modelfile     # noqa: E402
-import ppmlx.quantize      # noqa: E402
-import ppmlx.engine        # noqa: E402
-import ppmlx.engine_embed  # noqa: E402
-import ppmlx.engine_vlm    # noqa: E402
-import ppmlx.mcp           # noqa: E402
+import ppmlx.config        # noqa: F401, E402
+import ppmlx.schema        # noqa: F401, E402
+import ppmlx.db            # noqa: F401, E402
+import ppmlx.models        # noqa: F401, E402
+import ppmlx.memory        # noqa: F401, E402
+import ppmlx.quantize      # noqa: F401, E402
+import ppmlx.engine        # noqa: F401, E402
+import ppmlx.engine_embed  # noqa: F401, E402
+import ppmlx.engine_vlm    # noqa: F401, E402
+import ppmlx.mcp           # noqa: F401, E402
 
 # Snapshot real module attributes HERE (module level) — before any test file
 # is collected.  test_server.py's module-level code runs at collection time and

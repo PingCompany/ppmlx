@@ -93,7 +93,7 @@ def test_generate_calls_mlx():
     reset_engine()
     engine = TextEngine(max_loaded=2)
 
-    text, reasoning, pt, ct = engine.generate(
+    text, reasoning, pt, ct, rt = engine.generate(
         "some/model", [{"role": "user", "content": "hi"}]
     )
 
@@ -119,12 +119,13 @@ def test_generate_returns_text():
 
     result = engine.generate("some/model", [{"role": "user", "content": "hi"}])
     assert isinstance(result, tuple)
-    assert len(result) == 4
-    text, reasoning, pt, ct = result
+    assert len(result) == 5
+    text, reasoning, pt, ct, rt = result
     assert isinstance(text, str)
     assert reasoning is None
     assert isinstance(pt, int)
     assert isinstance(ct, int)
+    assert isinstance(rt, int)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +139,7 @@ def test_generate_strips_thinking():
     reset_engine()
     engine = TextEngine(max_loaded=2)
 
-    text, reasoning, pt, ct = engine.generate(
+    text, reasoning, pt, ct, rt = engine.generate(
         "some/model", [{"role": "user", "content": "hi"}], strip_thinking=True
     )
     assert text == "answer text"
@@ -395,3 +396,107 @@ def test_stream_generate_strip_thinking_false():
     ))
     assert "<think>" in result
     assert "reason" in result
+
+
+# ---------------------------------------------------------------------------
+# 16. _is_thinking_model detects <think> in chat_template
+# ---------------------------------------------------------------------------
+def test_is_thinking_model_true():
+    from ppmlx.engine import _is_thinking_model
+
+    tokenizer = MagicMock()
+    tokenizer.chat_template = "...some template with <think> tag..."
+    assert _is_thinking_model(tokenizer) is True
+
+
+def test_is_thinking_model_false():
+    from ppmlx.engine import _is_thinking_model
+
+    tokenizer = MagicMock()
+    tokenizer.chat_template = "plain template without thinking"
+    assert _is_thinking_model(tokenizer) is False
+
+    # No chat_template attribute at all
+    tokenizer2 = MagicMock(spec=[])
+    assert _is_thinking_model(tokenizer2) is False
+
+
+# ---------------------------------------------------------------------------
+# 17. generate retries on empty answer after thinking
+# ---------------------------------------------------------------------------
+def test_generate_empty_answer_retries():
+    """When strip_thinking produces empty text, generate() retries with
+    enable_thinking=False."""
+    fake, mock_model, mock_tokenizer = _make_fake_mlx_lm(
+        generate_return="<think>long reasoning</think>"
+    )
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    # First call returns thinking-only, second call (retry) returns real answer
+    fake.generate.side_effect = [
+        "<think>long reasoning</think>",
+        "actual answer",
+    ]
+
+    result = engine.generate("some/model", [{"role": "user", "content": "hi"}])
+    assert result.text == "actual answer"
+    assert fake.generate.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# 18. reasoning_budget caps thinking in stream
+# ---------------------------------------------------------------------------
+def test_reasoning_budget_stream():
+    """When reasoning_budget is set, thinking is capped and text is yielded."""
+    # Drip thinking content one chunk at a time so the budget check fires
+    # before the </think> close tag arrives.
+    slow_chunks = ["<think>"] + ["x" * 20 for _ in range(20)] + ["</think>", "answer"]
+    fake, _, _ = _make_fake_mlx_lm(stream_chunks=slow_chunks)
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    # Budget = 5 tokens => 20 chars. After ~20 chars of thinking the budget is hit.
+    result = "".join(engine.stream_generate(
+        "some/model", [{"role": "user", "content": "hi"}],
+        reasoning_budget=5,
+    ))
+    assert "answer" in result
+
+
+# ---------------------------------------------------------------------------
+# 19. GenerateResult unpacks as 4-tuple (backward compatibility)
+# ---------------------------------------------------------------------------
+def test_generate_result_unpacks_as_4tuple():
+    """GenerateResult supports named access and extended unpacking."""
+    from ppmlx.engine import GenerateResult
+
+    r = GenerateResult(
+        text="hello",
+        reasoning="thought",
+        prompt_tokens=10,
+        completion_tokens=5,
+        reasoning_tokens=3,
+    )
+
+    # Extended unpacking (existing callers can use text, reasoning, pt, ct, *_ = r)
+    text, reasoning, pt, ct, *rest = r
+    assert text == "hello"
+    assert reasoning == "thought"
+    assert pt == 10
+    assert ct == 5
+    assert rest == [3]
+
+    # Named access
+    assert r.text == "hello"
+    assert r.reasoning_tokens == 3
+
+    # Default value for reasoning_tokens
+    r2 = GenerateResult("hi", None, 1, 1)
+    assert r2.reasoning_tokens == 0
