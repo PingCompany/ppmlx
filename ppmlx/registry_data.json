@@ -393,7 +393,7 @@
       "downloads": 22758,
       "created": "2026-03-04"
     },
-    "ministral:3b": {
+    "ministral-3:3b": {
       "repo_id": "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
       "params_b": 3.0,
       "size_gb": 4.7,
@@ -683,7 +683,7 @@
       "downloads": 4662,
       "created": "2025-07-08"
     },
-    "ministral:8b": {
+    "ministral-3:8b": {
       "repo_id": "mlx-community/Ministral-3-8B-Instruct-2512-4bit",
       "params_b": 8.0,
       "size_gb": 10.4,
@@ -903,7 +903,7 @@
       "downloads": 3233,
       "created": "2025-10-14"
     },
-    "ministral:8b-reason": {
+    "ministral-3:8b-reason": {
       "repo_id": "mlx-community/Ministral-3-8B-Reasoning-2512-4bit",
       "params_b": 8.0,
       "size_gb": 5.6,
@@ -1093,7 +1093,7 @@
       "downloads": 2533,
       "created": "2026-01-22"
     },
-    "ministral:14b": {
+    "ministral-3:14b": {
       "repo_id": "mlx-community/Ministral-3-14B-Instruct-2512-4bit",
       "params_b": 14.0,
       "size_gb": 16.1,
