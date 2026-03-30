@@ -1639,6 +1639,7 @@ def stats(
 @template_app.command(name="list")
 def template_list():
     """List all available prompt templates."""
+    from rich.table import Table
     from ppmlx.templates import list_templates
 
     templates = list_templates()
