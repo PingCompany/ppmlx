@@ -95,18 +95,12 @@ def _strip_thinking(text: str) -> tuple[str, str | None]:
 
 
 def _resolve_model_path(repo_id: str) -> str:
-    """
-    Resolve a repo_id to a local path if available, otherwise return the repo_id
-    for direct HuggingFace loading.
-    """
+    """Resolve a repo_id to a local path if available, otherwise return the repo_id."""
     try:
-        from ppmlx.models import get_model_path
-        local = get_model_path(repo_id)
-        if local:
-            return str(local)
+        from ppmlx.models import resolve_model_path
+        return resolve_model_path(repo_id)
     except ImportError:
-        pass
-    return repo_id
+        return repo_id
 
 
 class TextEngine:

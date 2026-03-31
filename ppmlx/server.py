@@ -1397,6 +1397,95 @@ async def _async_iter_sync_gen(sync_gen, loop=None):
         yield item
 
 
+# ── Shared think-tag stream parser ──────────────────────────────────
+
+async def _parse_think_tags(raw_stream):
+    """Parse ``<think>...</think>`` tags from a raw token stream.
+
+    Yields tuples describing what was parsed:
+
+    * ``("thinking", chunk)``  — a chunk of reasoning text
+    * ``("thinking_done", full_reasoning)`` — thinking block closed
+    * ``("text", chunk)``  — a chunk of answer text
+    * ``("flush_text", full_text)``  — final flush of any buffered text
+
+    Assumes the model may start *inside* a thinking block (Qwen3 injects
+    ``<think>`` into the generation prompt).
+    """
+    in_thinking = True  # assume starting inside think block
+    buf = ""
+    reasoning_text = ""
+    full_text = ""
+
+    async for chunk in raw_stream:
+        buf += chunk
+        while buf:
+            if not in_thinking:
+                think_pos = buf.find("<think>")
+                close_pos = buf.find("</think>")
+                if think_pos == 0:
+                    in_thinking = True
+                    buf = buf[len("<think>"):]
+                    continue
+                elif close_pos == 0:
+                    # Closing tag without matching open (template-injected)
+                    buf = buf[len("</think>"):]
+                    if reasoning_text:
+                        yield ("thinking_done", reasoning_text)
+                    continue
+                else:
+                    # Check for partial tag at end of buffer
+                    partial = any(
+                        buf.endswith(t[:i])
+                        for t in ("<think>", "</think>")
+                        for i in range(1, len(t))
+                    )
+                    if partial:
+                        break
+                    text_chunk = buf[:think_pos] if think_pos > 0 else buf
+                    buf = buf[len(text_chunk):]
+                    if text_chunk:
+                        full_text += text_chunk
+                        yield ("text", text_chunk)
+                    if not buf:
+                        break
+            else:
+                close_pos = buf.find("</think>")
+                if close_pos >= 0:
+                    think_chunk = buf[:close_pos]
+                    buf = buf[close_pos + len("</think>"):]
+                    in_thinking = False
+                    if think_chunk:
+                        reasoning_text += think_chunk
+                        yield ("thinking", think_chunk)
+                    yield ("thinking_done", reasoning_text)
+                    continue
+                else:
+                    partial_len = 0
+                    for i in range(1, len("</think>")):
+                        if buf.endswith("</think>"[:i]):
+                            partial_len = i
+                            break
+                    safe = buf[:len(buf) - partial_len] if partial_len else buf
+                    buf = buf[len(safe):] if partial_len else ""
+                    if safe:
+                        reasoning_text += safe
+                        yield ("thinking", safe)
+                    break
+
+    # Flush remaining buffer
+    if buf:
+        if in_thinking:
+            reasoning_text += buf
+            yield ("thinking", buf)
+            yield ("thinking_done", reasoning_text)
+        else:
+            full_text += buf
+            yield ("text", buf)
+
+    yield ("flush_text", full_text)
+
+
 def _stream_responses(
     resp_id, msg_id, created, model_name, repo_id, messages,
     engine_type, temperature, top_p, max_tokens, request,
@@ -1461,11 +1550,7 @@ def _stream_responses(
                     enable_thinking=not bool(tools),  # Disable thinking for tool calls
                 )
 
-                # Qwen3 template injects <think> into the prompt, so model
-                # output starts inside a thinking block.  Start in thinking
-                # mode and emit a reasoning output item immediately.
-                in_thinking = True
-                buf = ""
+                # Start with reasoning item (Qwen3 starts inside think block)
                 reasoning_idx = 0
                 msg_output_idx = 1
                 rs_id = "rs_" + uuid.uuid4().hex[:12]
@@ -1474,103 +1559,27 @@ def _stream_responses(
                     "item": {"id": rs_id, "type": "reasoning", "summary": []},
                 }, seq)
 
-                async for chunk in _async_iter_sync_gen(gen):
-                    if not chunk:
-                        yield _sse("keepalive", {})
-                        continue
-                    buf += chunk
-                    while buf:
-                        if not in_thinking:
-                            think_pos = buf.find("<think>")
-                            close_pos = buf.find("</think>")
-                            if think_pos == 0:
-                                in_thinking = True
-                                buf = buf[len("<think>"):]
-                                if reasoning_idx is None:
-                                    reasoning_idx = 0
-                                    msg_output_idx = 1
-                                    rs_id = "rs_" + uuid.uuid4().hex[:12]
-                                    yield _sse("response.output_item.added", {
-                                        "output_index": reasoning_idx,
-                                        "item": {"id": rs_id, "type": "reasoning", "summary": []},
-                                    }, seq)
-                                continue
-                            elif close_pos == 0:
-                                buf = buf[len("</think>"):]
-                                if reasoning_idx is not None:
-                                    yield _sse("response.output_item.done", {
-                                        "output_index": reasoning_idx,
-                                        "item": {"id": rs_id, "type": "reasoning",
-                                                 "summary": [{"type": "summary_text", "text": reasoning_text}]},
-                                    }, seq)
-                                continue
-                            else:
-                                # Check for partial tag
-                                partial = any(buf.endswith(t[:i])
-                                              for t in ("<think>", "</think>")
-                                              for i in range(1, len(t)))
-                                if partial:
-                                    break
-                                # Plain text — buffer it (don't stream yet).
-                                # We'll emit clean text after parsing tool calls.
-                                text_chunk = buf[:think_pos] if think_pos > 0 else buf
-                                buf = buf[len(text_chunk):]
-                                if text_chunk:
-                                    full_text += text_chunk
-                                if not buf:
-                                    break
-                        else:
-                            close_pos = buf.find("</think>")
-                            if close_pos >= 0:
-                                think_chunk = buf[:close_pos]
-                                buf = buf[close_pos + len("</think>"):]
-                                in_thinking = False
-                                if think_chunk:
-                                    reasoning_text += think_chunk
-                                    yield _sse("response.reasoning_summary_text.delta", {
-                                        "output_index": reasoning_idx,
-                                        "delta": think_chunk,
-                                    }, seq)
-                                yield _sse("response.reasoning_summary_text.done", {
-                                    "output_index": reasoning_idx,
-                                    "text": reasoning_text,
-                                }, seq)
-                                yield _sse("response.output_item.done", {
-                                    "output_index": reasoning_idx,
-                                    "item": {"id": rs_id, "type": "reasoning",
-                                             "summary": [{"type": "summary_text", "text": reasoning_text}]},
-                                }, seq)
-                                continue
-                            else:
-                                # Partial check
-                                partial_len = 0
-                                for i in range(1, len("</think>")):
-                                    if buf.endswith("</think>"[:i]):
-                                        partial_len = i
-                                        break
-                                safe = buf[:len(buf) - partial_len] if partial_len else buf
-                                buf = buf[len(safe):] if partial_len else ""
-                                if safe:
-                                    reasoning_text += safe
-                                    if reasoning_idx is None:
-                                        # Template-injected thinking
-                                        reasoning_idx = 0
-                                        msg_output_idx = 1
-                                        rs_id = "rs_" + uuid.uuid4().hex[:12]
-                                        in_thinking = True
-                                        yield _sse("response.output_item.added", {
-                                            "output_index": reasoning_idx,
-                                            "item": {"id": rs_id, "type": "reasoning", "summary": []},
-                                        }, seq)
-                                    yield _sse("response.reasoning_summary_text.delta", {
-                                        "output_index": reasoning_idx,
-                                        "delta": safe,
-                                    }, seq)
-                                break
+                raw_stream = _async_iter_sync_gen(gen)
+                async for kind, data in _parse_think_tags(raw_stream):
+                    if kind == "thinking":
+                        yield _sse("response.reasoning_summary_text.delta", {
+                            "output_index": reasoning_idx,
+                            "delta": data,
+                        }, seq)
+                    elif kind == "thinking_done":
+                        reasoning_text = data
+                        yield _sse("response.reasoning_summary_text.done", {
+                            "output_index": reasoning_idx,
+                            "text": reasoning_text,
+                        }, seq)
+                        yield _sse("response.output_item.done", {
+                            "output_index": reasoning_idx,
+                            "item": {"id": rs_id, "type": "reasoning",
+                                     "summary": [{"type": "summary_text", "text": reasoning_text}]},
+                        }, seq)
+                    elif kind == "flush_text":
+                        full_text = data
 
-                # Flush remaining buf as text (buffered, not streamed)
-                if buf and not in_thinking:
-                    full_text += buf
             elif engine_type == "vision":
                 from ppmlx.engine_vlm import get_vision_engine
                 engine = get_vision_engine()
@@ -1985,15 +1994,8 @@ def _stream_anthropic(
 
         full_text = ""
         content_idx = 0
-
-        # State machine: track whether we're inside <think> or in text.
-        # We use strip_thinking=False so we get raw tokens including
-        # <think>...</think>, then emit them as thinking_delta / text_delta.
-        # Start outside thinking — detect <think> tag dynamically.
-        in_thinking = False
         thinking_started = False
         text_started = False
-        buf = ""
 
         try:
             from ppmlx.engine import get_engine
@@ -2023,181 +2025,38 @@ def _stream_anthropic(
                 _gen_kwargs.pop("reasoning_budget", None)
                 gen = engine.stream_generate(repo_id, messages, **_gen_kwargs)
 
-            # Detect if model's chat template injects <think> into the prompt
-            # (e.g. Qwen3, DeepSeek-R1). If so, model output starts INSIDE
-            # a thinking block without emitting <think>.
-            if _enable_thinking:
-                try:
-                    from ppmlx.engine import _is_thinking_model
-                    lm = engine._get_or_load(repo_id)
-                    prompt = engine._apply_chat_template(lm, messages, enable_thinking=True)
-                    if re.search(r"<think>\s*$", prompt):
-                        in_thinking = True
+            # Emit thinking block start immediately (Qwen3 starts inside think)
+            yield _anthropic_sse({
+                "type": "content_block_start",
+                "index": content_idx,
+                "content_block": {"type": "thinking", "thinking": ""},
+            })
+            thinking_started = True
+
+            raw_stream = _async_iter_sync_gen(gen)
+            async for kind, chunk in _parse_think_tags(raw_stream):
+                if kind == "thinking":
+                    if not thinking_started:
                         thinking_started = True
                         yield _anthropic_sse({
                             "type": "content_block_start",
                             "index": content_idx,
                             "content_block": {"type": "thinking", "thinking": ""},
                         })
-                except Exception:
-                    pass
-
-            _first_chunks_log = []
-            async for chunk in _async_iter_sync_gen(gen):
-                if not chunk:
-                    yield _anthropic_sse({"type": "ping"})
-                    continue
-                if len(_first_chunks_log) < 5:
-                    _first_chunks_log.append(repr(chunk))
-                    if len(_first_chunks_log) == 5:
-                        log.info("First 5 chunks: %s", _first_chunks_log)
-                buf += chunk
-
-                # Detect transitions between thinking and text
-                while buf:
-                    if not in_thinking:
-                        # Look for <think> to start thinking block
-                        think_pos = buf.find("<think>")
-                        close_pos = buf.find("</think>")
-
-                        if think_pos == 0:
-                            # Start thinking block
-                            in_thinking = True
-                            buf = buf[len("<think>"):]
-                            if not thinking_started:
-                                thinking_started = True
-                                yield _anthropic_sse({
-                                    "type": "content_block_start",
-                                    "index": content_idx,
-                                    "content_block": {"type": "thinking", "thinking": ""},
-                                })
-                            continue
-                        elif close_pos == 0:
-                            # Closing tag without opening — template injected
-                            # <think> into prompt, so we started inside thinking
-                            buf = buf[len("</think>"):]
-                            if thinking_started:
-                                yield _anthropic_sse({
-                                    "type": "content_block_stop",
-                                    "index": content_idx,
-                                })
-                                content_idx += 1
-                                thinking_started = False
-                            continue
-                        elif think_pos > 0:
-                            # Text before <think>
-                            text_chunk = buf[:think_pos]
-                            buf = buf[think_pos:]
-                            if text_chunk.strip():
-                                if not text_started:
-                                    text_started = True
-                                    yield _anthropic_sse({
-                                        "type": "content_block_start",
-                                        "index": content_idx,
-                                        "content_block": {"type": "text", "text": ""},
-                                    })
-                                full_text += text_chunk
-                                yield _anthropic_sse({
-                                    "type": "content_block_delta",
-                                    "index": content_idx,
-                                    "delta": {"type": "text_delta", "text": text_chunk},
-                                })
-                            continue
-                        else:
-                            # No tag found — might be partial tag at end of buf
-                            # Check for partial "<thi" or "</thi" at end
-                            partial = False
-                            for tag in ("<think>", "</think>"):
-                                for i in range(1, len(tag)):
-                                    if buf.endswith(tag[:i]):
-                                        partial = True
-                                        break
-                                if partial:
-                                    break
-                            if partial:
-                                break  # Wait for more data
-
-                            # Plain text, no partial tags
-                            text_chunk = buf
-                            buf = ""
-                            if text_chunk:
-                                if not text_started:
-                                    text_started = True
-                                    yield _anthropic_sse({
-                                        "type": "content_block_start",
-                                        "index": content_idx,
-                                        "content_block": {"type": "text", "text": ""},
-                                    })
-                                full_text += text_chunk
-                                yield _anthropic_sse({
-                                    "type": "content_block_delta",
-                                    "index": content_idx,
-                                    "delta": {"type": "text_delta", "text": text_chunk},
-                                })
-                            break
-                    else:
-                        # Inside thinking block — look for </think>
-                        close_pos = buf.find("</think>")
-                        if close_pos >= 0:
-                            think_chunk = buf[:close_pos]
-                            buf = buf[close_pos + len("</think>"):]
-                            in_thinking = False
-                            if think_chunk:
-                                yield _anthropic_sse({
-                                    "type": "content_block_delta",
-                                    "index": content_idx,
-                                    "delta": {"type": "thinking_delta", "thinking": think_chunk},
-                                })
-                            yield _anthropic_sse({
-                                "type": "content_block_stop",
-                                "index": content_idx,
-                            })
-                            content_idx += 1
-                            thinking_started = False
-                            continue
-                        else:
-                            # Check for partial "</thi" at end
-                            partial = False
-                            for i in range(1, len("</think>")):
-                                if buf.endswith("</think>"[:i]):
-                                    partial = True
-                                    break
-                            if partial:
-                                # Emit everything except the partial tag
-                                safe = buf[:len(buf) - i]
-                                buf = buf[len(buf) - i:]
-                            else:
-                                safe = buf
-                                buf = ""
-                            if safe:
-                                if not thinking_started:
-                                    # Template injected <think>, we start mid-think
-                                    thinking_started = True
-                                    in_thinking = True
-                                    yield _anthropic_sse({
-                                        "type": "content_block_start",
-                                        "index": content_idx,
-                                        "content_block": {"type": "thinking", "thinking": ""},
-                                    })
-                                yield _anthropic_sse({
-                                    "type": "content_block_delta",
-                                    "index": content_idx,
-                                    "delta": {"type": "thinking_delta", "thinking": safe},
-                                })
-                            break
-
-            # Flush remaining buffer
-            if buf:
-                if in_thinking or thinking_started:
-                    if buf.strip():
+                    yield _anthropic_sse({
+                        "type": "content_block_delta",
+                        "index": content_idx,
+                        "delta": {"type": "thinking_delta", "thinking": chunk},
+                    })
+                elif kind == "thinking_done":
+                    if thinking_started:
                         yield _anthropic_sse({
-                            "type": "content_block_delta",
+                            "type": "content_block_stop",
                             "index": content_idx,
-                            "delta": {"type": "thinking_delta", "thinking": buf},
                         })
-                    yield _anthropic_sse({"type": "content_block_stop", "index": content_idx})
-                    content_idx += 1
-                else:
+                        content_idx += 1
+                        thinking_started = False
+                elif kind == "text":
                     if not text_started:
                         text_started = True
                         yield _anthropic_sse({
@@ -2205,13 +2064,16 @@ def _stream_anthropic(
                             "index": content_idx,
                             "content_block": {"type": "text", "text": ""},
                         })
-                    full_text += buf
                     yield _anthropic_sse({
                         "type": "content_block_delta",
                         "index": content_idx,
-                        "delta": {"type": "text_delta", "text": buf},
+                        "delta": {"type": "text_delta", "text": chunk},
                     })
-            elif thinking_started:
+                elif kind == "flush_text":
+                    full_text = chunk
+
+            # Close thinking block if still open
+            if thinking_started:
                 yield _anthropic_sse({"type": "content_block_stop", "index": content_idx})
                 content_idx += 1
 
@@ -2229,8 +2091,8 @@ def _stream_anthropic(
             return
 
         log.info("/v1/messages stream done: full_text=%d chars, text_started=%s, "
-                 "thinking_started=%s, in_thinking=%s",
-                 len(full_text), text_started, thinking_started, in_thinking)
+                 "thinking_started=%s",
+                 len(full_text), text_started, thinking_started)
 
         # Parse tool calls from the collected text output
         tokenizer = engine.get_tokenizer(repo_id)
