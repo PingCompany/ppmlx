@@ -1709,5 +1709,220 @@ def stats(
         ))
 
 
+# ── RAG commands ───────────────────────────────────────────────────────
+
+rag_app = typer.Typer(
+    name="rag",
+    help="Chat with your documents (privacy-first RAG)",
+    no_args_is_help=True,
+)
+app.add_typer(rag_app, name="rag")
+
+
+@rag_app.command()
+def ingest(
+    path: str = typer.Argument(..., help="File or directory to ingest"),
+    collection: str = typer.Option("default", "--collection", "-c", help="Collection name"),
+    embed_model: str = typer.Option("embed:all-minilm", "--embed-model", "-e", help="Embedding model alias"),
+    chunk_size: int = typer.Option(500, "--chunk-size", help="Chunk size in characters"),
+    chunk_overlap: int = typer.Option(50, "--chunk-overlap", help="Overlap between chunks in characters"),
+):
+    """Ingest documents into a RAG collection for local Q&A."""
+    from ppmlx.rag import ingest as rag_ingest
+
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        console.print(f"[red]Path not found: {target}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Ingesting from [bold]{target}[/bold] into collection '{collection}'...[/cyan]")
+    try:
+        stats = rag_ingest(
+            path=target,
+            collection_name=collection,
+            embed_model=embed_model,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Ingestion failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]Done![/green] {stats['files_processed']} files processed, "
+                  f"{stats['chunks_created']} chunks created, "
+                  f"{stats['files_skipped']} files skipped.")
+    if stats["errors"]:
+        console.print(f"[yellow]{len(stats['errors'])} errors:[/yellow]")
+        for err in stats["errors"]:
+            console.print(f"  [dim]{err['file']}[/dim]: {err['error']}")
+
+
+@rag_app.command()
+def chat(
+    collection: str = typer.Option("default", "--collection", "-c", help="Collection to query"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Chat model alias"),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Number of context chunks to retrieve"),
+    temperature: Optional[float] = typer.Option(None, "--temperature", "-t"),
+    max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
+):
+    """Chat with your documents using retrieval-augmented generation."""
+    from ppmlx.rag import VectorStore, retrieve, build_rag_prompt
+
+    store = VectorStore()
+    coll = store.get_collection(collection)
+    if coll is None:
+        console.print(f"[red]Collection '{collection}' not found. Run [bold]ppmlx rag ingest[/bold] first.[/red]")
+        raise typer.Exit(1)
+
+    doc_count = len(store.get_documents(coll["id"]))
+    console.print(f"[green]RAG chat with collection '[bold]{collection}[/bold]' "
+                  f"({doc_count} docs). Type /bye to exit.[/green]")
+
+    # Resolve chat model
+    if not model:
+        from ppmlx.config import load_config
+        model = load_config().defaults.model
+
+    from ppmlx.models import resolve_alias, get_model_path, download_model, ModelNotFoundError
+    from ppmlx.engine import get_engine
+
+    try:
+        repo_id = resolve_alias(model)
+    except ModelNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    local_path = get_model_path(repo_id)
+    if not local_path:
+        console.print(f"[yellow]Downloading model {model}...[/yellow]")
+        try:
+            download_model(model)
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    engine = get_engine()
+    messages: list[dict[str, str]] = []
+
+    while True:
+        try:
+            query = console.input("[bold blue]You[/bold blue]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye![/dim]")
+            break
+
+        if not query:
+            continue
+        if query.lower() in ("/bye", "/exit", "/quit"):
+            console.print("[dim]Goodbye![/dim]")
+            break
+
+        # Retrieve relevant context
+        try:
+            contexts = retrieve(query, collection_name=collection, top_k=top_k, store=store)
+        except Exception as e:
+            console.print(f"[red]Retrieval error: {e}[/red]")
+            continue
+
+        augmented_query = build_rag_prompt(query, contexts)
+
+        # Build messages for the LLM
+        turn_messages = [
+            {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
+            *messages,
+            {"role": "user", "content": augmented_query},
+        ]
+
+        console.print("[bold green]Assistant[/bold green]: ", end="")
+        response_text = ""
+        try:
+            result = engine.generate(
+                repo_id,
+                turn_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if hasattr(result, "__iter__") and not isinstance(result, (str, dict)):
+                for token_data in result:
+                    token = token_data if isinstance(token_data, str) else token_data.get("text", "")
+                    response_text += token
+                    console.print(token, end="")
+            else:
+                response_text = result if isinstance(result, str) else result.get("text", str(result))
+                console.print(response_text, end="")
+        except Exception as e:
+            console.print(f"\n[red]Generation error: {e}[/red]")
+            continue
+
+        console.print()  # newline after response
+
+        # Show sources
+        if contexts:
+            sources = sorted(set(Path(c["source"]).name for c in contexts))
+            console.print(f"[dim]Sources: {', '.join(sources)}[/dim]")
+
+        # Keep conversation history (use the original query, not the augmented one)
+        messages.append({"role": "user", "content": query})
+        messages.append({"role": "assistant", "content": response_text})
+
+
+@rag_app.command(name="list")
+def rag_list():
+    """List all RAG collections and their stats."""
+    from ppmlx.rag import VectorStore
+
+    store = VectorStore()
+    collections = store.list_collections()
+
+    if not collections:
+        console.print("[dim]No RAG collections. Run [bold]ppmlx rag ingest <dir>[/bold] to create one.[/dim]")
+        return
+
+    table = Table(title="RAG Collections", show_header=True)
+    table.add_column("Collection", style="cyan")
+    table.add_column("Embed Model", style="green")
+    table.add_column("Documents", justify="right")
+    table.add_column("Chunks", justify="right")
+    table.add_column("Created", style="dim")
+
+    for c in collections:
+        table.add_row(
+            c["name"],
+            c["embed_model"],
+            str(c["doc_count"]),
+            str(c["chunk_count"]),
+            c["created_at"][:19],
+        )
+
+    console.print(table)
+
+
+@rag_app.command()
+def rm(
+    collection: str = typer.Argument(..., help="Collection name to delete"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Remove a RAG collection and all its data."""
+    from ppmlx.rag import VectorStore
+
+    store = VectorStore()
+    coll = store.get_collection(collection)
+    if coll is None:
+        console.print(f"[red]Collection '{collection}' not found.[/red]")
+        raise typer.Exit(1)
+
+    if not force:
+        confirm = typer.confirm(f"Delete collection '{collection}' and all its data?")
+        if not confirm:
+            console.print("[dim]Cancelled.[/dim]")
+            raise typer.Exit()
+
+    store.delete_collection(collection)
+    console.print(f"[green]Deleted collection '{collection}'.[/green]")
+
+
 if __name__ == "__main__":
     app()
