@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-31
+
+### Changed
+- Deduplicate `_resolve_model_path` across engine modules into `models.py`
+- Extract shared think-tag stream processor, eliminating ~100 lines of duplication
+- Remove `setproctitle` dependency
+
+### Fixed
+- Incorrect `reasoning_text` assignment in streaming responses
+- `_flush_port` now verifies PID belongs to ppmlx before killing (H3)
+- Vision engine rejects `file://` URLs and bare paths from API requests (C3)
+
+### Security
+- CORS defaults to localhost-only; configurable via `cors_origins` in config.toml (C2)
+- Request body size limit middleware (default 10 MB, configurable) (H1)
+- Server-side `max_tokens` cap (default 32768, configurable) (H2)
+- Embedding input limited to 256 texts per request (H4)
+- WebSocket message size limit (10 MB) (H5)
+- Removed debug JSONL logging to `/tmp/` (C1)
+
+### Added
+- `SECURITY_AUDIT.md` documenting all findings and fixes
+- Homebrew formula with `arch: :arm64` constraint and auto-update workflow
+
 ## [0.4.0] - 2026-03-30
 
 ### Added
