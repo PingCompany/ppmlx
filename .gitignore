@@ -36,7 +36,5 @@ uv.lock
 # Benchmarks & generated output
 benchmark_results/
 
-# Site / docs build artifacts
-site/dist/
-site/node_modules/
-site/.astro/
+# Site (moved to github.com/the-focus-company/ppmlx.dev)
+site/
