@@ -748,6 +748,150 @@ def serve(
 
 
 @app.command()
+def gateway(
+    host: Optional[str] = typer.Option(None, help="Bind host (default: 127.0.0.1)"),
+    port: Optional[int] = typer.Option(None, help="Bind port (default: 6768)"),
+    local_server: Optional[str] = typer.Option(None, "--local-server", help="Local ppmlx server URL (default: http://127.0.0.1:6767)"),
+):
+    """Start the smart API gateway that routes between local and cloud models.
+
+    Routes requests to local ppmlx models or cloud providers (OpenAI, Anthropic)
+    based on model name patterns configured in ~/.ppmlx/config.toml.
+
+    Example config:
+
+        [gateway]
+        port = 6768
+
+        [[gateway.routes]]
+        pattern = "gpt-*"
+        backend = "openai"
+        api_key_env = "OPENAI_API_KEY"
+
+        [[gateway.routes]]
+        pattern = "claude-*"
+        backend = "anthropic"
+        api_key_env = "ANTHROPIC_API_KEY"
+
+        [[gateway.routes]]
+        pattern = "*"
+        backend = "local"
+        fallback = "openai"
+    """
+    import uvicorn
+    from ppmlx.gateway import load_gateway_config, build_routing_table, create_gateway_app
+    from ppmlx import __version__
+
+    cfg = load_gateway_config()
+    if host:
+        cfg.host = host
+    if port:
+        cfg.port = port
+    if local_server:
+        cfg.local_server = local_server
+
+    # Add default routes if none configured
+    if not cfg.routes:
+        from ppmlx.gateway import RouteConfig
+        cfg.routes = [
+            RouteConfig(pattern="gpt-*", backend="openai", api_key_env="OPENAI_API_KEY"),
+            RouteConfig(pattern="claude-*", backend="anthropic", api_key_env="ANTHROPIC_API_KEY"),
+            RouteConfig(pattern="*", backend="local"),
+        ]
+
+    routing_table = build_routing_table(cfg)
+
+    # Build routing info string
+    route_lines = []
+    for r in routing_table:
+        route_lines.append(f"     {r['pattern']:20s} -> {r['backend']:12s} (fallback: {r['fallback']})")
+
+    console.print(Panel(
+        f"[bold green]ppmlx gateway v{__version__}[/bold green]\n"
+        f"   Listening on [link]http://{cfg.host}:{cfg.port}[/link]\n"
+        f"   Local server: {cfg.local_server}\n"
+        f"   Routes:\n" + "\n".join(route_lines) + "\n"
+        f"\n   Endpoints:\n"
+        f"     POST /v1/chat/completions  (routed)\n"
+        f"     POST /v1/completions       (routed)\n"
+        f"     POST /v1/embeddings        (local)\n"
+        f"     GET  /v1/models            (aggregated)\n"
+        f"     GET  /gateway/routes       (routing table)\n"
+        f"     GET  /health",
+        title="ppmlx gateway",
+        border_style="cyan",
+    ))
+
+    gateway_app = create_gateway_app(cfg)
+
+    if _setproctitle_mod:
+        _setproctitle_mod.setproctitle(f"ppmlx: gateway ({cfg.host}:{cfg.port})")
+
+    uvicorn.run(
+        gateway_app,
+        host=cfg.host,
+        port=cfg.port,
+        log_level="info",
+        reload=False,
+    )
+
+
+@app.command()
+def launch(
+    action: Optional[str] = typer.Argument(None, help="Action: run, claude, codex, opencode, pi"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model name or alias"),
+    host: Optional[str] = typer.Option(None, help="Bind host"),
+    port: Optional[int] = typer.Option(None, help="Bind port (default: 6767)"),
+    no_cors: bool = typer.Option(False, "--no-cors", help="Disable CORS"),
+    flush: bool = typer.Option(False, "--flush", "-f", help="Kill any process using the port before starting"),
+):
+    """Select an action and model, then launch.
+
+    Without arguments, opens an interactive TUI picker.
+    With ACTION and MODEL, launches directly (non-interactive).
+    """
+    from ppmlx.models import list_local_models, DEFAULT_ALIASES
+    from ppmlx.config import load_config
+
+    valid_actions = {item.key for item in _LAUNCH_ITEMS}
+
+    overrides = {k: v for k, v in [("host", host), ("port", port)] if v}
+    cfg = load_config(cli_overrides=overrides)
+    effective_host = host or cfg.server.host
+    effective_port = port or cfg.server.port
+
+    if flush:
+        _flush_port(effective_host, effective_port)
+
+    if action and model:
+        if action not in valid_actions:
+            console.print(f"[red]Unknown action '{action}'. Valid: {', '.join(sorted(valid_actions))}[/red]")
+            raise typer.Exit(1)
+    elif action and not model:
+        if action in valid_actions:
+            console.print(f"[red]MODEL argument is required when ACTION is specified.[/red]")
+            raise typer.Exit(1)
+        # Single arg that's not a valid action — fall through to TUI
+        local_models = list_local_models()
+        action, model = _launch_tui(local_models, DEFAULT_ALIASES)
+    else:
+        local_models = list_local_models()
+        action, model = _launch_tui(local_models, DEFAULT_ALIASES)
+
+    if not action:
+        raise typer.Exit()
+
+    if not model:
+        console.print("[yellow]No model selected. Press \u2192 in the menu to pick one.[/yellow]")
+        raise typer.Exit(1)
+
+    if action == "run":
+        run(model=model, system=None, max_kv_size=None, temperature=None, max_tokens=None)
+    else:
+        _launch_coding_tool(action, model, effective_host, effective_port)
+
+
+@app.command()
 def run(
     model: Optional[str] = typer.Argument(None, help="Model name or alias"),
     system: Optional[str] = typer.Option(None, "--system", "-s", help="System prompt"),
