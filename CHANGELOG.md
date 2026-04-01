@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-01
+
+### Added
+- TurboQuant section in README linking to ppmlx.dev/turboquant
+- Website moved to dedicated repo (the-focus-company/ppmlx.dev)
+
 ## [0.4.1] - 2026-03-31
 
 ### Changed

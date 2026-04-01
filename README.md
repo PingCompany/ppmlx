@@ -91,6 +91,12 @@ Measured on a MacBook Pro M4 Pro (48 GB unified memory, macOS 15.x). Each scenar
 
 **Methodology.** Streaming chat completions over the OpenAI-compatible API; TTFT measured from request start to first SSE content chunk. See [`scripts/bench_common.sh`](scripts/bench_common.sh) and the per-model scripts in `scripts/` for the full, reproducible setup.
 
+### TurboQuant — KV Cache Compression
+
+Native implementation of [Google's TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874) for Apple Silicon. Compresses KV cache 4–5x with near-zero quality loss — a 9B model at 64k context goes from 1 GB to 256 MB.
+
+**[Read more on ppmlx.dev/turboquant](https://ppmlx.dev/turboquant/)**
+
 ---
 
 That's it. Any OpenAI-compatible tool works out of the box:
