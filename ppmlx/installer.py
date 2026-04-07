@@ -126,6 +126,41 @@ def _pip_uninstall(package_names: list[str], timeout: int = 300) -> bool:
 
 # ── Install / uninstall ────────────────────────────────────────────────
 
+def _download_voice_models() -> None:
+    """Download default STT and TTS models after voice addon install."""
+    import io
+    import contextlib
+    import os
+    from ppmlx.config import load_config
+    cfg = load_config().voice
+
+    models = [
+        ("STT", cfg.stt_model),
+        ("TTS", cfg.tts_model),
+    ]
+    from ppmlx.models import _get_hf_token
+    token = _get_hf_token()
+
+    for label, repo_id in models:
+        short_name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
+        with console.status(
+            f"[cyan]Downloading {label} model ({short_name})…[/cyan]",
+            spinner="dots",
+        ):
+            try:
+                from huggingface_hub import snapshot_download
+                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+                with contextlib.redirect_stderr(io.StringIO()), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    snapshot_download(repo_id, token=token)
+                console.print(f"  [green]✓ {label} model ready[/green]")
+            except Exception as e:
+                console.print(f"  [yellow]⚠ {label} download failed: {e}[/yellow]")
+                console.print(f"  [dim]Will download on first use.[/dim]")
+            finally:
+                os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+
+
 def _install(comp: Component) -> bool:
     for formula in comp.requires_brew:
         if not _brew_installed(formula):
@@ -153,7 +188,11 @@ def install_component(key: str) -> bool:
     console.print(f"  [green]✓ Done[/green]" if ok else f"  [red]✗ Failed[/red]")
     if not ok:
         console.print(f"  [dim]Try: pip install {' '.join(comp.packages)}[/dim]")
-    return ok
+        return False
+    # Post-install: download default models for voice
+    if key == "voice":
+        _download_voice_models()
+    return True
 
 
 def uninstall_component(key: str) -> bool:

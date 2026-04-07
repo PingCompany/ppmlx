@@ -959,6 +959,8 @@ def agent(
             stt_model=_vc.stt_model,
             tts_model=_vc.tts_model,
             tts_voice=_vc.tts_voice,
+            tts_speed=_vc.tts_speed,
+            tts_volume=_vc.tts_volume,
             ptt_mode=_vc.ptt_mode,
             ptt_key=_vc.ptt_key,
             silence_threshold=_vc.silence_threshold,
@@ -995,8 +997,8 @@ def agent(
         f"  Max iterations: {max_iterations}\n"
         f"  Working dir: {agent_cfg.working_dir}\n\n"
         f"[dim]Type your instructions. The agent will plan and execute.\n"
-        f"{'Hold [' + vcfg.ptt_key.upper() + '] to record, release to send. ' if (voice and vcfg and vcfg.ptt_mode) else ('Press Enter for voice input. ' if voice else '')}"
-        f"Type /exit to quit.[/dim]",
+        f"{'Hold [' + vcfg.ptt_key.upper() + '] to record, release to send. ' if (voice and vcfg and vcfg.ptt_mode) else ('Enter = voice input, or type text. ' if voice else '')}"
+        f"Type /exit or double Ctrl+C to quit.[/dim]",
         title="Agent",
         border_style="green" if not sandbox else "red",
     ))
@@ -1031,21 +1033,49 @@ def agent(
 
     from ppmlx.render import print_response
 
+    # Pre-load voice models with spinners (hides noisy hf_hub output)
+    if voice and voice_in:
+        with console.status("[bold cyan]Loading STT model…[/bold cyan]", spinner="dots"):
+            try:
+                voice_in.preload_stt()
+            except Exception:
+                pass  # will retry on first use
+    if voice and voice_out:
+        with console.status("[bold cyan]Loading TTS model…[/bold cyan]", spinner="dots"):
+            try:
+                voice_out._load_tts()
+            except Exception:
+                pass  # will retry on first use
+
     # REPL loop
+    _last_interrupt: float = 0.0
     while True:
         try:
             if voice and voice_in and vcfg:
                 if vcfg.ptt_mode:
+                    # PTT mode: go straight to recording
                     console.print(
                         f"\n[bold cyan]🎤 Hold [{vcfg.ptt_key.upper()}] to record…[/bold cyan]"
                     )
+                    user_input = voice_in.record_and_transcribe()
+                    if not user_input:
+                        console.print("[dim]No speech detected.[/dim]")
+                        continue
+                    console.print(f"[cyan]You:[/cyan] {user_input}")
                 else:
-                    console.print("\n[bold cyan]🎤 Listening…[/bold cyan] (speak, then pause)")
-                user_input = voice_in.record_and_transcribe()
-                if not user_input:
-                    console.print("[dim]No speech detected.[/dim]")
-                    continue
-                console.print(f"[cyan]You:[/cyan] {user_input}")
+                    # Auto-silence mode: Enter → voice, typed text → use directly
+                    user_input = console.input(
+                        "\n[bold cyan]You:[/bold cyan] [dim](Enter = 🎤 voice)[/dim] "
+                    ).strip()
+                    if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
+                        break
+                    if not user_input:
+                        console.print("[bold cyan]🎤 Listening…[/bold cyan] (speak, then pause)")
+                        user_input = voice_in.record_and_transcribe()
+                        if not user_input:
+                            console.print("[dim]No speech detected.[/dim]")
+                            continue
+                        console.print(f"[cyan]You:[/cyan] {user_input}")
             else:
                 user_input = console.input("\n[bold cyan]You:[/bold cyan] ").strip()
 
@@ -1067,15 +1097,21 @@ def agent(
                 prefix="\n[bold green]Agent:[/bold green] ",
             )
 
-            # Speak the answer
+            # Speak the answer (clean text only, no tool output)
             if voice and voice_out and answer:
                 try:
                     voice_out.speak(answer)
-                except Exception as e:
-                    log.debug("TTS failed: %s", e)
+                except Exception:
+                    pass
 
         except KeyboardInterrupt:
-            console.print("\n[dim]Use /exit to quit.[/dim]")
+            import time as _itime
+            now = _itime.time()
+            if now - _last_interrupt < 2.0:
+                console.print("\n[dim]Agent session ended.[/dim]")
+                raise typer.Exit(0)
+            _last_interrupt = now
+            console.print("\n[dim]Ctrl+C again to quit, or type /exit[/dim]")
             continue
         except EOFError:
             break

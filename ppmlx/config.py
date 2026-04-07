@@ -94,9 +94,11 @@ class AnalyticsConfig:
 @dataclass
 class VoiceSettings:
     """Voice I/O settings — written to [voice] in config.toml."""
-    stt_model: str = "mlx-community/whisper-large-v3-turbo"
-    tts_model: str = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
+    stt_model: str = "mlx-community/whisper-large-v3-turbo-q4"
+    tts_model: str = "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit"
     tts_voice: str | None = None
+    tts_speed: float = 1.0
+    tts_volume: float = 1.10
     # Push-to-talk: hold ptt_key to record, release to send.
     # Set ptt_mode = true to enable; ptt_key accepts 'space', 'f5', single chars, …
     ptt_mode: bool = False
@@ -256,6 +258,8 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         if "stt_model" in v: cfg.voice.stt_model = str(v["stt_model"])
         if "tts_model" in v: cfg.voice.tts_model = str(v["tts_model"])
         if "tts_voice" in v: cfg.voice.tts_voice = str(v["tts_voice"]) if v["tts_voice"] else None
+        if "tts_speed" in v: cfg.voice.tts_speed = float(v["tts_speed"])
+        if "tts_volume" in v: cfg.voice.tts_volume = float(v["tts_volume"])
         if "ptt_mode" in v: cfg.voice.ptt_mode = bool(v["ptt_mode"])
         if "ptt_key" in v: cfg.voice.ptt_key = str(v["ptt_key"]).strip().lower()
         if "silence_threshold" in v: cfg.voice.silence_threshold = float(v["silence_threshold"])

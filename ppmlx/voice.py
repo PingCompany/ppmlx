@@ -10,6 +10,7 @@ Dependencies (optional extras):
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import time
@@ -23,17 +24,36 @@ log = logging.getLogger("ppmlx.voice")
 @dataclass
 class VoiceConfig:
     """Configuration for voice I/O."""
-    stt_model: str = "mlx-community/whisper-large-v3-turbo"
-    tts_model: str = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
+    stt_model: str = "mlx-community/whisper-large-v3-turbo-q4"
+    tts_model: str = "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit"
     tts_voice: str | None = None  # None = default voice
     sample_rate: int = 16000  # Recording sample rate (STT)
     tts_sample_rate: int = 24000  # Playback sample rate (TTS)
+    tts_speed: float = 1.0  # TTS playback speed multiplier
     silence_threshold: float = 0.01  # RMS threshold for silence detection
     silence_duration: float = 1.5  # Seconds of silence to stop recording
     max_record_seconds: float = 30.0  # Maximum recording duration
+    tts_volume: float = 1.10  # Target peak level for normalization
     # Push-to-talk: hold ptt_key while speaking, release to transcribe.
     ptt_mode: bool = False
     ptt_key: str = "space"  # Accepts 'space', 'f5', single chars, …
+
+
+def _ensure_hf_token() -> None:
+    """Set HF_TOKEN env var from ppmlx config if not already set.
+
+    Third-party libs (mlx_whisper, mlx_audio) use huggingface_hub which
+    only reads the env var, not our config.toml.
+    """
+    if os.environ.get("HF_TOKEN"):
+        return
+    try:
+        from ppmlx.models import _get_hf_token
+        token = _get_hf_token()
+        if token:
+            os.environ["HF_TOKEN"] = token
+    except Exception:
+        pass
 
 
 class VoiceInput:
@@ -42,6 +62,7 @@ class VoiceInput:
     def __init__(self, config: VoiceConfig | None = None):
         self.config = config or VoiceConfig()
         self._whisper = None
+        _ensure_hf_token()
 
     def _load_whisper(self) -> None:
         """Lazy-load the Whisper model."""
@@ -56,6 +77,23 @@ class VoiceInput:
                 "mlx-whisper is required for voice input. "
                 "Install with: pip install mlx-whisper"
             )
+
+    def preload_stt(self) -> None:
+        """Pre-download and load the STT model into memory.
+
+        Suppresses noisy huggingface_hub progress bars so the caller can
+        show its own loading animation instead.
+        """
+        self._load_whisper()
+        import io, contextlib
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                from mlx_whisper.load_models import load_model
+                load_model(self.config.stt_model)
+        finally:
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
 
     @staticmethod
     def _check_ffmpeg() -> None:
@@ -83,6 +121,10 @@ class VoiceInput:
             return ""
         # Skip clips that are too short to contain real speech (< 0.3 s)
         if len(audio) < self.config.sample_rate * 0.3:
+            return ""
+        # Trim leading/trailing silence so Whisper doesn't hallucinate
+        audio = self._trim_silence(audio)
+        if audio is None or len(audio) < self.config.sample_rate * 0.3:
             return ""
         return self._transcribe(audio)
 
@@ -171,6 +213,7 @@ class VoiceInput:
 
         chunks: list[Any] = []
         silent_chunks = 0
+        speech_detected = False
         silence_limit = int(self.config.silence_duration / chunk_duration)
 
         log.debug("Recording... (silence threshold=%.3f, max=%.0fs)",
@@ -187,12 +230,19 @@ class VoiceInput:
                     rms = float(np.sqrt(np.mean(data ** 2)))
                     if rms < self.config.silence_threshold:
                         silent_chunks += 1
-                        if silent_chunks >= silence_limit and len(chunks) > silence_limit:
+                        # Only stop on silence AFTER speech was detected
+                        if speech_detected and silent_chunks >= silence_limit:
                             break
                     else:
                         silent_chunks = 0
+                        if not speech_detected:
+                            speech_detected = True
+                            log.debug("Speech detected (RMS=%.4f)", rms)
         except KeyboardInterrupt:
             pass
+
+        if not speech_detected:
+            return None
 
         if not chunks:
             return None
@@ -200,25 +250,66 @@ class VoiceInput:
         import numpy as np
         return np.concatenate(chunks, axis=0).flatten()
 
+    def _trim_silence(self, audio: Any) -> Any:
+        """Trim leading and trailing silence from audio."""
+        import numpy as np
+        threshold = self.config.silence_threshold
+        frame_len = int(self.config.sample_rate * 0.05)  # 50 ms frames
+        # Find first frame above threshold
+        start = 0
+        for i in range(0, len(audio) - frame_len, frame_len):
+            rms = float(np.sqrt(np.mean(audio[i:i + frame_len] ** 2)))
+            if rms >= threshold:
+                start = max(0, i - frame_len)  # keep one frame of lead-in
+                break
+        else:
+            return None
+        # Find last frame above threshold
+        end = len(audio)
+        for i in range(len(audio) - frame_len, start, -frame_len):
+            rms = float(np.sqrt(np.mean(audio[i:i + frame_len] ** 2)))
+            if rms >= threshold:
+                end = min(len(audio), i + 2 * frame_len)
+                break
+        return audio[start:end]
+
+    # Known Whisper hallucinations on silence/noise
+    _HALLUCINATION_PHRASES: frozenset[str] = frozenset({
+        "thank you", "thanks for watching", "thanks for listening",
+        "thank you for watching", "thank you for listening",
+        "you", "bye", "bye bye", "goodbye",
+        "the end", "see you next time", "see you",
+        "subscribe", "like and subscribe",
+        "dziękuję", "dzięki", "do widzenia",
+    })
+
     def _transcribe(self, audio: Any) -> str:
         """Transcribe a numpy audio array.
 
-        Passes the array directly to mlx_whisper (which accepts both file paths
-        and numpy arrays), avoiding the ffmpeg dependency that the file-path
-        code path requires.
-
-        condition_on_previous_text=False prevents Whisper from auto-completing
-        prior context (the main cause of "Thank you" hallucinations on short clips).
-        no_speech_threshold filters segments where Whisper itself isn't confident
-        speech was present.
+        Uses hallucination_silence_threshold and condition_on_previous_text=False
+        to minimize Whisper hallucinations on short/quiet clips.
         """
-        result = self._whisper.transcribe(
-            audio,
-            path_or_hf_repo=self.config.stt_model,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-        )
-        return result.get("text", "").strip()
+        import io, contextlib
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = self._whisper.transcribe(
+                    audio,
+                    path_or_hf_repo=self.config.stt_model,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6,
+                    hallucination_silence_threshold=2.0,
+                    temperature=(0.0, 0.2, 0.4),
+                )
+        finally:
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+        text = result.get("text", "").strip()
+        # Filter known hallucination phrases
+        if text.lower().rstrip(".!?,") in self._HALLUCINATION_PHRASES:
+            log.debug("Filtered hallucination: %r", text)
+            return ""
+        return text
 
 
 class VoiceOutput:
@@ -227,6 +318,7 @@ class VoiceOutput:
     def __init__(self, config: VoiceConfig | None = None):
         self.config = config or VoiceConfig()
         self._tts_model = None
+        _ensure_hf_token()
 
     def _load_tts(self) -> None:
         """Lazy-load the TTS model."""
@@ -234,7 +326,14 @@ class VoiceOutput:
             return
         try:
             from mlx_audio.tts.utils import load_model
-            self._tts_model = load_model(self.config.tts_model)
+            import io, contextlib
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            try:
+                with contextlib.redirect_stderr(io.StringIO()), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self._tts_model = load_model(self.config.tts_model)
+            finally:
+                os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
             log.info("TTS model: %s", self.config.tts_model)
         except ImportError:
             raise ImportError(
@@ -242,8 +341,71 @@ class VoiceOutput:
                 "Install with: pip install mlx-audio"
             )
 
+    def _normalize_audio(self, audio: Any) -> Any:
+        """Normalize audio to target peak level and remove DC offset."""
+        import numpy as np
+        a = np.asarray(audio, dtype=np.float32)
+        # Remove DC offset
+        a = a - np.mean(a)
+        # Normalize to target peak
+        peak = np.max(np.abs(a))
+        target = self.config.tts_volume
+        if peak > 1e-6:
+            a = a * (target / peak)
+        return a
+
+    @staticmethod
+    def clean_text_for_speech(text: str) -> str:
+        """Strip markdown, code blocks, and other non-speech content."""
+        import re
+        # Remove code blocks
+        text = re.sub(r"```[\s\S]*?```", "", text)
+        # Remove inline code
+        text = re.sub(r"`[^`]+`", "", text)
+        # Remove markdown links, keep text: [text](url) → text
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        # Remove markdown headers
+        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+        # Remove bold/italic markers
+        text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+        text = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", text)
+        # Remove bullet points
+        text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+        # Remove numbered lists prefix
+        text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+        # Collapse whitespace
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """Split text into sentences for incremental TTS."""
+        import re
+        # Split on sentence-ending punctuation followed by space or end
+        parts = re.split(r'(?<=[.!?])\s+', text.strip())
+        return [s for s in parts if s.strip()]
+
+    def _generate_audio(self, text: str) -> tuple[Any, int] | None:
+        """Generate speech for a text chunk. Returns (audio_np, sample_rate) or None."""
+        import numpy as np
+        kwargs: dict[str, Any] = {"text": text}
+        if self.config.tts_voice:
+            kwargs["voice"] = self.config.tts_voice
+        chunks = []
+        sr = self.config.tts_sample_rate
+        for result in self._tts_model.generate(**kwargs):
+            if result.audio is not None:
+                chunks.append(np.asarray(result.audio, dtype=np.float32))
+                sr = getattr(result, "sample_rate", sr)
+        if not chunks:
+            return None
+        audio = self._normalize_audio(np.concatenate(chunks))
+        # Apply speed multiplier via sample rate
+        playback_sr = int(sr * self.config.tts_speed)
+        return audio, playback_sr
+
     def speak(self, text: str) -> None:
-        """Generate speech and play it through speakers."""
+        """Generate speech sentence by sentence, overlapping generation and playback."""
         self._load_tts()
         try:
             import sounddevice as sd
@@ -253,57 +415,54 @@ class VoiceOutput:
                 "Install with: brew install portaudio && pip install sounddevice"
             )
 
-        kwargs: dict[str, Any] = {"text": text}
-        if self.config.tts_voice:
-            kwargs["voice"] = self.config.tts_voice
+        text = self.clean_text_for_speech(text)
+        if not text:
+            return
 
-        for result in self._tts_model.generate(**kwargs):
-            audio = result.audio
-            if audio is not None:
-                sr = getattr(result, "sample_rate", self.config.tts_sample_rate)
-                sd.play(audio, samplerate=sr)
-                sd.wait()
+        sentences = self._split_sentences(text)
+        if not sentences:
+            return
 
-    def speak_streamed(self, text: str) -> None:
-        """Generate speech with streaming playback (lower latency)."""
-        self._load_tts()
-        try:
-            import sounddevice as sd
-            import numpy as np
-        except ImportError:
-            raise ImportError(
-                "sounddevice and numpy required. "
-                "Install with: pip install sounddevice numpy"
-            )
+        # Generate first sentence synchronously
+        result = self._generate_audio(sentences[0])
+        if result is None:
+            return
 
-        kwargs: dict[str, Any] = {"text": text}
-        if self.config.tts_voice:
-            kwargs["voice"] = self.config.tts_voice
+        for i in range(len(sentences)):
+            audio, sr = result  # type: ignore[misc]
 
-        for result in self._tts_model.generate(**kwargs):
-            audio = result.audio
-            if audio is not None:
-                sr = getattr(result, "sample_rate", self.config.tts_sample_rate)
-                sd.play(audio, samplerate=sr)
-                sd.wait()
+            # Start playback of current sentence
+            sd.play(audio, samplerate=sr)
+
+            # Generate next sentence in parallel while audio plays
+            next_result = None
+            if i + 1 < len(sentences):
+                next_result = self._generate_audio(sentences[i + 1])
+
+            # Wait for current playback to finish
+            sd.wait()
+            result = next_result
+            if result is None and i + 1 < len(sentences):
+                break
 
     def save(self, text: str, path: str | Path) -> Path:
         """Generate speech and save to a WAV file."""
         self._load_tts()
         import soundfile as sf
+        import numpy as np
 
+        text = self.clean_text_for_speech(text)
         path = Path(path)
-        all_audio = []
+        all_audio: list[Any] = []
         sr = self.config.tts_sample_rate
 
         for result in self._tts_model.generate(text=text):
             if result.audio is not None:
-                all_audio.append(result.audio)
+                all_audio.append(np.asarray(result.audio, dtype=np.float32))
                 sr = getattr(result, "sample_rate", sr)
 
         if all_audio:
-            import numpy as np
-            combined = np.concatenate(all_audio)
+            combined = self._normalize_audio(np.concatenate(all_audio))
             sf.write(str(path), combined, sr)
 
         return path

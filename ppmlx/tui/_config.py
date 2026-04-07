@@ -85,6 +85,25 @@ def config_menu() -> None:
     cur_logging = data.get("logging", {}).get("enabled", True)
     cur_analytics = data.get("analytics", {}).get("enabled", False)
 
+    # Voice settings
+    voice = data.get("voice", {})
+    cur_stt_model = voice.get("stt_model", "mlx-community/whisper-large-v3-turbo-q4")
+    cur_tts_model = voice.get("tts_model", "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit")
+    cur_tts_voice = voice.get("tts_voice", "")
+    cur_tts_speed = voice.get("tts_speed", 1.0)
+    cur_tts_volume = voice.get("tts_volume", 1.10)
+    cur_ptt_mode = voice.get("ptt_mode", False)
+    cur_ptt_key = voice.get("ptt_key", "space")
+    cur_silence_threshold = voice.get("silence_threshold", 0.01)
+    cur_silence_duration = voice.get("silence_duration", 1.5)
+
+    tts_speed_options = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]
+    tts_volume_options = [0.5, 0.7, 0.85, 1.0, 1.10, 1.25, 1.5]
+    silence_dur_options = [0.5, 1.0, 1.5, 2.0, 3.0]
+    tts_speed_options = _ensure_in(tts_speed_options, cur_tts_speed)
+    tts_volume_options = _ensure_in(tts_volume_options, cur_tts_volume)
+    silence_dur_options = _ensure_in(silence_dur_options, cur_silence_duration)
+
     if cur_ta not in ta_modes:
         cur_ta = "no_tools_only"
     if cur_refresh not in refresh_modes:
@@ -141,6 +160,23 @@ def config_menu() -> None:
               refresh_modes,
               {"always": "Always", "weekly": "Weekly", "monthly": "Monthly", "never": "Never"}),
 
+        _Group("Voice"),
+        _Item("stt_model", "STT Model", "text"),
+        _Item("tts_model", "TTS Model", "text"),
+        _Item("tts_voice", "TTS Voice", "text"),
+        _Item("tts_speed", "TTS Speed", "cycle",
+              tts_speed_options,
+              {v: f"{v}x" for v in tts_speed_options}),
+        _Item("tts_volume", "TTS Volume", "cycle",
+              tts_volume_options,
+              {v: f"{v}" for v in tts_volume_options}),
+        _Item("ptt_mode", "Push-to-Talk", "toggle",
+              labels={True: "Enabled", False: "Disabled"}),
+        _Item("ptt_key", "PTT Key", "text"),
+        _Item("silence_duration", "Silence Duration", "cycle",
+              silence_dur_options,
+              {v: f"{v}s" for v in silence_dur_options}),
+
         _Group("Other"),
         _Item("hf_token", "HuggingFace Token", "text"),
         _Item("logging", "Request Logging", "toggle",
@@ -173,6 +209,14 @@ def config_menu() -> None:
         "effort_base": effort_base_options.index(cur_effort),
         "reg_enabled": cur_reg_enabled,
         "refresh": refresh_modes.index(cur_refresh),
+        "stt_model": cur_stt_model,
+        "tts_model": cur_tts_model,
+        "tts_voice": cur_tts_voice,
+        "tts_speed": tts_speed_options.index(cur_tts_speed),
+        "tts_volume": tts_volume_options.index(cur_tts_volume),
+        "ptt_mode": cur_ptt_mode,
+        "ptt_key": cur_ptt_key,
+        "silence_duration": silence_dur_options.index(cur_silence_duration),
         "hf_token": cur_hf_token,
         "logging": cur_logging,
         "analytics": cur_analytics,
@@ -285,6 +329,15 @@ def config_menu() -> None:
         data["thinking"]["effort_base"] = effort_base_options[state["effort_base"]]
         data.setdefault("registry", {})["enabled"] = state["reg_enabled"]
         data["registry"]["refresh"] = refresh_modes[state["refresh"]]
+        v = data.setdefault("voice", {})
+        v["stt_model"] = state["stt_model"]
+        v["tts_model"] = state["tts_model"]
+        v["tts_voice"] = state["tts_voice"] or None
+        v["tts_speed"] = tts_speed_options[state["tts_speed"]]
+        v["tts_volume"] = tts_volume_options[state["tts_volume"]]
+        v["ptt_mode"] = state["ptt_mode"]
+        v["ptt_key"] = state["ptt_key"]
+        v["silence_duration"] = silence_dur_options[state["silence_duration"]]
         data.setdefault("auth", {})["hf_token"] = state["hf_token"]
         data.setdefault("logging", {})["enabled"] = state["logging"]
         data.setdefault("analytics", {})["enabled"] = state["analytics"]

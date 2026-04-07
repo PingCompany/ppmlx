@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-04-07
+
+### Added
+- **Overlapped TTS playback**: generate sentence N+1 while playing sentence N for ~2x faster voice responses
+- **Sentence-level TTS streaming**: speak sentence by sentence instead of waiting for full response
+- **Voice config in TUI**: `ppmlx config` now has a Voice section — STT/TTS model, voice, speed, volume, PTT mode/key, silence duration
+- **TTS speed control**: `tts_speed` setting (0.8x–1.5x) adjusts playback rate without re-generation
+- **TTS volume normalization**: `tts_volume` setting (default 1.10) with DC offset removal for cleaner audio
+- **Auto-download voice models**: installing the voice addon now pre-downloads default STT and TTS models
+- **HF token propagation**: `hf_token` from ppmlx config is now passed to huggingface_hub in voice mode (fixes unauthenticated download warnings)
+- **Text cleaning for TTS**: strips markdown, code blocks, links, and formatting before speech generation
+
+### Fixed
+- **Voice exit handling**: auto-silence mode now shows a text prompt — Enter for voice, or type `/exit` to quit; double Ctrl+C also exits
+- **Recording stops on silence before speech**: fixed premature recording stop by waiting for speech before silence detection
+- **Hidden HF progress bars**: suppressed noisy `tqdm`/`huggingface_hub` output during model loading with clean Rich spinners instead
+- **STT model compatibility**: switched default from `whisper-large-v3-turbo-4bit` (incompatible `model.safetensors`) to `whisper-large-v3-turbo-q4` (`weights.npz`)
+- **`NameError: log`** crash on STT preload failure in agent CLI
+
+### Changed
+- Default STT model: `whisper-large-v3-turbo` → `whisper-large-v3-turbo-q4` (~400 MB, 4x smaller)
+
 ## [0.8.2] - 2026-04-07
 
 ### Added
