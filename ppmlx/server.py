@@ -1070,7 +1070,7 @@ def _stream_chat(
 
                     # Detect template-injected thinking (Qwen3, DeepSeek-R1)
                     try:
-                        lm = engine._get_or_load(repo_id)
+                        lm = engine.load(repo_id)
                         prompt = engine._apply_chat_template(lm, messages, enable_thinking=True)
                         if re.search(r"<think>\s*$", prompt):
                             inside_think = True

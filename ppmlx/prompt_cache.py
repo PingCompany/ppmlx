@@ -10,6 +10,7 @@ request shares the same system prompt.
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import threading
 from collections import OrderedDict
@@ -100,12 +101,7 @@ class PromptCacheStore:
 
     @staticmethod
     def _make_key(repo_id: str, tokens: tuple[int, ...]) -> str:
-        """Build a cache key from repo_id and token sequence.
-
-        Uses a collision-resistant hash (SHA-1 of raw token bytes) instead
-        of Python's ``hash()`` to avoid silent eviction from hash collisions.
-        """
-        import hashlib
+        """Build a collision-resistant cache key from repo_id and token sequence."""
         h = hashlib.sha1(
             b"".join(t.to_bytes(4, "little", signed=True) for t in tokens)
         ).hexdigest()[:16]
@@ -122,6 +118,9 @@ class PromptCacheStore:
         *cache* after this call (avoids a potentially expensive copy of
         hundreds of MB of KV tensors).
         """
+        if not self.is_enabled:
+            return
+
         token_tuple = tuple(tokens)
         key = self._make_key(repo_id, token_tuple)
 
@@ -132,7 +131,7 @@ class PromptCacheStore:
             self._entries.move_to_end(key)
 
             while len(self._entries) > self._max_entries:
-                evicted_key, evicted = self._entries.popitem(last=False)
+                evicted_key, _ = self._entries.popitem(last=False)
                 log.debug("Prompt cache evicted: %s", evicted_key)
 
     def clear(self, repo_id: str | None = None) -> None:

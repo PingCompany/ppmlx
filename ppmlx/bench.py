@@ -92,7 +92,6 @@ class IterationResult:
 @dataclass
 class ScenarioStats:
     """Aggregated statistics for a scenario across N iterations."""
-    scenario: str
     label: str
     iterations: list[IterationResult] = field(default_factory=list)
 
@@ -109,7 +108,8 @@ class ScenarioStats:
             return {"avg": 0.0, "stddev": 0.0, "min": 0.0, "max": 0.0}
         n = len(values)
         avg = sum(values) / n
-        variance = sum((v - avg) ** 2 for v in values) / n
+        # Bessel's correction (n-1) for sample stddev; fall back to n=1
+        variance = sum((v - avg) ** 2 for v in values) / max(1, n - 1)
         return {
             "avg": round(avg, 2),
             "stddev": round(math.sqrt(variance), 2),
@@ -293,7 +293,6 @@ class BenchmarkRunner:
 
         for name in self.scenario_names:
             result.scenarios[name] = ScenarioStats(
-                scenario=name,
                 label=SCENARIOS[name]["label"],
             )
 
@@ -475,7 +474,6 @@ def load_results(path: Path) -> BenchmarkResult:
 
     for name, scenario_data in data.get("results", {}).items():
         ss = ScenarioStats(
-            scenario=name,
             label=scenario_data.get("label", name),
         )
         for it_data in scenario_data.get("iterations", []):

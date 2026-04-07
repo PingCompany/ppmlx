@@ -343,11 +343,7 @@ class TextEngine:
         Also infers the tool parser when the chat template is added late
         (mlx-lm only runs inference at load time, before this fallback).
         """
-        if getattr(tokenizer, "chat_template", None):
-            # Template already present — but tool parser may still be missing
-            # if the template was set by this method in a previous call.
-            pass
-        else:
+        if not getattr(tokenizer, "chat_template", None):
             try:
                 from transformers import AutoTokenizer as _AT
                 ref_tok = _AT.from_pretrained(repo_id, trust_remote_code=True)
@@ -355,9 +351,9 @@ class TextEngine:
                 if tmpl:
                     tokenizer.chat_template = tmpl
             except Exception:
-                pass
+                log.debug("Could not fetch chat template for %s", repo_id)
 
-        # If the tokenizer has a chat_template but no tool parser, try to infer one.
+        # Infer tool parser if template is present but parser is missing.
         if (
             getattr(tokenizer, "chat_template", None)
             and not getattr(tokenizer, "has_tool_calling", False)
@@ -379,7 +375,7 @@ class TextEngine:
                         parser_type, repo_id,
                     )
             except Exception:
-                pass
+                log.debug("Tool parser inference failed for %s", repo_id)
 
     def _load_impl(self, repo_id: str) -> LoadedModel:
         """Actually load a model using mlx_lm.load. Called under lock."""
@@ -415,10 +411,6 @@ class TextEngine:
             self._emit_event("unload", evicted_id)
         self._emit_event("load", repo_id)
         return lm
-
-    def _get_or_load(self, repo_id: str) -> LoadedModel:
-        """Get from cache or load; moves to end of LRU."""
-        return self.load(repo_id)
 
     def _emit_event(self, event: str, repo_id: str) -> None:
         """Log model lifecycle event to DB (best-effort)."""
@@ -506,6 +498,9 @@ class TextEngine:
         if cache is None:
             return len(prompt_tokens_list)
 
+        # After _prefill_with_cache, the cache covers ALL prompt tokens.
+        # generate_step requires ≥1 prompt token, so trim the last one
+        # from the cache and pass it as the prompt seed.
         if can_trim_prompt_cache(cache):
             trim_prompt_cache(cache, 1)
         kwargs["prompt"] = mx.array([prompt_tokens_list[-1]])
@@ -585,7 +580,7 @@ class TextEngine:
             except (ImportError, TypeError):
                 pass
         if draft_model is not None:
-            draft_lm = self._get_or_load(draft_model)
+            draft_lm = self.load(draft_model)
             kwargs["draft_model"] = draft_lm.model
             kwargs["num_draft_tokens"] = num_draft_tokens
         return kwargs
@@ -613,7 +608,7 @@ class TextEngine:
         """
         from mlx_lm import generate as mlx_generate
 
-        lm = self._get_or_load(repo_id)
+        lm = self.load(repo_id)
         if max_tokens is None:
             max_tokens = _auto_max_tokens(lm)
         prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking, tools=tools)
@@ -636,10 +631,10 @@ class TextEngine:
 
         # Estimate token counts (reuse cached count when available)
         try:
-            prompt_tokens = cached_prompt_len or len(lm.tokenizer.encode(prompt))
+            prompt_tokens = cached_prompt_len if cached_prompt_len is not None else len(lm.tokenizer.encode(prompt))
             completion_tokens = len(lm.tokenizer.encode(text))
         except Exception:
-            prompt_tokens = cached_prompt_len or len(prompt.split())
+            prompt_tokens = cached_prompt_len if cached_prompt_len is not None else len(prompt.split())
             completion_tokens = len(text.split())
 
         reasoning_tokens = 0
@@ -651,15 +646,21 @@ class TextEngine:
                 except Exception:
                     reasoning_tokens = len(reasoning.split())
 
-            # Bug fix: if the model spent all tokens on thinking and returned an
+            # If the model spent all tokens on thinking and returned an
             # empty answer, retry once with thinking disabled.
             if text == "" and reasoning is not None and enable_thinking:
                 log.info("Empty answer after thinking — retrying with enable_thinking=False")
                 retry_prompt = self._apply_chat_template(
                     lm, messages, enable_thinking=False, tools=tools,
                 )
-                retry_kwargs = {**kwargs, "prompt": retry_prompt}
-                text = mlx_generate(lm.model, lm.tokenizer, **retry_kwargs)
+                # Build fresh kwargs — the original may carry a stale prompt_cache
+                retry_kwargs = self._build_mlx_kwargs(
+                    retry_prompt, max_tokens, temperature, top_p,
+                    seed, repetition_penalty, draft_model, num_draft_tokens,
+                )
+                retry_kwargs["verbose"] = False
+                with self._generate_lock:
+                    text = mlx_generate(lm.model, lm.tokenizer, **retry_kwargs)
                 try:
                     completion_tokens = len(lm.tokenizer.encode(text))
                 except Exception:
@@ -695,7 +696,7 @@ class TextEngine:
         """
         from mlx_lm import stream_generate as mlx_stream
 
-        lm = self._get_or_load(repo_id)
+        lm = self.load(repo_id)
         if max_tokens is None:
             max_tokens = _auto_max_tokens(lm)
         prompt = self._apply_chat_template(lm, messages, enable_thinking=enable_thinking, tools=tools)
@@ -728,9 +729,6 @@ class TextEngine:
             return
 
         # State machine to strip <think>...</think> blocks from streamed tokens.
-        # Buffers partial tag matches and only yields text outside think blocks.
-        # State machine to strip <think>...</think> blocks from streamed tokens.
-        # Buffers partial tag matches and only yields text outside think blocks.
         # Qwen3's chat template injects "<think>\n" into the generation prompt,
         # so the model output begins *inside* a think block.
         #
@@ -838,7 +836,7 @@ class TextEngine:
 
     def get_tokenizer(self, repo_id: str) -> Any:
         """Return the tokenizer for a model (loads if needed)."""
-        return self._get_or_load(repo_id).tokenizer
+        return self.load(repo_id).tokenizer
 
     def unload(self, repo_id: str) -> bool:
         """Unload a specific model from cache. Returns True if it was loaded."""

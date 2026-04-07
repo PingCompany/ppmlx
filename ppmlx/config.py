@@ -106,7 +106,7 @@ def get_ppmlx_dir() -> Path:
 
 
 def _parse_bool(v: str) -> bool:
-    return v.lower() not in ("0", "false", "no")
+    return v.lower() not in ("0", "false", "no", "off", "")
 
 
 def _normalize_refresh(value: Any) -> str:
@@ -147,8 +147,13 @@ def load_config(cli_overrides: dict[str, Any] | None = None) -> Config:
         with open(toml_path, "rb") as f:
             data = tomllib.load(f)
         _apply_toml(cfg, data)
-    except Exception:
-        pass
+    except FileNotFoundError:
+        pass  # No config file — use defaults
+    except Exception as exc:
+        import logging
+        logging.getLogger("ppmlx.config").warning(
+            "Failed to load %s: %s — using defaults", toml_path, exc,
+        )
     _apply_env(cfg)
     if cli_overrides:
         _apply_cli(cfg, cli_overrides)

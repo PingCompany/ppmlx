@@ -6,17 +6,14 @@ ppmlx analyzes the request and routes it to the optimal model:
 - **Simple** requests (short prompt, no tools, no images) → small fast model
 - **Complex** requests (long prompt, tools, multi-turn, code) → large capable model
 
-This gives agents near-instant responses for trivial tasks while preserving
-quality for complex reasoning — without any client-side logic.
-
 Configuration via ``~/.ppmlx/config.toml``:
 
 .. code-block:: toml
 
     [router]
     enabled = true
-    small_model = "qwen3.5:0.8b"    # fast model for simple requests
-    large_model = "qwen3.5:9b"      # capable model for complex requests
+    small_model = "qwen3.5:0.8b"
+    large_model = "qwen3.5:9b"
     threshold = 3                     # complexity score threshold (1-10)
 """
 from __future__ import annotations
@@ -28,7 +25,7 @@ from typing import Any
 
 from ppmlx.config import RouterConfig
 
-log = logging.getLogger("ppmlx.engine")
+log = logging.getLogger("ppmlx.router")
 
 
 @dataclass(frozen=True)
@@ -41,28 +38,29 @@ class RouteDecision:
 
 # ── Complexity signals ──────────────────────────────────────────────────
 
+# Match unambiguous code constructs only (avoid natural-language false positives)
 _CODE_PATTERNS = re.compile(
-    r"```|def\s+\w+|class\s+\w+|function\s+|import\s+|#include|"
-    r"SELECT\s+|CREATE\s+TABLE|async\s+def|=>|\.map\(|\.filter\(",
+    r"```|def\s+\w+\(|class\s+\w+[:(]|#include\s*<|"
+    r"SELECT\s+\w+\s+FROM|CREATE\s+TABLE|async\s+def\s",
     re.IGNORECASE,
 )
 
 _REASONING_KEYWORDS = re.compile(
     r"\bexplain\b|\banalyze\b|\bcompare\b|\bdesign\b|\barchitect\b|"
-    r"\bdebug\b|\boptimize\b|\brefactor\b|\breview\b|\bwhy\b.*\?|"
+    r"\bdebug\b|\boptimize\b|\brefactor\b|\breview\b|"
     r"\btrade.?off\b|\bpros?\s+and\s+cons\b|\bstep.by.step\b",
     re.IGNORECASE,
 )
 
 _SIMPLE_PATTERNS = re.compile(
-    r"^(yes|no|ok|sure|thanks|hello|hi|hey|what is|list|show|get|"
+    r"(yes|no|ok|sure|thanks|hello|hi|hey|what is|list|show|get|"
     r"tell me|name|how many|true or false)\b",
     re.IGNORECASE,
 )
 
 
 def _count_tokens_approx(text: str) -> int:
-    """Rough token count (4 chars per token heuristic)."""
+    """Rough token count (~4 chars per token for Latin text)."""
     return max(1, len(text) // 4)
 
 
@@ -85,29 +83,19 @@ def analyze_complexity(
     tools: list[dict] | None = None,
     max_tokens: int | None = None,
 ) -> int:
-    """Score request complexity from 1 (trivial) to 10 (very complex).
-
-    Signals considered:
-    - Message count (multi-turn = more complex)
-    - Total prompt length
-    - Presence of code blocks
-    - Reasoning keywords
-    - Tool calling
-    - Image content
-    - Requested max_tokens
-    """
+    """Score request complexity from 1 (trivial) to 10 (very complex)."""
     score = 1
     text = _extract_text(messages)
     approx_tokens = _count_tokens_approx(text)
 
-    # ── Message count ───────────────────────────────────────────────
+    # Message count (multi-turn = more complex)
     n_msgs = len(messages)
     if n_msgs >= 10:
         score += 2
     elif n_msgs >= 4:
         score += 1
 
-    # ── Prompt length ───────────────────────────────────────────────
+    # Prompt length
     if approx_tokens > 2000:
         score += 3
     elif approx_tokens > 500:
@@ -115,46 +103,54 @@ def analyze_complexity(
     elif approx_tokens > 100:
         score += 1
 
-    # ── Code presence ───────────────────────────────────────────────
+    # Code presence
     code_matches = len(_CODE_PATTERNS.findall(text))
     if code_matches >= 3:
         score += 2
     elif code_matches >= 1:
         score += 1
 
-    # ── Reasoning keywords ──────────────────────────────────────────
+    # Reasoning keywords
     reasoning_matches = len(_REASONING_KEYWORDS.findall(text))
     if reasoning_matches >= 3:
         score += 2
     elif reasoning_matches >= 1:
         score += 1
 
-    # ── Tools ───────────────────────────────────────────────────────
+    # Tools
     if tools:
         score += 1
         if len(tools) > 5:
             score += 1
 
-    # ── Images (multimodal) ─────────────────────────────────────────
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    score += 2
-                    break
+    # Images — add +2 once if any message contains an image
+    has_images = any(
+        isinstance(msg.get("content"), list)
+        and any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for p in msg["content"]
+        )
+        for msg in messages
+    )
+    if has_images:
+        score += 2
 
-    # ── Requested output length ─────────────────────────────────────
+    # Requested output length
     if max_tokens and max_tokens > 4096:
         score += 1
 
-    # ── Simplicity detection (override down) ────────────────────────
+    # Simplicity detection — last user message starts with a simple pattern
     last_user = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             c = msg.get("content", "")
             if isinstance(c, str):
                 last_user = c
+            elif isinstance(c, list):
+                last_user = " ".join(
+                    p.get("text", "") for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
             break
     if last_user and _SIMPLE_PATTERNS.match(last_user.strip()) and approx_tokens < 100:
         score = max(1, score - 2)
@@ -177,9 +173,8 @@ def route(
             complexity_score=score,
             reason=f"complexity={score} >= threshold={config.threshold} -> large model",
         )
-    else:
-        return RouteDecision(
-            model=config.small_model,
-            complexity_score=score,
-            reason=f"complexity={score} < threshold={config.threshold} -> small model",
-        )
+    return RouteDecision(
+        model=config.small_model,
+        complexity_score=score,
+        reason=f"complexity={score} < threshold={config.threshold} -> small model",
+    )

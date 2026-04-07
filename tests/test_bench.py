@@ -40,7 +40,7 @@ def _make_iterations(values: list[tuple[float, float, float, int, int]]) -> list
 
 class TestScenarioStats:
     def test_stats_basic(self):
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([
             (100.0, 50.0, 2000.0, 10, 100),
             (120.0, 60.0, 1800.0, 10, 120),
@@ -56,17 +56,17 @@ class TestScenarioStats:
         # avg tps = (50+60+55)/3 = 55
         assert stats["tokens_per_sec"]["avg"] == 55.0
 
-        # stddev: sqrt(((50-55)^2 + (60-55)^2 + (55-55)^2) / 3) = sqrt(50/3) ~= 4.08
-        assert abs(stats["tokens_per_sec"]["stddev"] - 4.08) < 0.1
+        # sample stddev (Bessel): sqrt(((50-55)^2 + (60-55)^2 + (55-55)^2) / 2) = sqrt(25) = 5.0
+        assert abs(stats["tokens_per_sec"]["stddev"] - 5.0) < 0.1
 
     def test_stats_empty(self):
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         stats = ss.stats()
         assert stats["ttft_ms"]["avg"] == 0.0
         assert stats["tokens_per_sec"]["avg"] == 0.0
 
     def test_stats_with_errors(self):
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = [
             IterationResult(ttft_ms=100.0, tokens_per_sec=50.0, total_latency_ms=2000.0,
                             prompt_tokens=10, completion_tokens=100),
@@ -80,7 +80,7 @@ class TestScenarioStats:
         assert stats["ttft_ms"]["avg"] == 110.0
 
     def test_successful_property(self):
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = [
             IterationResult(ttft_ms=100.0, tokens_per_sec=50.0, total_latency_ms=2000.0,
                             prompt_tokens=10, completion_tokens=100),
@@ -90,7 +90,7 @@ class TestScenarioStats:
         assert ss.successful[0].ttft_ms == 100.0
 
     def test_single_iteration_stddev_zero(self):
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([(100.0, 50.0, 2000.0, 10, 100)])
         stats = ss.stats()
         assert stats["ttft_ms"]["stddev"] == 0.0
@@ -108,7 +108,7 @@ class TestBenchmarkResult:
             runs=2,
             system_info={"platform": "test", "ram_gb": 32.0},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([
             (100.0, 50.0, 2000.0, 10, 100),
             (120.0, 60.0, 1800.0, 10, 120),
@@ -149,7 +149,7 @@ class TestJsonIO:
             runs=3,
             system_info={"platform": "test"},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([
             (100.0, 50.0, 2000.0, 10, 100),
             (120.0, 60.0, 1800.0, 10, 120),
@@ -186,7 +186,7 @@ class TestJsonIO:
             runs=2,
             system_info={},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = [
             IterationResult(ttft_ms=100.0, tokens_per_sec=50.0, total_latency_ms=2000.0,
                             prompt_tokens=10, completion_tokens=100),
@@ -207,7 +207,7 @@ class TestJsonIO:
             runs=1,
             system_info={"ram_gb": 32},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([(100.0, 50.0, 2000.0, 10, 100)])
         result.scenarios["simple"] = ss
 
@@ -320,7 +320,7 @@ class TestComparison:
             runs=1,
             system_info={},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([(ttft, tps, latency, 10, 100)])
         result.scenarios["simple"] = ss
         return result
@@ -359,7 +359,7 @@ class TestComparison:
         current = BenchmarkResult(
             model="test", timestamp="", runs=1, system_info={},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([(100.0, 50.0, 2000.0, 10, 100)])
         current.scenarios["simple"] = ss
         # baseline has no scenarios — comparison should not crash
@@ -379,7 +379,7 @@ class TestDisplay:
             runs=1,
             system_info={"platform": "test", "ram_gb": 32},
         )
-        ss = ScenarioStats(scenario="simple", label="Simple")
+        ss = ScenarioStats(label="Simple")
         ss.iterations = _make_iterations([(100.0, 50.0, 2000.0, 10, 100)])
         result.scenarios["simple"] = ss
 
