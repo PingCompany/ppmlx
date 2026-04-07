@@ -22,12 +22,6 @@ app = typer.Typer(
     help="Run LLMs locally on Apple Silicon via MLX",
     no_args_is_help=True,
 )
-template_app = typer.Typer(
-    name="template",
-    help="Manage and run prompt templates",
-    no_args_is_help=True,
-)
-app.add_typer(template_app, name="template")
 console = Console()
 
 _VALID_QUANTIZE_BITS = frozenset({2, 3, 4, 6, 8})
@@ -317,7 +311,10 @@ def _start_server_bg(model: str, host: str, port: int) -> subprocess.Popen:
     cmd = [sys.executable, "-m", "ppmlx.cli", "serve", "--host", host, "--port", str(port)]
     if model:
         cmd += ["--model", model]
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    log_path = Path.home() / ".ppmlx" / "server.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w")
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log_file)
 
 
 def _wait_server_ready(host: str, port: int, proc: subprocess.Popen, timeout: int = 30) -> bool:
@@ -416,9 +413,10 @@ def _launch_coding_tool(action: str, model: str, host: str, port: int) -> None:
         raise typer.Exit(1)
 
     if not ready:
+        log_path = Path.home() / ".ppmlx" / "server.log"
         stderr_output = ""
-        if proc.stderr:
-            stderr_output = proc.stderr.read().decode(errors="replace").strip()
+        if log_path.exists():
+            stderr_output = log_path.read_text().strip()
         proc.terminate()
         console.print("[red]Server failed to start within 30 seconds.[/red]")
         if stderr_output:
@@ -656,17 +654,28 @@ def launch(
 @app.command()
 def serve(
     host: Optional[str] = typer.Option(None, help="Bind host"),
-    port: Optional[int] = typer.Option(None, help="Bind port (default: 6767)"),
+    port: Optional[int] = typer.Option(None, help="Bind port (default: 6767, or 6768 with --gateway)"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Pre-load a model on startup"),
     embed_model: Optional[str] = typer.Option(None, "--embed-model", help="Pre-load an embedding model"),
     no_cors: bool = typer.Option(False, "--no-cors", help="Disable CORS"),
     interactive: bool = typer.Option(False, "--interactive", "-i", help="Interactively select a model to serve"),
     batch_mode: bool = typer.Option(False, "--batch", help="Enable continuous batching for concurrent requests"),
+    gateway_mode: bool = typer.Option(False, "--gateway", help="Run as smart routing gateway (local + cloud)"),
+    local_server: Optional[str] = typer.Option(None, "--local-server", help="Local ppmlx server URL (only with --gateway)"),
 ):
-    """Start the OpenAI-compatible API server."""
+    """Start the OpenAI-compatible API server.
+
+    With --gateway, runs as a smart routing proxy that routes requests
+    to local ppmlx models or cloud providers (OpenAI, Anthropic) based
+    on model name patterns configured in ~/.ppmlx/config.toml.
+    """
     import uvicorn
     from ppmlx.config import load_config
     from ppmlx import __version__
+
+    if gateway_mode:
+        _serve_gateway(host=host, port=port, local_server=local_server)
+        return
 
     overrides = {}
     if host: overrides["host"] = host
@@ -730,6 +739,13 @@ def serve(
         border_style="blue",
     ))
 
+    if model:
+        from ppmlx.server import set_preload_model
+        set_preload_model(model)
+    if embed_model:
+        from ppmlx.server import set_preload_embed_model
+        set_preload_embed_model(embed_model)
+
     if batch_mode:
         from ppmlx.server import set_batch_mode
         set_batch_mode(True)
@@ -747,39 +763,18 @@ def serve(
     )
 
 
-@app.command()
-def gateway(
-    host: Optional[str] = typer.Option(None, help="Bind host (default: 127.0.0.1)"),
-    port: Optional[int] = typer.Option(None, help="Bind port (default: 6768)"),
-    local_server: Optional[str] = typer.Option(None, "--local-server", help="Local ppmlx server URL (default: http://127.0.0.1:6767)"),
+def _deprecated(old: str, new: str):
+    console.print(f"[yellow]'ppmlx {old}' is deprecated. Use 'ppmlx {new}' instead.[/yellow]")
+
+
+def _serve_gateway(
+    host: str | None = None,
+    port: int | None = None,
+    local_server: str | None = None,
 ):
-    """Start the smart API gateway that routes between local and cloud models.
-
-    Routes requests to local ppmlx models or cloud providers (OpenAI, Anthropic)
-    based on model name patterns configured in ~/.ppmlx/config.toml.
-
-    Example config:
-
-        [gateway]
-        port = 6768
-
-        [[gateway.routes]]
-        pattern = "gpt-*"
-        backend = "openai"
-        api_key_env = "OPENAI_API_KEY"
-
-        [[gateway.routes]]
-        pattern = "claude-*"
-        backend = "anthropic"
-        api_key_env = "ANTHROPIC_API_KEY"
-
-        [[gateway.routes]]
-        pattern = "*"
-        backend = "local"
-        fallback = "openai"
-    """
+    """Internal: start the gateway server."""
     import uvicorn
-    from ppmlx.gateway import load_gateway_config, build_routing_table, create_gateway_app
+    from ppmlx.gateway import load_gateway_config, build_routing_table, create_gateway_app, RouteConfig
     from ppmlx import __version__
 
     cfg = load_gateway_config()
@@ -790,9 +785,7 @@ def gateway(
     if local_server:
         cfg.local_server = local_server
 
-    # Add default routes if none configured
     if not cfg.routes:
-        from ppmlx.gateway import RouteConfig
         cfg.routes = [
             RouteConfig(pattern="gpt-*", backend="openai", api_key_env="OPENAI_API_KEY"),
             RouteConfig(pattern="claude-*", backend="anthropic", api_key_env="ANTHROPIC_API_KEY"),
@@ -800,8 +793,6 @@ def gateway(
         ]
 
     routing_table = build_routing_table(cfg)
-
-    # Build routing info string
     route_lines = []
     for r in routing_table:
         route_lines.append(f"     {r['pattern']:20s} -> {r['backend']:12s} (fallback: {r['fallback']})")
@@ -836,59 +827,15 @@ def gateway(
     )
 
 
-@app.command()
-def launch(
-    action: Optional[str] = typer.Argument(None, help="Action: run, claude, codex, opencode, pi"),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model name or alias"),
+@app.command(hidden=True)
+def gateway(
     host: Optional[str] = typer.Option(None, help="Bind host"),
-    port: Optional[int] = typer.Option(None, help="Bind port (default: 6767)"),
-    no_cors: bool = typer.Option(False, "--no-cors", help="Disable CORS"),
-    flush: bool = typer.Option(False, "--flush", "-f", help="Kill any process using the port before starting"),
+    port: Optional[int] = typer.Option(None, help="Bind port"),
+    local_server: Optional[str] = typer.Option(None, "--local-server", help="Local ppmlx server URL"),
 ):
-    """Select an action and model, then launch.
-
-    Without arguments, opens an interactive TUI picker.
-    With ACTION and MODEL, launches directly (non-interactive).
-    """
-    from ppmlx.models import list_local_models, DEFAULT_ALIASES
-    from ppmlx.config import load_config
-
-    valid_actions = {item.key for item in _LAUNCH_ITEMS}
-
-    overrides = {k: v for k, v in [("host", host), ("port", port)] if v}
-    cfg = load_config(cli_overrides=overrides)
-    effective_host = host or cfg.server.host
-    effective_port = port or cfg.server.port
-
-    if flush:
-        _flush_port(effective_host, effective_port)
-
-    if action and model:
-        if action not in valid_actions:
-            console.print(f"[red]Unknown action '{action}'. Valid: {', '.join(sorted(valid_actions))}[/red]")
-            raise typer.Exit(1)
-    elif action and not model:
-        if action in valid_actions:
-            console.print(f"[red]MODEL argument is required when ACTION is specified.[/red]")
-            raise typer.Exit(1)
-        # Single arg that's not a valid action — fall through to TUI
-        local_models = list_local_models()
-        action, model = _launch_tui(local_models, DEFAULT_ALIASES)
-    else:
-        local_models = list_local_models()
-        action, model = _launch_tui(local_models, DEFAULT_ALIASES)
-
-    if not action:
-        raise typer.Exit()
-
-    if not model:
-        console.print("[yellow]No model selected. Press \u2192 in the menu to pick one.[/yellow]")
-        raise typer.Exit(1)
-
-    if action == "run":
-        run(model=model, system=None, max_kv_size=None, temperature=None, max_tokens=None)
-    else:
-        _launch_coding_tool(action, model, effective_host, effective_port)
+    """Deprecated: use 'ppmlx serve --gateway' instead."""
+    _deprecated("gateway", "serve --gateway")
+    _serve_gateway(host=host, port=port, local_server=local_server)
 
 
 @app.command()
@@ -1459,11 +1406,43 @@ def pull(
     do_quantize: bool = typer.Option(False, "--quantize", "-q", help="Quantize the model after downloading"),
     bits: int = typer.Option(4, "--bits", help="Quantization bit depth (2, 3, 4, 6, or 8)"),
     keep_original: bool = typer.Option(False, "--keep-original", help="Keep the full-precision download after quantization"),
+    group_size: int = typer.Option(64, "--group-size", help="Quantization group size (only with --quantize)"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory for quantized model"),
+    upload_repo: Optional[str] = typer.Option(None, "--upload-repo", help="HF repo to upload quantized model to"),
 ):
-    """Download a model from HuggingFace Hub (interactive multiselect when no model given)."""
+    """Download a model from HuggingFace Hub (interactive multiselect when no model given).
+
+    With --quantize, also converts the model to MLX quantized format.
+    Use --group-size, --output, --upload-repo for advanced quantization options.
+    """
     if do_quantize and bits not in _VALID_QUANTIZE_BITS:
         console.print(f"[red]Invalid --bits value: {bits}. Must be one of {sorted(_VALID_QUANTIZE_BITS)}.[/red]")
         raise typer.Exit(1)
+
+    # Standalone quantize mode: model is already local, skip download
+    if do_quantize and model and (group_size != 64 or output or upload_repo):
+        from ppmlx.models import get_model_path, resolve_alias
+        try:
+            repo_id = resolve_alias(model)
+        except Exception:
+            repo_id = model
+        local_path = get_model_path(repo_id)
+        if local_path:
+            from ppmlx.quantize import quantize as do_quant, QuantizeConfig
+            cfg = QuantizeConfig(
+                bits=bits,
+                group_size=group_size,
+                output_path=Path(output) if output else None,
+                upload_repo=upload_repo,
+                hf_token=token,
+            )
+            try:
+                path = do_quant(model, cfg, progress_callback=lambda msg: console.print(f"[blue]{msg}[/blue]"))
+                console.print(f"[green]Quantized model saved to: {path}[/green]")
+            except Exception as e:
+                console.print(f"[red]Quantization failed: {e}[/red]")
+                raise typer.Exit(1)
+            return
 
     if model is None:
         from ppmlx.tui import pick_models
@@ -1481,11 +1460,18 @@ def pull(
         raise typer.Exit(1)
 
 
-@app.command(name="list")
+list_app = typer.Typer(name="list", help="List models and manage aliases/favorites", invoke_without_command=True)
+app.add_typer(list_app, name="list")
+
+
+@list_app.callback(invoke_without_command=True)
 def list_models(
+    ctx: typer.Context,
     all_models: bool = typer.Option(False, "--all", "-a", help="Show all models (local + registry)"),
 ):
-    """List models. Shows downloaded models by default, --all includes registry."""
+    """List models with ★ for favorites. Subcommands: alias, fav."""
+    if ctx.invoked_subcommand is not None:
+        return
     _track_usage("list_models", {"all_models": all_models})
 
     rows = _build_picker_rows(local_only=not all_models)
@@ -1496,6 +1482,116 @@ def list_models(
     from ppmlx.tui import browse_models
     title = "Models" if all_models else "Local Models"
     browse_models(rows, title=title, command_str="ppmlx list")
+
+
+@list_app.command(name="alias")
+def list_alias():
+    """Interactively add or remove model aliases."""
+    import questionary
+    from ppmlx.models import load_user_aliases, save_user_alias, remove_user_alias, list_local_models
+
+    user_aliases = load_user_aliases()
+
+    action = questionary.select(
+        "Manage aliases:",
+        choices=[
+            questionary.Choice("Add a new alias", value="add"),
+            questionary.Choice("Remove an alias", value="remove"),
+            questionary.Choice("Show all aliases", value="show"),
+        ],
+    ).ask()
+    if not action:
+        raise typer.Exit()
+
+    if action == "show":
+        records = _build_model_records(exclude_embed=False)
+        if not records:
+            console.print("[dim]No aliases configured.[/dim]")
+            return
+        table = _model_table(records, title="Model Aliases", show_repo=True, show_source=True, show_size=False)
+        console.print(table)
+        return
+
+    if action == "add":
+        local_models = list_local_models()
+        if not local_models:
+            console.print("[yellow]No local models found. Run: ppmlx pull <model>[/yellow]")
+            raise typer.Exit(1)
+        choices = [
+            questionary.Choice(f"{m['alias']:<24} {m['repo_id']}", value=m["repo_id"])
+            for m in sorted(local_models, key=lambda x: x["alias"])
+        ]
+        repo = questionary.select("Select a model to alias:", choices=choices).ask()
+        if not repo:
+            raise typer.Exit()
+        name = questionary.text(
+            "Alias name:",
+            validate=lambda v: True if v.strip() else "Alias cannot be empty",
+        ).ask()
+        if not name:
+            raise typer.Exit()
+        save_user_alias(name.strip(), repo)
+        console.print(f"[green]Alias created: [bold]{name.strip()}[/bold] -> {repo}[/green]")
+        return
+
+    if action == "remove":
+        if not user_aliases:
+            console.print("[dim]No user aliases to remove.[/dim]")
+            raise typer.Exit()
+        choices = [questionary.Choice(f"{k} -> {v}", value=k) for k, v in user_aliases.items()]
+        selected = questionary.select("Remove alias:", choices=choices).ask()
+        if not selected:
+            raise typer.Exit()
+        remove_user_alias(selected)
+        console.print(f"[green]Removed alias: [bold]{selected}[/bold][/green]")
+
+
+@list_app.command(name="fav")
+def list_fav():
+    """Interactively toggle favorite models (yes/no per model)."""
+    import questionary
+    from ppmlx.models import list_local_models, load_favorites, add_favorite, remove_favorite
+
+    local_models = list_local_models()
+    if not local_models:
+        console.print("[yellow]No local models found. Run: ppmlx pull <model>[/yellow]")
+        raise typer.Exit(1)
+
+    current_favs = set(load_favorites())
+    sorted_models = sorted(local_models, key=lambda x: x["alias"])
+
+    choices = [
+        questionary.Choice(
+            f"{'★ ' if m['alias'] in current_favs else '  '}{m['alias']}",
+            value=m["alias"],
+            checked=m["alias"] in current_favs,
+        )
+        for m in sorted_models
+    ]
+
+    selected = questionary.checkbox(
+        "Select favorites (space to toggle):",
+        choices=choices,
+    ).ask()
+
+    if selected is None:
+        raise typer.Exit()
+
+    new_favs = set(selected)
+    added = new_favs - current_favs
+    removed = current_favs - new_favs
+
+    for m in added:
+        add_favorite(m)
+    for m in removed:
+        remove_favorite(m)
+
+    if added:
+        console.print(f"[green]★ Added: {', '.join(sorted(added))}[/green]")
+    if removed:
+        console.print(f"[yellow]Removed: {', '.join(sorted(removed))}[/yellow]")
+    if not added and not removed:
+        console.print("[dim]No changes.[/dim]")
 
 
 @app.command()
@@ -1536,121 +1632,42 @@ def rm(
             console.print(f"[red]Failed to remove {m}[/red]")
 
 
-@app.command(name="alias")
-def add_alias(
-    name: Optional[str] = typer.Argument(None, help="Alias name (e.g. my-model)"),
-    repo: Optional[str] = typer.Argument(None, help="HuggingFace repo ID (e.g. org/model)"),
+@app.command(name="alias", hidden=True)
+def add_alias_deprecated(
+    name: Optional[str] = typer.Argument(None),
+    repo: Optional[str] = typer.Argument(None),
 ):
-    """Add a custom model alias. Interactive when called without arguments."""
-    from ppmlx.models import save_user_alias
-
-    if name is None or repo is None:
-        import questionary
-        from ppmlx.models import list_local_models
-        local_models = list_local_models()
-        if not local_models:
-            console.print("[yellow]No local models found. Run: ppmlx pull <model>[/yellow]")
-            raise typer.Exit(1)
-
-        choices = [
-            questionary.Choice(
-                f"{m['alias']:<24} {m['repo_id']}",
-                value=m["repo_id"],
-            )
-            for m in sorted(local_models, key=lambda x: x["alias"])
-        ]
-        if repo is None:
-            repo = questionary.select(
-                "Select a model to alias:", choices=choices,
-            ).ask()
-            if not repo:
-                raise typer.Exit()
-
-        if name is None:
-            name = questionary.text(
-                "Alias name:",
-                validate=lambda v: True if v.strip() else "Alias cannot be empty",
-            ).ask()
-            if not name:
-                raise typer.Exit()
-            name = name.strip()
-
-    save_user_alias(name, repo)
-    console.print(f"[green]Alias created: [bold]{name}[/bold] -> {repo}[/green]")
+    """Deprecated: use 'ppmlx list alias' instead."""
+    _deprecated("alias", "list alias")
+    list_alias()
 
 
-@app.command()
+@app.command(hidden=True)
 def aliases():
-    """Show all model aliases (built-in + custom + registry)."""
-    records = _build_model_records(exclude_embed=False)
-    if not records:
-        console.print("[dim]No aliases configured.[/dim]")
-        return
-    table = _model_table(
-        records,
-        title="Model Aliases",
-        show_repo=True,
-        show_source=True,
-        show_size=False,
-    )
-    console.print(table)
-    try:
-        from ppmlx.registry import registry_meta
-        meta = registry_meta()
-        console.print(f"[dim]Registry: {meta['count']} models, updated {meta['updated']}[/dim]")
-    except Exception:
-        pass
+    """Deprecated: use 'ppmlx list alias' instead."""
+    _deprecated("aliases", "list alias")
+    list_alias()
 
 
-@app.command()
-def fav(
-    model: Optional[str] = typer.Argument(None, help="Model alias to add to favorites"),
-):
-    """Add a model to your favorites list."""
-    if not model:
-        model = _pick_model()
-    from ppmlx.models import add_favorite
-    if add_favorite(model):
-        console.print(f"[green]★ Added [bold]{model}[/bold] to favorites[/green]")
-    else:
-        console.print(f"[yellow]{model} is already a favorite.[/yellow]")
+@app.command(hidden=True)
+def fav(model: Optional[str] = typer.Argument(None)):
+    """Deprecated: use 'ppmlx list fav' instead."""
+    _deprecated("fav", "list fav")
+    list_fav()
 
 
-@app.command()
-def unfav(
-    model: Optional[str] = typer.Argument(None, help="Model alias to remove from favorites"),
-):
-    """Remove a model from your favorites list."""
-    if not model:
-        from ppmlx.models import load_favorites
-        favs = load_favorites()
-        if not favs:
-            console.print("[dim]No favorites set.[/dim]")
-            raise typer.Exit()
-        import questionary
-        choices = [questionary.Choice(f, value=f) for f in favs]
-        selected = questionary.select(
-            "Remove from favorites:", choices=choices,
-        ).ask()
-        if not selected:
-            raise typer.Exit()
-        model = selected
-    from ppmlx.models import remove_favorite
-    if remove_favorite(model):
-        console.print(f"[green]Removed [bold]{model}[/bold] from favorites[/green]")
-    else:
-        console.print(f"[yellow]{model} is not a favorite.[/yellow]")
+@app.command(hidden=True)
+def unfav(model: Optional[str] = typer.Argument(None)):
+    """Deprecated: use 'ppmlx list fav' instead."""
+    _deprecated("unfav", "list fav")
+    list_fav()
 
 
-@app.command()
+@app.command(hidden=True)
 def favs():
-    """Show your favorite models."""
-    records = _build_model_records(filter_favorites=True)
-    if not records:
-        console.print("[dim]No favorites yet. Add one with: ppmlx fav <model>[/dim]")
-        return
-    table = _model_table(records, title="★ Favorite Models", show_params=True)
-    console.print(table)
+    """Deprecated: use 'ppmlx list fav' instead."""
+    _deprecated("favs", "list fav")
+    list_fav()
 
 
 def _format_duration(seconds: float) -> str:
@@ -1736,42 +1753,31 @@ def ps():
         console.print("[yellow]Server not running. Start it with: ppmlx serve[/yellow]")
 
 
-@app.command()
+@app.command(hidden=True)
 def quantize(
     model: Optional[str] = typer.Argument(None, help="HuggingFace repo ID or alias"),
-    bits: int = typer.Option(4, "--bits", "-b", help="Quantization bits (2,3,4,6,8)"),
+    bits: int = typer.Option(4, "--bits", "-b", help="Quantization bits"),
     group_size: int = typer.Option(64, "--group-size", help="Quantization group size"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory"),
     upload: Optional[str] = typer.Option(None, "--upload-repo", help="HF repo to upload to"),
     token: Optional[str] = typer.Option(None, "--token", help="HuggingFace token"),
 ):
-    """Convert and quantize a HuggingFace model to MLX format."""
-    _track_usage(
-        "quantize_started",
-        {"bits": bits, "group_size": group_size, "upload": bool(upload)},
-    )
-    if not model:
-        model = _pick_model()
-    from ppmlx.quantize import quantize as do_quantize, QuantizeConfig
-
-    cfg = QuantizeConfig(
-        bits=bits,
-        group_size=group_size,
-        output_path=Path(output) if output else None,
-        upload_repo=upload,
-        hf_token=token,
+    """Deprecated: use 'ppmlx pull --quantize' instead."""
+    _deprecated("quantize", "pull --quantize")
+    pull(
+        model=model, token=token, do_quantize=True, bits=bits,
+        keep_original=False, group_size=group_size,
+        output=output, upload_repo=upload,
     )
 
-    try:
-        path = do_quantize(model, cfg, progress_callback=lambda msg: console.print(f"[blue]{msg}[/blue]"))
-        console.print(f"[green]Quantized model saved to: {path}[/green]")
-    except Exception as e:
-        console.print(f"[red]Quantization failed: {e}[/red]")
-        raise typer.Exit(1)
+
+config_app = typer.Typer(name="config", help="Configuration, logs, and benchmarks", invoke_without_command=True)
+app.add_typer(config_app, name="config")
 
 
-@app.command(name="config")
+@config_app.callback(invoke_without_command=True)
 def config_cmd(
+    ctx: typer.Context,
     hf_token: Optional[str] = typer.Option(None, "--hf-token", help="Set HuggingFace token"),
     thinking: Optional[bool] = typer.Option(
         None,
@@ -1799,21 +1805,22 @@ def config_cmd(
         help="Enable or disable anonymous usage analytics.",
     ),
 ):
-    """View or interactively set ppmlx configuration (HF token, defaults, etc.)."""
+    """View or set ppmlx configuration. Subcommands: logs, bench."""
+    if ctx.invoked_subcommand is not None:
+        return
+
     import tomllib
     import tomli_w  # type: ignore[import]
     from ppmlx.config import get_ppmlx_dir
 
     cfg_path = get_ppmlx_dir() / "config.toml"
 
-    # Load existing config
     try:
         with open(cfg_path, "rb") as f:
             data: dict = tomllib.load(f)
     except Exception:
         data = {}
 
-    # Non-interactive: apply any flags passed via CLI
     has_flag = any(v is not None for v in [hf_token, thinking, reasoning_budget, effort_base, max_tools_tokens, analytics])
     if has_flag:
         if hf_token is not None:
@@ -1850,7 +1857,6 @@ def config_cmd(
         console.print(f"[dim]{cfg_path}[/dim]")
         return
 
-    # Interactive TUI config
     from ppmlx.tui import config_menu
     config_menu()
 
@@ -1871,8 +1877,8 @@ def _open_log_db():
     return get_db(db_path)
 
 
-@app.command()
-def logs(
+@config_app.command(name="logs")
+def config_logs(
     limit: int = typer.Option(20, "--limit", "-n", help="Number of requests to show"),
     model: str = typer.Option(None, "--model", "-m", help="Filter by model alias"),
     since: float = typer.Option(None, "--since", "-s", help="Hours to look back"),
@@ -1880,8 +1886,13 @@ def logs(
     slow: float = typer.Option(None, "--slow", help="Min duration in ms"),
     thinking: bool = typer.Option(False, "--thinking", "-t", help="Show only thinking-enabled requests"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+    show_stats: bool = typer.Option(False, "--stats", "-S", help="Show aggregated statistics instead of request list"),
 ):
-    """Query and display request history from the log database."""
+    """Query request history or show aggregated stats (--stats)."""
+    if show_stats:
+        _show_stats(since=since or 24, json_output=json_output)
+        return
+
     from rich.table import Table
 
     db = _open_log_db()
@@ -1958,12 +1969,8 @@ def logs(
     console.print(f"\nShowing {len(rows)} requests | Avg duration: {avg_dur} | Avg tok/s: {avg_tps}")
 
 
-@app.command()
-def stats(
-    since: float = typer.Option(24, "--since", "-s", help="Hours to look back"),
-    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
-):
-    """Display aggregated statistics from the log database."""
+def _show_stats(since: float = 24, json_output: bool = False):
+    """Display aggregated statistics."""
     from rich.table import Table
 
     db = _open_log_db()
@@ -2008,6 +2015,32 @@ def stats(
             f"Avg reasoning tokens: [bold]{t.get('avg_reasoning_tokens', 'N/A')}[/bold]",
             title="Thinking Stats",
         ))
+
+
+# Deprecated top-level shims for logs/stats
+@app.command(hidden=True)
+def logs(
+    limit: int = typer.Option(20, "--limit", "-n"),
+    model: str = typer.Option(None, "--model", "-m"),
+    since: float = typer.Option(None, "--since", "-s"),
+    errors: bool = typer.Option(False, "--errors", "-e"),
+    slow: float = typer.Option(None, "--slow"),
+    thinking: bool = typer.Option(False, "--thinking", "-t"),
+    json_output: bool = typer.Option(False, "--json", "-j"),
+):
+    """Deprecated: use 'ppmlx config logs' instead."""
+    _deprecated("logs", "config logs")
+    config_logs(limit=limit, model=model, since=since, errors=errors, slow=slow, thinking=thinking, json_output=json_output, show_stats=False)
+
+
+@app.command(hidden=True)
+def stats(
+    since: float = typer.Option(24, "--since", "-s"),
+    json_output: bool = typer.Option(False, "--json", "-j"),
+):
+    """Deprecated: use 'ppmlx config logs --stats' instead."""
+    _deprecated("stats", "config logs --stats")
+    _show_stats(since=since, json_output=json_output)
 
 
 # ── RAG commands ───────────────────────────────────────────────────────
@@ -2418,262 +2451,54 @@ def process(
         raise typer.Exit(1)
 
 
-# ── Template commands ──────────────────────────────────────────────────
 
 
-@template_app.command(name="list")
-def template_list():
-    """List all available prompt templates."""
-    from rich.table import Table
-    from ppmlx.templates import list_templates
-
-    templates = list_templates()
-    if not templates:
-        console.print("[dim]No templates found.[/dim]")
-        return
-
-    table = Table(title="Prompt Templates", show_header=True)
-    table.add_column("Name", style="cyan", no_wrap=True)
-    table.add_column("Description")
-    table.add_column("Source", style="dim")
-
-    for t in templates:
-        table.add_row(t.name, t.description, t.source)
-
-    console.print(table)
-    console.print(f"\n[dim]Run a template:  ppmlx template run <name> --var input=\"your text\"[/dim]")
-    console.print(f"[dim]Show details:    ppmlx template show <name>[/dim]")
-
-
-@template_app.command(name="show")
-def template_show(
-    name: str = typer.Argument(..., help="Template name"),
-):
-    """Show details of a prompt template."""
-    from ppmlx.templates import get_template, TemplateNotFoundError
-
-    try:
-        t = get_template(name)
-    except TemplateNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1)
-
-    console.print(Panel(
-        f"[bold]{t.name}[/bold]\n"
-        f"[dim]{t.description}[/dim]\n"
-        f"[dim]Source: {t.source}[/dim]",
-        border_style="cyan",
-    ))
-
-    if t.system:
-        console.print("\n[bold]System prompt:[/bold]")
-        console.print(f"  {t.system}")
-
-    console.print("\n[bold]User prompt template:[/bold]")
-    console.print(f"  {t.prompt}")
-
-    if t.variables:
-        console.print("\n[bold]Variables:[/bold]")
-        for var_name, spec in t.variables.items():
-            req = "[red]required[/red]" if spec.required else f"default: [green]{spec.default}[/green]"
-            desc = f"  {spec.description}" if spec.description else ""
-            console.print(f"  [cyan]{{{{{var_name}}}}}[/cyan]  ({req}){desc}")
-
-    if t.parameters:
-        console.print("\n[bold]Parameters:[/bold]")
-        for k, v in t.parameters.items():
-            console.print(f"  {k}: {v}")
-
-    if t.default_model:
-        console.print(f"\n[bold]Default model:[/bold] {t.default_model}")
-
-
-@template_app.command(name="run")
-def template_run(
-    name: str = typer.Argument(..., help="Template name"),
-    var: list[str] = typer.Option([], "--var", "-v", help="Variable in key=value format (repeatable)"),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model to use (overrides template default)"),
-    raw: bool = typer.Option(False, "--raw", "-r", help="Output raw text without formatting"),
-):
-    """Run a prompt template with variables.
-
-    Variables are passed with --var key=value. The special 'input' variable
-    is read from stdin if not provided and stdin is piped.
-
-    Examples:
-      ppmlx template run summarize --var input="Long text here..."
-      cat file.txt | ppmlx template run summarize
-      echo "Hello world" | ppmlx template run translate --var lang=Spanish
-    """
-    from ppmlx.templates import (
-        get_template, render_template, read_stdin_if_available,
-        TemplateNotFoundError, TemplateMissingVariableError,
-    )
-
-    try:
-        t = get_template(name)
-    except TemplateNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1)
-
-    # Parse --var key=value pairs
-    variables: dict[str, str] = {}
-    for v in var:
-        if "=" not in v:
-            console.print(f"[red]Invalid variable format: '{v}'. Use key=value[/red]")
-            raise typer.Exit(1)
-        key, _, value = v.partition("=")
-        variables[key.strip()] = value.strip()
-
-    # Read stdin for 'input' variable if not provided and stdin is piped
-    if "input" in t.variables and "input" not in variables:
-        stdin_data = read_stdin_if_available()
-        if stdin_data:
-            variables["input"] = stdin_data.strip()
-
-    # Render the template
-    try:
-        system_prompt, user_prompt = render_template(t, variables)
-    except TemplateMissingVariableError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1)
-
-    # Determine which model to use
-    effective_model = model or t.default_model
-    if not effective_model:
-        from ppmlx.config import load_config
-        cfg = load_config()
-        effective_model = cfg.defaults.model
-
-    # Build messages
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_prompt})
-
-    # Get generation parameters from template
-    temperature = t.parameters.get("temperature", 0.7)
-    max_tokens = t.parameters.get("max_tokens", 2048)
-
-    # Run inference
-    from ppmlx.models import resolve_alias, get_model_path, download_model, ModelNotFoundError
-    from ppmlx.engine import get_engine
-
-    try:
-        repo_id = resolve_alias(effective_model)
-    except ModelNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1)
-
-    local_path = get_model_path(repo_id)
-    if not local_path:
-        console.print(f"[yellow]Downloading {effective_model}...[/yellow]")
-        try:
-            local_path = download_model(effective_model)
-        except Exception as e:
-            console.print(f"[red]Download failed: {e}[/red]")
-            raise typer.Exit(1)
-
-    engine = get_engine()
-
-    if not raw:
-        console.print(f"[dim]Template: {t.name} | Model: {effective_model}[/dim]")
-
-    try:
-        for chunk in engine.stream_generate(
-            repo_id, messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        ):
-            if raw:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-            else:
-                console.print(chunk, end="")
-        if raw:
-            sys.stdout.write("\n")
-        else:
-            console.print()
-    except KeyboardInterrupt:
-        console.print("\n[dim]Generation interrupted.[/dim]")
-        raise typer.Exit(1)
-    except Exception as exc:
-        console.print(f"\n[red]Error: {exc}[/red]")
-        raise typer.Exit(1)
-
-
-@template_app.command(name="create")
-def template_create(
-    name: str = typer.Argument(..., help="Name for the new template"),
-    description: str = typer.Option("", "--description", "-d", help="Template description"),
-    system: str = typer.Option("", "--system", "-s", help="System prompt"),
-    prompt: str = typer.Option("", "--prompt", "-p", help="User prompt template (use {{var}} for variables)"),
-):
-    """Create a new user template.
-
-    Templates are saved to ~/.ppmlx/templates/<name>.yaml.
-
-    Example:
-      ppmlx template create my_template \\
-        --description "My custom template" \\
-        --system "You are helpful." \\
-        --prompt "Help me with: {{input}}"
-    """
-    import yaml
-
-    from ppmlx.templates import _user_dir, _VAR_PATTERN
-
-    if not prompt:
-        console.print("[red]--prompt is required. Use {{input}} for the main variable.[/red]")
-        raise typer.Exit(1)
-
-    found_vars = set(_VAR_PATTERN.findall(prompt))
-    if system:
-        found_vars.update(_VAR_PATTERN.findall(system))
-
-    variables: dict[str, dict] = {}
-    for v in sorted(found_vars):
-        variables[v] = {"required": True, "description": f"Value for {v}"}
-
-    template_data = {
-        "name": name,
-        "description": description or f"Custom template: {name}",
-        "system": system,
-        "prompt": prompt,
-        "variables": variables,
-        "parameters": {"temperature": 0.7, "max_tokens": 2048},
-    }
-
-    out_path = _user_dir(create=True) / f"{name}.yaml"
-    out_path.write_text(yaml.dump(template_data, default_flow_style=False, sort_keys=False))
-
-    console.print(f"[green]Template created: {out_path}[/green]")
-    console.print(f"[dim]Run it with: ppmlx template run {name} --var input=\"your text\"[/dim]")
-
-
-@app.command()
-def bench(
+@config_app.command(name="bench")
+def config_bench(
     model: str = typer.Argument(..., help="Model name or alias to benchmark"),
     runs: int = typer.Option(3, "--runs", "-n", help="Number of iterations per scenario"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Save JSON results to this path"),
     scenarios: Optional[str] = typer.Option(None, "--scenarios", "-s", help="Comma-separated scenario names (simple,complex,long_context)"),
     compare: Optional[str] = typer.Option(None, "--compare", "-c", help="Compare against a baseline JSON file"),
+    speculative: bool = typer.Option(False, "--speculative", help="Run twice (normal + speculative) and compare"),
+    draft_model: Optional[str] = typer.Option(None, "--draft-model", "-d", help="Draft model for speculative decoding"),
+    speculative_tokens: Optional[int] = typer.Option(None, "--speculative-tokens", help="Draft tokens per step (default: 5)"),
     host: str = typer.Option("127.0.0.1", "--host", help="Server host"),
     port: int = typer.Option(6767, "--port", "-p", help="Server port"),
     no_auto_server: bool = typer.Option(False, "--no-auto-server", help="Do not auto-start the server"),
 ):
-    """Run standardized benchmarks against a model."""
+    """Run standardized benchmarks against a model.
+
+    Use --speculative to automatically run normal vs speculative decoding
+    comparison. If no --draft-model is specified, ppmlx will auto-detect
+    one from the same model family.
+    """
     from ppmlx.bench import (
         BenchmarkRunner,
         SCENARIOS,
         print_results,
         print_comparison,
+        print_speculative_comparison,
         save_results,
         load_results,
     )
 
     base_url = f"http://{host}:{port}"
     scenario_list = [s.strip() for s in scenarios.split(",")] if scenarios else None
+
+    # Auto-detect draft model for speculative mode
+    if speculative and not draft_model:
+        try:
+            from ppmlx.models import get_draft_model
+            draft_model = get_draft_model(model)
+            if draft_model:
+                console.print(f"[blue]Auto-detected draft model: {draft_model}[/blue]")
+            else:
+                console.print(f"[red]No draft model known for '{model}'. Use --draft-model to specify one.[/red]")
+                raise typer.Exit(1)
+        except ImportError:
+            console.print("[red]Could not import model pairing module.[/red]")
+            raise typer.Exit(1)
 
     # Check if server is already running
     server_proc = None
@@ -2711,11 +2536,16 @@ def bench(
 
     try:
         try:
+            # Run normal benchmark (or speculative-only if draft_model but not --speculative)
+            normal_draft = None if speculative else draft_model
+            normal_spec_tokens = None if speculative else speculative_tokens
             runner = BenchmarkRunner(
                 model=model,
                 base_url=base_url,
                 runs=runs,
                 scenarios=scenario_list,
+                draft_model=normal_draft,
+                speculative_tokens=normal_spec_tokens,
             )
         except ValueError as exc:
             console.print(f"[red]{exc}[/red]")
@@ -2724,12 +2554,42 @@ def bench(
         print_results(result, console)
 
         # Save results
-        if output:
+        if output and not speculative:
             out_path = save_results(result, Path(output))
             console.print(f"\n[green]Results saved to {out_path}[/green]")
 
-        # Compare against baseline
-        if compare:
+        # Speculative comparison mode: run again with draft model
+        if speculative and draft_model:
+            console.print(f"\n[bold blue]Running speculative decoding with draft={draft_model}...[/bold blue]")
+            try:
+                spec_runner = BenchmarkRunner(
+                    model=model,
+                    base_url=base_url,
+                    runs=runs,
+                    scenarios=scenario_list,
+                    draft_model=draft_model,
+                    speculative_tokens=speculative_tokens,
+                )
+            except ValueError as exc:
+                console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(1)
+            spec_result = spec_runner.run()
+            print_results(spec_result, console)
+
+            # Show comparison
+            console.print()
+            print_speculative_comparison(result, spec_result, console)
+
+            # Save both results
+            if output:
+                base_path = Path(output)
+                normal_path = save_results(result, base_path.with_stem(base_path.stem + "_normal"))
+                spec_path = save_results(spec_result, base_path.with_stem(base_path.stem + "_speculative"))
+                console.print(f"\n[green]Normal results: {normal_path}[/green]")
+                console.print(f"[green]Speculative results: {spec_path}[/green]")
+
+        # Compare against baseline (non-speculative mode)
+        elif compare:
             compare_path = Path(compare)
             if not compare_path.exists():
                 console.print(f"[red]Baseline file not found: {compare}[/red]")
@@ -2745,121 +2605,20 @@ def bench(
             server_proc.wait(timeout=5)
 
 
-@app.command()
-def agent(
-    model: Optional[str] = typer.Argument(None, help="Model name or alias"),
-    prompt: Optional[str] = typer.Argument(None, help="Prompt for the agent"),
-    tools: Optional[str] = typer.Option(None, "--tools", help="Comma-separated list of tools to enable (default: all)"),
-    max_iterations: int = typer.Option(10, "--max-iterations", "-n", help="Max tool call rounds"),
-    sandbox: bool = typer.Option(False, "--sandbox", help="Restrict to read-only operations"),
-    system: Optional[str] = typer.Option(None, "--system", "-s", help="System prompt"),
-    temperature: Optional[float] = typer.Option(None, "--temperature", "-t"),
-    max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
-    working_dir: Optional[str] = typer.Option(None, "--working-dir", "-w", help="Working directory for tools"),
+@app.command(hidden=True)
+def bench(
+    model: str = typer.Argument(...),
+    runs: int = typer.Option(3, "--runs", "-n"),
+    output: Optional[str] = typer.Option(None, "--output", "-o"),
+    scenarios: Optional[str] = typer.Option(None, "--scenarios", "-s"),
+    compare: Optional[str] = typer.Option(None, "--compare", "-c"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(6767, "--port", "-p"),
+    no_auto_server: bool = typer.Option(False, "--no-auto-server"),
 ):
-    """Run an agent loop that can execute tool calls."""
-    if not model:
-        model = _pick_model()
-    if not prompt:
-        console.print("[red]A prompt is required. Usage: ppmlx agent <model> \"your prompt\"[/red]")
-        raise typer.Exit(1)
-
-    from ppmlx.models import resolve_alias, get_model_path, download_model, ModelNotFoundError
-    from ppmlx.engine import get_engine
-    from ppmlx.memory import check_memory_warning
-    from ppmlx.agent import AgentConfig, AgentRuntime, AgentStep, BUILTIN_TOOL_NAMES
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-
-    try:
-        repo_id = resolve_alias(model)
-    except ModelNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1)
-
-    local_path = get_model_path(repo_id)
-    if not local_path:
-        console.print(f"[yellow]Model not found locally. Downloading {model}...[/yellow]")
-        try:
-            local_path = download_model(model)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Download cancelled.[/yellow]")
-            raise typer.Exit(1)
-        except Exception as e:
-            console.print(f"[red]Download failed: {e}[/red]")
-            raise typer.Exit(1)
-
-    warning = check_memory_warning(local_path)
-    if warning:
-        console.print(f"[yellow]{warning}[/yellow]")
-
-    # Parse enabled tools
-    enabled_tools: list[str] | None = None
-    if tools:
-        enabled_tools = [t.strip() for t in tools.split(",")]
-        invalid = set(enabled_tools) - BUILTIN_TOOL_NAMES
-        if invalid:
-            console.print(
-                f"[red]Unknown tools: {', '.join(invalid)}. "
-                f"Available: {', '.join(sorted(BUILTIN_TOOL_NAMES))}[/red]"
-            )
-            raise typer.Exit(1)
-
-    cwd = working_dir or os.getcwd()
-
-    config = AgentConfig(
-        model=repo_id,
-        max_iterations=max_iterations,
-        sandbox=sandbox,
-        working_dir=cwd,
-        enabled_tools=enabled_tools,
-        temperature=temperature if temperature is not None else 0.7,
-        max_tokens=max_tokens,
-    )
-
-    def on_step(step: AgentStep) -> None:
-        if step.tool_calls:
-            for i, tc in enumerate(step.tool_calls):
-                tr = step.tool_results[i] if i < len(step.tool_results) else None
-                console.print(
-                    Panel(
-                        f"[bold cyan]{tc['name']}[/bold cyan]({tc['arguments']})",
-                        title=f"[dim]Tool Call (iter {step.iteration + 1})[/dim]",
-                        border_style="cyan",
-                    )
-                )
-                if tr:
-                    style = "red" if tr.is_error else "green"
-                    output_preview = tr.output
-                    if len(output_preview) > 500:
-                        output_preview = output_preview[:500] + "\n... [truncated]"
-                    console.print(
-                        Panel(
-                            output_preview,
-                            title=f"[dim]Result[/dim]",
-                            border_style=style,
-                        )
-                    )
-        if not step.tool_calls and step.assistant_text:
-            console.print()
-            console.print(Markdown(step.assistant_text))
-
-    engine = get_engine()
-    runtime = AgentRuntime(config=config, engine=engine, on_step=on_step)
-
-    console.print(
-        f"[green]Agent running with [bold]{model}[/bold] "
-        f"(max {max_iterations} iterations, "
-        f"{'sandbox' if sandbox else 'full access'})[/green]\n"
-    )
-
-    try:
-        final_answer, steps = runtime.run(prompt=prompt, system_prompt=system)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Agent interrupted.[/yellow]")
-        raise typer.Exit(1)
-
-    console.print(f"\n[dim]Agent completed in {len(steps)} iteration(s).[/dim]")
+    """Deprecated: use 'ppmlx config bench' instead."""
+    _deprecated("bench", "config bench")
+    config_bench(model=model, runs=runs, output=output, scenarios=scenarios, compare=compare, host=host, port=port, no_auto_server=no_auto_server)
 
 
 if __name__ == "__main__":

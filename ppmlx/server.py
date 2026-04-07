@@ -43,6 +43,24 @@ def set_batch_mode(enabled: bool) -> None:
     log.info("Batch mode %s", "enabled" if enabled else "disabled")
 
 
+# Preload flags — set via ``set_preload_model()`` / ``set_preload_embed_model()``
+# before the server starts.  The lifespan handler reads these at startup.
+_preload_model: str | None = None
+_preload_embed_model: str | None = None
+
+
+def set_preload_model(model: str | None) -> None:
+    """Set a model to pre-load during server startup."""
+    global _preload_model
+    _preload_model = model
+
+
+def set_preload_embed_model(model: str | None) -> None:
+    """Set an embedding model to pre-load during server startup."""
+    global _preload_embed_model
+    _preload_embed_model = model
+
+
 def is_batch_mode() -> bool:
     """Return whether batch mode is currently enabled."""
     return _batch_mode
@@ -137,6 +155,29 @@ async def lifespan(app: FastAPI):
         interval = cfg.logging.snapshot_interval_seconds
     except ImportError:
         interval = 60
+
+    # Pre-load models if requested via CLI flags
+    if _preload_model:
+        try:
+            from ppmlx.models import resolve_alias
+            from ppmlx.engine import get_engine
+            repo_id = resolve_alias(_preload_model)
+            log.info("Pre-loading model: %s (%s)", _preload_model, repo_id)
+            await asyncio.to_thread(get_engine().load, repo_id)
+            log.info("Model pre-loaded: %s", _preload_model)
+        except Exception as exc:
+            log.warning("Failed to pre-load model %s: %s", _preload_model, exc)
+
+    if _preload_embed_model:
+        try:
+            from ppmlx.models import resolve_alias
+            from ppmlx.engine_embed import get_embed_engine
+            repo_id = resolve_alias(_preload_embed_model)
+            log.info("Pre-loading embedding model: %s (%s)", _preload_embed_model, repo_id)
+            await asyncio.to_thread(get_embed_engine().load, repo_id)
+            log.info("Embedding model pre-loaded: %s", _preload_embed_model)
+        except Exception as exc:
+            log.warning("Failed to pre-load embedding model %s: %s", _preload_embed_model, exc)
 
     snapshot_task = asyncio.create_task(_snapshot_loop(interval))
 
@@ -781,6 +822,21 @@ async def chat_completions(request: Request):
     except Exception:
         repo_id = model_name
 
+    # Auto-speculative: if no draft model specified, try config default then auto-pairing
+    if draft_model is None and _cfg:
+        if _cfg.defaults.draft_model:
+            draft_model = _cfg.defaults.draft_model
+        elif _cfg.defaults.auto_speculative:
+            try:
+                from ppmlx.models import get_draft_model
+                draft_model = get_draft_model(model_name)
+                if draft_model:
+                    log.info("Auto-speculative: paired %s → draft %s", model_name, draft_model)
+            except Exception:
+                pass
+        if speculative_tokens is None and _cfg.defaults.speculative_tokens:
+            speculative_tokens = _cfg.defaults.speculative_tokens
+
     # Resolve draft model alias (reuses same resolve_alias)
     draft_repo_id: str | None = None
     if draft_model:
@@ -1294,7 +1350,7 @@ async def _nonstream_chat(
             error_message=str(exc),
         )
         log.exception("Chat completion generation failed")
-        raise HTTPException(status_code=503, detail="Model generation failed")
+        raise HTTPException(status_code=503, detail=f"Model generation failed: {exc}")
 
     total_dur = (time.time() - start_ts) * 1000
 
@@ -1398,7 +1454,7 @@ async def completions(request: Request):
         )
     except Exception:
         log.exception("Text completion generation failed")
-        raise HTTPException(status_code=503, detail="Model generation failed")
+        raise HTTPException(status_code=503, detail=f"Model generation failed: {exc}")
 
     return JSONResponse({
         "id": request_id,
@@ -1620,7 +1676,7 @@ async def _async_iter_sync_gen(sync_gen, loop=None):
 
 # ── Shared think-tag stream parser ──────────────────────────────────
 
-async def _parse_think_tags(raw_stream):
+async def _parse_think_tags(raw_stream, *, assume_thinking: bool = True):
     """Parse ``<think>...</think>`` tags from a raw token stream.
 
     Yields tuples describing what was parsed:
@@ -1630,15 +1686,19 @@ async def _parse_think_tags(raw_stream):
     * ``("text", chunk)``  — a chunk of answer text
     * ``("flush_text", full_text)``  — final flush of any buffered text
 
-    Assumes the model may start *inside* a thinking block (Qwen3 injects
-    ``<think>`` into the generation prompt).
+    When *assume_thinking* is True (default), assumes the model starts inside
+    a thinking block (Qwen3 injects ``<think>`` into the generation prompt).
+    Set to False for models that don't use ``<think>`` tags.
     """
-    in_thinking = True  # assume starting inside think block
+    in_thinking = assume_thinking
     buf = ""
     reasoning_text = ""
     full_text = ""
 
     async for chunk in raw_stream:
+        if chunk == "":
+            yield ("keepalive", "")
+            continue
         buf += chunk
         while buf:
             if not in_thinking:
@@ -1782,6 +1842,9 @@ def _stream_responses(
 
                 raw_stream = _async_iter_sync_gen(gen)
                 async for kind, data in _parse_think_tags(raw_stream):
+                    if kind == "keepalive":
+                        yield ": keepalive\n\n"
+                        continue
                     if kind == "thinking":
                         yield _sse("response.reasoning_summary_text.delta", {
                             "output_index": reasoning_idx,
@@ -1963,7 +2026,7 @@ async def _nonstream_responses(
         raise
     except Exception:
         log.exception("Responses generation failed")
-        raise HTTPException(status_code=503, detail="Model generation failed")
+        raise HTTPException(status_code=503, detail=f"Model generation failed: {exc}")
 
     tokenizer = engine.get_tokenizer(repo_id)
     remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=tools)
@@ -2246,16 +2309,26 @@ def _stream_anthropic(
                 _gen_kwargs.pop("reasoning_budget", None)
                 gen = engine.stream_generate(repo_id, messages, **_gen_kwargs)
 
-            # Emit thinking block start immediately (Qwen3 starts inside think)
-            yield _anthropic_sse({
-                "type": "content_block_start",
-                "index": content_idx,
-                "content_block": {"type": "thinking", "thinking": ""},
-            })
-            thinking_started = True
+            # Check if the model actually uses <think> tags
+            from ppmlx.engine import _is_thinking_model
+            _model_thinks = _enable_thinking and _is_thinking_model(
+                engine.get_tokenizer(repo_id)
+            )
+
+            if _model_thinks:
+                # Emit thinking block start immediately (Qwen3 starts inside think)
+                yield _anthropic_sse({
+                    "type": "content_block_start",
+                    "index": content_idx,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                })
+                thinking_started = True
 
             raw_stream = _async_iter_sync_gen(gen)
-            async for kind, chunk in _parse_think_tags(raw_stream):
+            async for kind, chunk in _parse_think_tags(raw_stream, assume_thinking=_model_thinks):
+                if kind == "keepalive":
+                    yield ": keepalive\n\n"
+                    continue
                 if kind == "thinking":
                     if not thinking_started:
                         thinking_started = True
@@ -2420,7 +2493,7 @@ async def _nonstream_anthropic(
             text, reasoning, prompt_tokens, completion_tokens = result[0], result[1], result[2], result[3]
     except Exception:
         log.exception("Anthropic messages generation failed")
-        raise HTTPException(status_code=503, detail="Model generation failed")
+        raise HTTPException(status_code=503, detail=f"Model generation failed: {exc}")
 
     tokenizer = engine.get_tokenizer(repo_id)
     remaining_text, tool_calls = _parse_tool_calls(text, tokenizer=tokenizer, tools=oai_tools)

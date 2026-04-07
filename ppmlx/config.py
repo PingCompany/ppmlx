@@ -29,6 +29,7 @@ class DefaultsConfig:
     max_tokens: int = 2048
     draft_model: str | None = None
     speculative_tokens: int = 5
+    auto_speculative: bool = False  # auto-detect draft models for speculative decoding
 
 
 @dataclass
@@ -45,6 +46,7 @@ class MemoryConfig:
 @dataclass
 class RegistryConfig:
     enabled: bool = True
+    refresh: str = "weekly"  # "always" | "weekly" | "monthly" | "never"
 
 
 @dataclass
@@ -95,6 +97,13 @@ def get_ppmlx_dir() -> Path:
 
 def _parse_bool(v: str) -> bool:
     return v.lower() not in ("0", "false", "no")
+
+
+def _normalize_refresh(value: Any) -> str:
+    raw = str(value).strip().lower()
+    if raw in ("always", "weekly", "monthly", "never"):
+        return raw
+    return "weekly"
 
 
 def _normalize_tool_awareness_mode(value: Any) -> str:
@@ -160,6 +169,7 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         if "max_tokens" in d: cfg.defaults.max_tokens = int(d["max_tokens"])
         if "draft_model" in d: cfg.defaults.draft_model = str(d["draft_model"]) if d["draft_model"] else None
         if "speculative_tokens" in d: cfg.defaults.speculative_tokens = int(d["speculative_tokens"])
+        if "auto_speculative" in d: cfg.defaults.auto_speculative = bool(d["auto_speculative"])
     if "logging" in data:
         lg = data["logging"]
         if "enabled" in lg: cfg.logging.enabled = bool(lg["enabled"])
@@ -171,6 +181,7 @@ def _apply_toml(cfg: Config, data: dict) -> None:
     if "registry" in data:
         r = data["registry"]
         if "enabled" in r: cfg.registry.enabled = bool(r["enabled"])
+        if "refresh" in r: cfg.registry.refresh = _normalize_refresh(r["refresh"])
     if "tool_awareness" in data:
         ta = data["tool_awareness"]
         if "mode" in ta:
@@ -208,10 +219,12 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_MAX_TOKENS": ("defaults", "max_tokens", int),
         "PPMLX_DRAFT_MODEL": ("defaults", "draft_model", str),
         "PPMLX_SPECULATIVE_TOKENS": ("defaults", "speculative_tokens", int),
+        "PPMLX_AUTO_SPECULATIVE": ("defaults", "auto_speculative", _parse_bool),
         "PPMLX_LOG_ENABLED": ("logging", "enabled", _parse_bool),
         "PPMLX_LOG_SNAPSHOT_INTERVAL": ("logging", "snapshot_interval_seconds", int),
         "PPMLX_MEMORY_WIRED_LIMIT": ("memory", "wired_limit_mb", int),
         "PPMLX_REGISTRY_ENABLED": ("registry", "enabled", _parse_bool),
+        "PPMLX_REGISTRY_REFRESH": ("registry", "refresh", _normalize_refresh),
         "PPMLX_INJECT_TOOL_AWARENESS": ("tool_awareness", "mode", _normalize_tool_awareness_mode),
         "PPMLX_THINKING_ENABLED": ("thinking", "enabled", _parse_bool),
         "PPMLX_THINKING_BUDGET": ("thinking", "default_reasoning_budget", int),
@@ -246,6 +259,7 @@ def _apply_cli(cfg: Config, overrides: dict) -> None:
         elif key == "max_tokens": cfg.defaults.max_tokens = int(val)
         elif key == "draft_model": cfg.defaults.draft_model = str(val) if val else None
         elif key == "speculative_tokens": cfg.defaults.speculative_tokens = int(val)
+        elif key == "auto_speculative": cfg.defaults.auto_speculative = bool(val)
 
 
 def check_first_run() -> None:

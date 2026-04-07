@@ -24,6 +24,72 @@ DEFAULT_ALIASES: dict[str, str] = {
     "gpt-oss:120b":       "mlx-community/gpt-oss-120b-4bit",
 }
 
+# ── Draft model pairs (speculative decoding) ──────────────────────────
+# Maps larger model aliases to their smallest same-family sibling.
+# Both models MUST share the same tokenizer vocabulary.
+
+DRAFT_PAIRS: dict[str, str] = {
+    # Qwen 3.5: 0.8B is the draft for all larger variants
+    "qwen3.5:2b":         "qwen3.5:0.8b",
+    "qwen3.5:4b":         "qwen3.5:0.8b",
+    "qwen3.5:9b":         "qwen3.5:0.8b",
+    "qwen3.5:27b":        "qwen3.5:0.8b",
+    "qwen3.5:35b-a3b":    "qwen3.5:0.8b",
+    "qwen3.5:122b-a10b":  "qwen3.5:0.8b",
+    # GPT-OSS: 20B is the draft for 120B
+    "gpt-oss:120b":       "gpt-oss:20b",
+}
+
+
+def get_draft_model(alias_or_repo: str) -> str | None:
+    """Return the recommended draft model alias for speculative decoding.
+
+    Checks:
+    1. Exact alias match in ``DRAFT_PAIRS``
+    2. Reverse lookup: if *alias_or_repo* is a repo ID, find its alias first
+       (checks built-in defaults first, then all registered aliases)
+    3. User-defined draft pairs from ``~/.ppmlx/draft_pairs.json``
+
+    Returns ``None`` if no suitable draft model is known.
+    """
+    # 1. Direct alias match
+    if alias_or_repo in DRAFT_PAIRS:
+        return DRAFT_PAIRS[alias_or_repo]
+
+    # 2. Reverse lookup from repo_id → alias → pair
+    # Check DEFAULT_ALIASES first (always available, no IO needed)
+    for alias, repo_id in DEFAULT_ALIASES.items():
+        if repo_id == alias_or_repo and alias in DRAFT_PAIRS:
+            return DRAFT_PAIRS[alias]
+
+    # Then check all aliases (includes registry and user overrides)
+    try:
+        all_a = all_aliases()
+        for alias, repo_id in all_a.items():
+            if repo_id == alias_or_repo and alias in DRAFT_PAIRS:
+                return DRAFT_PAIRS[alias]
+    except Exception:
+        pass
+
+    # 3. User-defined draft pairs
+    user_pairs = _load_user_draft_pairs()
+    if alias_or_repo in user_pairs:
+        return user_pairs[alias_or_repo]
+
+    return None
+
+
+def _load_user_draft_pairs() -> dict[str, str]:
+    """Load user-defined draft pairs from ``~/.ppmlx/draft_pairs.json``."""
+    p = _get_ppmlx_dir() / "draft_pairs.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
 # Patterns for routing
 _VISION_INDICATORS = ["-VL-", "-vlm"]
 _TEXT_ONLY_INDICATORS = ["-text-", "-Text-", "OptiQ"]
@@ -286,6 +352,7 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     counting while still tracking whichever location is active.
     """
     import threading
+    from rich.console import Console as _Console
     from rich.progress import (
         Progress, BarColumn, DownloadColumn, TransferSpeedColumn,
         TimeRemainingColumn, TextColumn, SpinnerColumn,
@@ -315,10 +382,25 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     prev_hf_env = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+    # Dummy tqdm class to silence the file-count progress bar that
+    # snapshot_download emits even when HF_HUB_DISABLE_PROGRESS_BARS is set.
+    from tqdm.auto import tqdm as _tqdm_base
+    class _SilentTqdm(_tqdm_base):  # type: ignore[type-arg]
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            kw["disable"] = True
+            super().__init__(*a, **kw)
+
     # ── colours ──────────────────────────────────────────────────────
     BLUE, GREEN, ORANGE, RED, WHITE = "blue", "green", "#d78700", "red", "white"
 
     bar = BarColumn(bar_width=None, complete_style=BLUE, finished_style=GREEN)
+    # Fixed-width console prevents re-draw glitches when the terminal
+    # window gains/loses focus or is resized (SIGWINCH).
+    try:
+        _term_width = os.get_terminal_size().columns
+    except OSError:
+        _term_width = 80
+    _dl_console = _Console(width=_term_width)
     with Progress(
         SpinnerColumn(style=WHITE),
         TextColumn("[bold blue]{task.description}"),
@@ -326,6 +408,7 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
         DownloadColumn(),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
+        console=_dl_console,
         refresh_per_second=10,
     ) as progress:
         task = progress.add_task(f"↓ {alias_or_repo}", total=total)
@@ -340,6 +423,7 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
                     local_dir=str(local_path),
                     token=token,
                     ignore_patterns=_DOWNLOAD_IGNORE_PATTERNS,
+                    tqdm_class=_SilentTqdm,
                 )
             except BaseException as exc:
                 result["error"] = exc
