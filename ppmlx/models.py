@@ -387,6 +387,11 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
         def get_lock(cls) -> threading.Lock:
             """huggingface_hub calls tqdm_class.get_lock() — return a dummy lock."""
             return _counter_lock
+
+        @classmethod
+        def set_lock(cls, lock: Any) -> None:
+            """huggingface_hub calls tqdm_class.set_lock() — accept and ignore."""
+            pass
         def display(self, *a: Any, **kw: Any) -> None: pass
         def clear(self, *a: Any, **kw: Any) -> None: pass
         def __enter__(self) -> "_ProgressTqdm": return self
