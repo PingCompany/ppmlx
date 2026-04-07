@@ -382,6 +382,11 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
         def set_postfix(self, *a: Any, **kw: Any) -> None: pass
         def set_postfix_str(self, *a: Any, **kw: Any) -> None: pass
         def refresh(self) -> None: pass
+
+        @classmethod
+        def get_lock(cls) -> threading.Lock:
+            """huggingface_hub calls tqdm_class.get_lock() — return a dummy lock."""
+            return _counter_lock
         def display(self, *a: Any, **kw: Any) -> None: pass
         def clear(self, *a: Any, **kw: Any) -> None: pass
         def __enter__(self) -> "_ProgressTqdm": return self

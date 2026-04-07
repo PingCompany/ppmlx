@@ -706,6 +706,7 @@ def serve(
     batch_mode: bool = typer.Option(False, "--batch", help="Enable continuous batching for concurrent requests"),
     gateway_mode: bool = typer.Option(False, "--gateway", help="Run as smart routing gateway (local + cloud)"),
     local_server: Optional[str] = typer.Option(None, "--local-server", help="Local ppmlx server URL (only with --gateway)"),
+    kv_quant: Optional[str] = typer.Option(None, "--kv-quant", help="KV-cache quantization: off, turboquant"),
 ):
     """Start the OpenAI-compatible API server.
 
@@ -725,6 +726,7 @@ def serve(
     if host: overrides["host"] = host
     if port: overrides["port"] = port
     if no_cors: overrides["cors"] = False
+    if kv_quant: overrides["kv_quant"] = kv_quant
     cfg = load_config(cli_overrides=overrides)
     _track_usage(
         "serve_started",

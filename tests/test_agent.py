@@ -438,4 +438,5 @@ class TestToolDefinitions:
     def test_builtin_tool_names(self):
         assert BUILTIN_TOOL_NAMES == {
             "read_file", "write_file", "list_files", "run_command",
+            "find_files", "search_files", "patch_file", "delegate", "check_task",
         }

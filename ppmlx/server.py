@@ -183,6 +183,9 @@ async def lifespan(app: FastAPI):
     except ImportError:
         interval = 60
 
+    # Pass KV-cache config to engine if compression is enabled
+    _kv_cache_cfg = cfg.kv_cache if cfg.kv_cache.quantize != "off" else None
+
     # Pre-load models if requested via CLI flags
     if _preload_model:
         try:
@@ -190,7 +193,7 @@ async def lifespan(app: FastAPI):
             from ppmlx.engine import get_engine
             repo_id = resolve_alias(_preload_model)
             log.info("Pre-loading model: %s (%s)", _preload_model, repo_id)
-            await asyncio.to_thread(get_engine().load, repo_id)
+            await asyncio.to_thread(get_engine(kv_cache=_kv_cache_cfg).load, repo_id)
             log.info("Model pre-loaded: %s", _preload_model)
         except Exception as exc:
             log.warning("Failed to pre-load model %s: %s", _preload_model, exc)

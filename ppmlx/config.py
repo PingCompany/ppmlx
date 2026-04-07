@@ -119,6 +119,14 @@ class VoiceSettings:
 
 
 @dataclass
+class KVCacheConfig:
+    quantize: str = "off"   # "off" | "turboquant"
+    bits: int = 3            # PolarQuant bits (2, 3, or 4)
+    qjl: bool = True         # enable QJL error correction
+    qjl_dim: int = 0         # 0 = auto (head_dim // 2)
+
+
+@dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
@@ -132,6 +140,7 @@ class Config:
     analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     voice: VoiceSettings = field(default_factory=VoiceSettings)
+    kv_cache: KVCacheConfig = field(default_factory=KVCacheConfig)
 
 
 def get_ppmlx_dir() -> Path:
@@ -286,6 +295,15 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         if "ptt_key" in v: cfg.voice.ptt_key = str(v["ptt_key"]).strip().lower()
         if "silence_threshold" in v: cfg.voice.silence_threshold = float(v["silence_threshold"])
         if "silence_duration" in v: cfg.voice.silence_duration = float(v["silence_duration"])
+    if "kv_cache" in data:
+        kc = data["kv_cache"]
+        if "quantize" in kc:
+            raw = str(kc["quantize"]).strip().lower()
+            if raw in ("off", "turboquant"):
+                cfg.kv_cache.quantize = raw
+        if "bits" in kc: cfg.kv_cache.bits = int(kc["bits"])
+        if "qjl" in kc: cfg.kv_cache.qjl = bool(kc["qjl"])
+        if "qjl_dim" in kc: cfg.kv_cache.qjl_dim = int(kc["qjl_dim"])
 
 
 def _apply_env(cfg: Config) -> None:
@@ -325,6 +343,10 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_ANALYTICS_HOST": ("analytics", "host", str),
         "PPMLX_ANALYTICS_PROJECT_API_KEY": ("analytics", "project_api_key", str),
         "PPMLX_ANALYTICS_RESPECT_DNT": ("analytics", "respect_do_not_track", _parse_bool),
+        "PPMLX_KV_CACHE_QUANTIZE": ("kv_cache", "quantize", str),
+        "PPMLX_KV_CACHE_BITS": ("kv_cache", "bits", int),
+        "PPMLX_KV_CACHE_QJL": ("kv_cache", "qjl", _parse_bool),
+        "PPMLX_KV_CACHE_QJL_DIM": ("kv_cache", "qjl_dim", int),
     }
     for env_key, (section, attr, coerce) in mapping.items():
         val = os.environ.get(env_key)
@@ -352,6 +374,10 @@ def _apply_cli(cfg: Config, overrides: dict) -> None:
         elif key == "speculative_tokens": cfg.defaults.speculative_tokens = int(val)
         elif key == "auto_speculative": cfg.defaults.auto_speculative = bool(val)
         elif key == "prompt_cache_limit": cfg.defaults.prompt_cache_limit = int(val)
+        elif key == "kv_quant":
+            raw = str(val).strip().lower()
+            if raw in ("off", "turboquant"):
+                cfg.kv_cache.quantize = raw
 
 
 def check_first_run() -> None:

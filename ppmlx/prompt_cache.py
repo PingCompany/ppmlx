@@ -158,6 +158,11 @@ class PromptCacheStore:
         """Estimate memory usage of a KV-cache in bytes."""
         total = 0
         for layer in cache:
+            # TurboQuantCache exposes .nbytes with actual compressed size
+            layer_nbytes = getattr(layer, "nbytes", None)
+            if isinstance(layer_nbytes, int):
+                total += layer_nbytes
+                continue
             for attr in ("keys", "values"):
                 arr = getattr(layer, attr, None)
                 if arr is not None:

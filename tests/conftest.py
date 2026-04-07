@@ -40,6 +40,7 @@ import ppmlx.rag           # noqa: F401, E402
 import ppmlx.processor     # noqa: F401, E402
 import ppmlx.agent         # noqa: F401, E402
 import ppmlx.gateway       # noqa: F401, E402
+import ppmlx.turboquant    # noqa: F401, E402
 
 # Snapshot real module attributes HERE (module level) — before any test file
 # is collected.  test_server.py's module-level code runs at collection time and

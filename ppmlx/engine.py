@@ -45,6 +45,35 @@ def _patch_rotating_kv_cache():
 
 _patch_rotating_kv_cache()
 
+_turboquant_patched = False
+
+
+def _patch_turboquant_cache(kv_cfg: "KVCacheConfig") -> None:
+    """Monkey-patch make_prompt_cache to wrap KVCache with TurboQuant compression."""
+    global _turboquant_patched
+    if _turboquant_patched:
+        return
+    try:
+        from mlx_lm.models.cache import make_prompt_cache as _orig_make, KVCache
+        from ppmlx.turboquant import TurboQuantCache
+        import mlx_lm.models.cache as cache_mod
+
+        bits, qjl, qjl_dim = kv_cfg.bits, kv_cfg.qjl, kv_cfg.qjl_dim
+
+        def _turbo_make(model, max_kv_size=None):
+            caches = _orig_make(model, max_kv_size)
+            return [
+                TurboQuantCache.wrap(c, bits=bits, qjl=qjl, qjl_dim=qjl_dim)
+                if isinstance(c, KVCache) else c
+                for c in caches
+            ]
+
+        cache_mod.make_prompt_cache = _turbo_make
+        _turboquant_patched = True
+        log.info("TurboQuant KV-cache compression enabled (%d-bit, QJL=%s)", bits, qjl)
+    except Exception as exc:
+        log.warning("Failed to patch TurboQuant cache: %s", exc)
+
 
 @dataclass
 class LoadedModel:
@@ -287,7 +316,9 @@ class TextEngine:
     _REAPER_INTERVAL = 30  # seconds between TTL reaper sweeps
 
     def __init__(self, max_loaded: int = 2, ttl_seconds: int = 0,
-                 prompt_cache_limit: int = 4):
+                 prompt_cache_limit: int = 4,
+                 kv_cache: "KVCacheConfig | None" = None):
+        from ppmlx.config import KVCacheConfig
         self._max_loaded = max_loaded
         self._ttl_seconds = ttl_seconds
         self._models: OrderedDict[str, LoadedModel] = OrderedDict()
@@ -295,6 +326,9 @@ class TextEngine:
         self._generate_lock = threading.Lock()
         self._reaper_stop = threading.Event()
         self._reaper_thread: threading.Thread | None = None
+        kv_cfg = kv_cache or KVCacheConfig()
+        if kv_cfg.quantize == "turboquant":
+            _patch_turboquant_cache(kv_cfg)
         # Prompt KV-cache reuse (skip prefill for repeated prompt prefixes)
         from ppmlx.prompt_cache import PromptCacheStore
         self._prompt_cache = PromptCacheStore(max_entries=prompt_cache_limit)
@@ -393,15 +427,18 @@ class TextEngine:
             # have that attribute). Fall back to loading without the flag — it only
             # suppresses a regex warning and is safe to skip.
             # Temporarily silence the resulting "incorrect regex" warning from
-            # the transformers tokenizer logger so it doesn't confuse users.
+            # both the transformers logger and the warnings module.
             import logging as _logging
-            _tok_log = _logging.getLogger("transformers.tokenization_utils_tokenizers")
+            import warnings as _warnings
+            _tok_log = _logging.getLogger("transformers.tokenization_utils_base")
             _saved_level = _tok_log.level
             _tok_log.setLevel(_logging.ERROR)
-            try:
-                model, tokenizer = mlx_load(path)
-            finally:
-                _tok_log.setLevel(_saved_level)
+            with _warnings.catch_warnings():
+                _warnings.filterwarnings("ignore", message=".*incorrect regex.*")
+                try:
+                    model, tokenizer = mlx_load(path)
+                finally:
+                    _tok_log.setLevel(_saved_level)
         self._ensure_chat_template(tokenizer, repo_id)
         return LoadedModel(repo_id=repo_id, model=model, tokenizer=tokenizer)
 
@@ -907,7 +944,8 @@ _engine_lock = threading.Lock()
 
 
 def get_engine(max_loaded: int = 2, ttl_seconds: int = 0,
-               prompt_cache_limit: int = 4) -> TextEngine:
+               prompt_cache_limit: int = 4,
+               kv_cache: "KVCacheConfig | None" = None) -> TextEngine:
     """Return the module-level singleton TextEngine."""
     global _engine_instance
     if _engine_instance is None:
@@ -917,6 +955,7 @@ def get_engine(max_loaded: int = 2, ttl_seconds: int = 0,
                     max_loaded=max_loaded,
                     ttl_seconds=ttl_seconds,
                     prompt_cache_limit=prompt_cache_limit,
+                    kv_cache=kv_cache,
                 )
     return _engine_instance
 

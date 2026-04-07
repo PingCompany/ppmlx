@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-04-07
+
+### Added
+- **TurboQuant KV-cache compression**: 3-4 bit KV-cache quantization via PolarQuant + QJL (Quantized Johnson-Lindenstrauss), reducing memory usage ~6x with zero accuracy loss. Enable with `--kv-quant turboquant` on `ppmlx serve` or `[kv_cache] quantize = "turboquant"` in config.toml. Based on Google Research paper (ICLR 2026, arxiv 2504.19874).
+- **`[kv_cache]` config section**: `quantize`, `bits`, `qjl`, `qjl_dim` settings for KV-cache compression
+
 ## [0.9.1] - 2026-04-07
 
 ### Added
