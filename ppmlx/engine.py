@@ -479,25 +479,32 @@ class TextEngine:
     _PREFILL_CHUNK_SIZE = 2048
 
     def _apply_prompt_cache(
-        self, repo_id: str, lm: LoadedModel, prompt: str, kwargs: dict[str, Any],
-    ) -> None:
+        self, repo_id: str, lm: LoadedModel, prompt: str,
+        kwargs: dict[str, Any], *, draft_model: str | None = None,
+    ) -> int | None:
         """Modify *kwargs* in-place to use a cached KV-cache prefix.
 
+        Returns the prompt token count (to avoid redundant re-tokenization),
+        or ``None`` if caching was skipped.
+
         Must be called under ``self._generate_lock``.
-        Falls back to normal generation if MLX cache utilities aren't available.
+        Skipped when caching is disabled, speculative decoding is active,
+        or MLX cache utilities aren't available.
         """
+        if not self._prompt_cache.is_enabled or draft_model is not None:
+            return None
         try:
             import mlx.core as mx
             from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
         except ImportError:
-            return  # MLX not available (e.g. CI) — skip prompt caching
+            return None
 
         prompt_tokens_list = lm.tokenizer.encode(prompt)
         cache, num_cached = self._prefill_with_cache(
             repo_id, lm, prompt_tokens_list,
         )
         if cache is None:
-            return  # prefill failed — fall back to normal generation
+            return len(prompt_tokens_list)
 
         if can_trim_prompt_cache(cache):
             trim_prompt_cache(cache, 1)
@@ -508,6 +515,7 @@ class TextEngine:
                 "Prompt cache: skipped prefill for %d/%d tokens",
                 num_cached, len(prompt_tokens_list),
             )
+        return len(prompt_tokens_list)
 
     def _prefill_with_cache(
         self, repo_id: str, lm: LoadedModel, prompt_tokens: list[int],
@@ -617,11 +625,9 @@ class TextEngine:
             kwargs["num_draft_tokens"] = num_draft_tokens
 
         with self._generate_lock:
-            # Prompt caching: prefill once, reuse for subsequent requests.
-            # Disabled with speculative decoding (draft model needs separate cache).
-            if draft_model is None and self._prompt_cache._max_entries > 0:
-                self._apply_prompt_cache(repo_id, lm, prompt, kwargs)
-
+            cached_prompt_len = self._apply_prompt_cache(
+                repo_id, lm, prompt, kwargs, draft_model=draft_model,
+            )
             text = mlx_generate(lm.model, lm.tokenizer, **kwargs)
 
         # Normalize gemma4 channel tokens to standard think tags
@@ -629,12 +635,12 @@ class TextEngine:
             g4 = _Gemma4Normalizer()
             text = g4.feed(text) + g4.flush()
 
-        # Estimate token counts
+        # Estimate token counts (reuse cached count when available)
         try:
-            prompt_tokens = len(lm.tokenizer.encode(prompt))
+            prompt_tokens = cached_prompt_len or len(lm.tokenizer.encode(prompt))
             completion_tokens = len(lm.tokenizer.encode(text))
         except Exception:
-            prompt_tokens = len(prompt.split())
+            prompt_tokens = cached_prompt_len or len(prompt.split())
             completion_tokens = len(text.split())
 
         reasoning_tokens = 0
@@ -731,19 +737,12 @@ class TextEngine:
 
         _gemma4 = _is_gemma4_model(lm.tokenizer)
 
-        # Prompt caching for streaming (same logic as generate()).
-        # Must be done before acquiring generate_lock in the non-strip path,
-        # but inside it for the strip path. We prepare the cache args here
-        # and apply under the lock.
-        _use_prompt_cache = (
-            draft_model is None and self._prompt_cache._max_entries > 0
-        )
-
         if not strip_thinking:
             g4 = _Gemma4Normalizer() if _gemma4 else None
             with self._generate_lock:
-                if _use_prompt_cache:
-                    self._apply_prompt_cache(repo_id, lm, prompt, kwargs)
+                self._apply_prompt_cache(
+                    repo_id, lm, prompt, kwargs, draft_model=draft_model,
+                )
                 for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
                     text = response.text if hasattr(response, "text") else response
                     if g4:
@@ -761,9 +760,6 @@ class TextEngine:
 
         # State machine to strip <think>...</think> blocks from streamed tokens.
         # Buffers partial tag matches and only yields text outside think blocks.
-        # Qwen3's chat template injects "<think>\n" into the generation prompt,
-        # so the model output begins *inside* a think block.
-        #
         # State machine to strip <think>...</think> blocks from streamed tokens.
         # Buffers partial tag matches and only yields text outside think blocks.
         # Qwen3's chat template injects "<think>\n" into the generation prompt,
@@ -782,8 +778,9 @@ class TextEngine:
 
         self._generate_lock.acquire()
         try:
-            if _use_prompt_cache:
-                self._apply_prompt_cache(repo_id, lm, prompt, kwargs)
+            self._apply_prompt_cache(
+                repo_id, lm, prompt, kwargs, draft_model=draft_model,
+            )
             for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
                 chunk = response.text if hasattr(response, "text") else response
                 if g4:

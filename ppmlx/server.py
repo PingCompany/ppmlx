@@ -820,14 +820,7 @@ async def chat_completions(request: Request):
     if model_name == "auto" and _cfg and _cfg.router.enabled:
         try:
             from ppmlx.router import route as _route
-            from ppmlx.router import RouterConfig as _RC
-            rc = _RC(
-                enabled=True,
-                small_model=_cfg.router.small_model,
-                large_model=_cfg.router.large_model,
-                threshold=_cfg.router.threshold,
-            )
-            decision = _route(messages, rc, tools=tools, max_tokens=max_tokens)
+            decision = _route(messages, _cfg.router, tools=tools, max_tokens=max_tokens)
             model_name = decision.model
             log.info(
                 "Router: %s (score=%d, %s)",

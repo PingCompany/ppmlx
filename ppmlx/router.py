@@ -26,16 +26,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from ppmlx.config import RouterConfig
+
 log = logging.getLogger("ppmlx.engine")
-
-
-@dataclass
-class RouterConfig:
-    """Configuration for the smart model router."""
-    enabled: bool = False
-    small_model: str = "qwen3.5:0.8b"
-    large_model: str = "qwen3.5:9b"
-    threshold: int = 3  # complexity score at or above which we use large_model
 
 
 @dataclass(frozen=True)

@@ -98,13 +98,21 @@ class PromptCacheStore:
         )
         return cached, remaining
 
-    def store(self, repo_id: str, tokens: list[int], cache: list[Any]) -> None:
-        """Store a prompt KV-cache snapshot (deep-copied)."""
+    def store(
+        self, repo_id: str, tokens: list[int], cache: list[Any],
+        *, _skip_copy: bool = False,
+    ) -> None:
+        """Store a prompt KV-cache snapshot.
+
+        By default the cache is deep-copied so the caller can keep mutating
+        their copy.  Pass ``_skip_copy=True`` when the caller will NOT use
+        *cache* after this call (avoids a potentially expensive copy of
+        hundreds of MB of KV tensors).
+        """
         token_tuple = tuple(tokens)
         key = f"{repo_id}:{len(token_tuple)}:{hash(token_tuple)}"
 
-        # Deep-copy outside the lock
-        snapshot = copy.deepcopy(cache)
+        snapshot = cache if _skip_copy else copy.deepcopy(cache)
 
         with self._lock:
             self._entries[key] = _CacheEntry(tokens=token_tuple, cache=snapshot)
@@ -123,6 +131,11 @@ class PromptCacheStore:
                 keys = [k for k in self._entries if k.startswith(repo_id + ":")]
                 for k in keys:
                     del self._entries[k]
+
+    @property
+    def is_enabled(self) -> bool:
+        """Return True if prompt caching is active (limit > 0)."""
+        return self._max_entries > 0
 
     def __len__(self) -> int:
         with self._lock:
