@@ -244,77 +244,9 @@ class TestListAndGetTemplates:
 # ── CLI command tests ─────────────────────────────────────────────────
 
 
-class TestTemplateCLI:
-    def test_template_list(self):
-        """template list shows built-in templates."""
+class TestTemplateCLIRemoved:
+    def test_template_command_removed(self):
+        """template subcommand is no longer available."""
         result = runner.invoke(app, ["template", "list"])
-        assert result.exit_code == 0
-        assert "summarize" in result.output
-        assert "translate" in result.output
-
-    def test_template_show(self):
-        """template show displays template details."""
-        result = runner.invoke(app, ["template", "show", "summarize"])
-        assert result.exit_code == 0
-        assert "summarize" in result.output
-        assert "input" in result.output
-
-    def test_template_show_nonexistent(self):
-        """template show exits with error for unknown template."""
-        result = runner.invoke(app, ["template", "show", "nonexistent_xyz"])
-        assert result.exit_code == 1
-        assert "not found" in result.output
-
-    def test_template_run_missing_var(self):
-        """template run exits with error when required variable is missing."""
-        result = runner.invoke(app, ["template", "run", "summarize"])
-        assert result.exit_code == 1
-        assert "input" in result.output
-
-    def test_template_run_nonexistent(self):
-        """template run exits with error for unknown template."""
-        result = runner.invoke(app, ["template", "run", "nonexistent_xyz"])
-        assert result.exit_code == 1
-
-    def test_template_run_bad_var_format(self):
-        """template run exits with error on invalid --var format."""
-        result = runner.invoke(app, ["template", "run", "summarize", "--var", "no_equals_sign"])
-        assert result.exit_code == 1
-        assert "key=value" in result.output
-
-    def test_template_create(self, tmp_path, monkeypatch):
-        """template create saves a YAML file to user templates dir."""
-        monkeypatch.setenv("HOME", str(tmp_path))
-
-        result = runner.invoke(app, [
-            "template", "create", "my_test",
-            "--description", "Test template",
-            "--system", "Be helpful",
-            "--prompt", "Do this: {{input}}",
-        ])
-        assert result.exit_code == 0
-        assert "Template created" in result.output
-
-        # Verify the file was created
-        created = tmp_path / ".ppmlx" / "templates" / "my_test.yaml"
-        assert created.exists()
-        content = created.read_text()
-        assert "my_test" in content
-        assert "input" in content
-
-    def test_template_create_no_prompt(self):
-        """template create fails without --prompt."""
-        result = runner.invoke(app, [
-            "template", "create", "my_test",
-        ])
-        assert result.exit_code == 1
-        assert "--prompt" in result.output
-
-    def test_template_help(self):
-        """template --help shows subcommands."""
-        result = runner.invoke(app, ["template", "--help"])
-        assert result.exit_code == 0
-        assert "list" in result.output
-        assert "show" in result.output
-        assert "run" in result.output
-        assert "create" in result.output
+        # Command was removed, should fail
+        assert result.exit_code != 0

@@ -322,10 +322,12 @@ def test_chat_template_applied():
     messages = [{"role": "user", "content": "test"}]
     engine.generate("some/model", messages)
 
-    mock_tokenizer.apply_chat_template.assert_called_once_with(
+    # First call should include enable_thinking=True (explicit pass-through)
+    mock_tokenizer.apply_chat_template.assert_any_call(
         messages,
         tokenize=False,
         add_generation_prompt=True,
+        enable_thinking=True,
     )
 
 
@@ -409,6 +411,15 @@ def test_is_thinking_model_true():
     assert _is_thinking_model(tokenizer) is True
 
 
+def test_is_thinking_model_gemma4():
+    """Gemma-4 uses <|think|> instead of <think>."""
+    from ppmlx.engine import _is_thinking_model
+
+    tokenizer = MagicMock()
+    tokenizer.chat_template = "...template with <|think|> marker..."
+    assert _is_thinking_model(tokenizer) is True
+
+
 def test_is_thinking_model_false():
     from ppmlx.engine import _is_thinking_model
 
@@ -419,6 +430,135 @@ def test_is_thinking_model_false():
     # No chat_template attribute at all
     tokenizer2 = MagicMock(spec=[])
     assert _is_thinking_model(tokenizer2) is False
+
+
+# ---------------------------------------------------------------------------
+# Gemma-4 channel token normalization
+# ---------------------------------------------------------------------------
+def test_is_gemma4_model():
+    from ppmlx.engine import _is_gemma4_model
+
+    tokenizer = MagicMock()
+    tokenizer.chat_template = "template with <|channel> and <channel|> tokens"
+    assert _is_gemma4_model(tokenizer) is True
+
+    tokenizer2 = MagicMock()
+    tokenizer2.chat_template = "plain template"
+    assert _is_gemma4_model(tokenizer2) is False
+
+
+def test_gemma4_normalizer_text_fallback():
+    """Text-based fallback strips channel tokens from decoded text."""
+    from ppmlx.engine import _Gemma4Normalizer
+
+    # Channel thought → <think>
+    g = _Gemma4Normalizer()
+    text = g.feed("<|channel>thought\nHello world")
+    assert text == "<think>Hello world"
+
+    # Channel on (no thinking before) → stripped
+    g2 = _Gemma4Normalizer()
+    text = g2.feed("<|channel>on\nResponse text")
+    assert text == "Response text"
+
+    # Channel end after thought → </think>
+    g3 = _Gemma4Normalizer()
+    text = g3.feed("<|channel>thought\nsome text<channel|> more")
+    assert text == "<think>some text</think> more"
+
+    # Channel end NOT after thought → stripped
+    g4 = _Gemma4Normalizer()
+    text = g4.feed("<|channel>on\nsome text<channel|> more")
+    assert text == "some text more"
+
+
+def test_gemma4_normalizer_token_ids():
+    """Token-ID-based detection of thinking transitions."""
+    from ppmlx.engine import _Gemma4Normalizer
+
+    g = _Gemma4Normalizer()
+
+    # <|channel>(100) + thought(45518) → suppressed (callers handle thinking start)
+    assert g.feed("", token_id=100) == ""  # <|channel> — suppressed
+    assert g.feed("", token_id=45518) == ""  # thought — suppressed (no <think>)
+    assert g.feed("I'm thinking", token_id=235) == "I'm thinking"
+
+    # <channel|>(101) while in thought → </think>
+    assert g.feed("", token_id=101) == "</think>"
+
+    # <|channel>(100) + on(498) → suppressed (no </think> since not in thought)
+    assert g.feed("", token_id=100) == ""
+    assert g.feed("", token_id=498) == ""
+
+    # Regular text
+    assert g.feed("answer text", token_id=999) == "answer text"
+
+
+def test_gemma4_normalizer_token_ids_with_thinking():
+    """Token-ID path: model thinks then answers."""
+    from ppmlx.engine import _Gemma4Normalizer
+
+    g = _Gemma4Normalizer()
+    output = ""
+
+    # <|channel>thought
+    output += g.feed("", token_id=100)  # <|channel>
+    output += g.feed("", token_id=45518)  # thought
+
+    # reasoning content
+    output += g.feed("Let me think...", token_id=1234)
+
+    # <channel|>
+    output += g.feed("", token_id=101)
+
+    # <|channel>on
+    output += g.feed("", token_id=100)
+    output += g.feed("", token_id=498)
+
+    # answer
+    output += g.feed("The answer is 42.", token_id=5678)
+
+    # No <think> marker — callers handle thinking-start state
+    assert output == "Let me think...</think>The answer is 42."
+
+
+def test_gemma4_normalizer_token_ids_no_thinking():
+    """Token-ID path: model skips thinking, goes straight to <|channel>on."""
+    from ppmlx.engine import _Gemma4Normalizer
+
+    g = _Gemma4Normalizer()
+    output = ""
+
+    # <|channel>on (no prior thinking)
+    output += g.feed("", token_id=100)
+    output += g.feed("", token_id=498)
+
+    # answer
+    output += g.feed("Hello!", token_id=5678)
+
+    # <channel|>
+    output += g.feed("", token_id=101)
+
+    assert output == "Hello!"
+
+
+def test_gemma4_normalizer_text_full_sequence():
+    """Text-only fallback: full thinking → answer sequence."""
+    from ppmlx.engine import _Gemma4Normalizer
+
+    g = _Gemma4Normalizer()
+    raw = "<|channel>thought\nI need to think...<channel|><|channel>on\nHere is my answer<channel|>"
+    text = g.feed(raw)
+    assert text == "<think>I need to think...</think>Here is my answer"
+
+
+def test_gemma4_normalizer_no_channel_tokens():
+    """Non-gemma4 text passes through unchanged."""
+    from ppmlx.engine import _Gemma4Normalizer
+
+    g = _Gemma4Normalizer()
+    text = g.feed("Just regular text with <think> tags")
+    assert text == "Just regular text with <think> tags"
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,42 @@ from typing import Any, Iterator, NamedTuple
 log = logging.getLogger("ppmlx.engine")
 
 
+def _patch_rotating_kv_cache():
+    """Fix RotatingKVCache._temporal_order crash when prompt > max_size.
+
+    See https://github.com/ml-explore/mlx-lm/pull/1104
+    """
+    try:
+        from mlx_lm.models.cache import RotatingKVCache
+        import mlx.core as mx
+
+        _orig_temporal_order = RotatingKVCache._temporal_order
+        _cache_trim_warned = set()
+
+        def _safe_temporal_order(self, v):
+            result = _orig_temporal_order(self, v)
+            # Trim to max_size if the result is larger (prompt exceeded window)
+            if result.shape[2] > self.max_size:
+                excess = result.shape[2] - self.max_size
+                if id(self) not in _cache_trim_warned:
+                    _cache_trim_warned.add(id(self))
+                    log.warning(
+                        "Prompt exceeds sliding window (%d > %d) — "
+                        "trimming %d tokens from KV cache. "
+                        "Response quality may be degraded.",
+                        result.shape[2], self.max_size, excess,
+                    )
+                result = result[..., -self.max_size:, :]
+            return result
+
+        RotatingKVCache._temporal_order = _safe_temporal_order
+    except Exception:
+        pass
+
+
+_patch_rotating_kv_cache()
+
+
 @dataclass
 class LoadedModel:
     """A model that has been loaded into memory."""
@@ -56,11 +92,147 @@ def _context_size(lm: "LoadedModel") -> int:
 
 
 def _is_thinking_model(tokenizer: Any) -> bool:
-    """Return True if the tokenizer's chat template contains ``<think>``."""
+    """Return True if the tokenizer's chat template supports thinking.
+
+    Detects both Qwen-style ``<think>`` and Gemma-4-style ``<|think|>`` markers.
+    """
     template = getattr(tokenizer, "chat_template", None)
     if template and isinstance(template, str):
-        return "<think>" in template
+        return "<think>" in template or "<|think|>" in template
     return False
+
+
+def _is_gemma4_model(tokenizer: Any) -> bool:
+    """Return True if the tokenizer uses Gemma-4 channel-style tokens."""
+    template = getattr(tokenizer, "chat_template", None)
+    if template and isinstance(template, str):
+        return "<|channel>" in template and "<channel|>" in template
+    return False
+
+
+# Gemma-4 channel token patterns (longest first for prefix matching)
+_GEMMA4_CHANNEL_PREFIXES = ["<|channel>thought", "<|channel>on", "<channel|>"]
+
+
+class _Gemma4Normalizer:
+    """Stateful converter from Gemma-4 channel tokens to ``<think>``/``</think>``.
+
+    Works at **two levels** simultaneously:
+
+    1. **Token-ID based** (primary) — Intercepts ``<|channel>`` (100),
+       ``<channel|>`` (101), ``thought`` (45518), ``on`` (498) token IDs from
+       ``GenerationResponse.token`` to track thinking state.  These tokens are
+       invisible to the detokenizer (stripped as special tokens), so we inject
+       ``<think>``/``</think>`` markers synthetically.
+
+    2. **Text-based** (fallback) — If channel tokens DO leak into decoded text
+       (some detokenizer configurations), strips them and converts to standard
+       think tags.
+    """
+
+    # Gemma-4 special token IDs
+    _CHANNEL_START = 100   # <|channel>
+    _CHANNEL_END = 101     # <channel|>
+    _THOUGHT = 45518       # "thought" (after <|channel>)
+    _ON = 498              # "on" (after <|channel>)
+
+    def __init__(self) -> None:
+        self._in_thought = False
+        self._pending_channel = False
+        self._text_buf = ""  # for text-based fallback
+
+    def feed(self, text: str, token_id: int | None = None) -> str:
+        """Feed a text chunk and optional token ID, return normalized output.
+
+        Call with both ``text`` and ``token_id`` from ``GenerationResponse``
+        for best results.  Falls back to text-only normalization when
+        ``token_id`` is None.
+        """
+        marker = ""
+        suppress = False
+
+        if token_id is not None:
+            if token_id == self._CHANNEL_START:
+                self._pending_channel = True
+                suppress = True
+            elif self._pending_channel:
+                self._pending_channel = False
+                if token_id == self._THOUGHT:
+                    self._in_thought = True
+                    # Don't emit <think> — callers handle thinking-start
+                    # state (engine sets inside_think, server uses assume_thinking)
+                    suppress = True
+                elif token_id == self._ON:
+                    if self._in_thought:
+                        self._in_thought = False
+                        marker = "</think>"
+                    suppress = True
+                # else: false alarm — not a channel sequence; don't suppress
+            elif token_id == self._CHANNEL_END:
+                if self._in_thought:
+                    self._in_thought = False
+                    marker = "</think>"
+                suppress = True
+
+        if suppress:
+            # Token-ID based: don't yield the original text for channel tokens
+            return marker
+
+        # Text-based fallback: strip any channel text that leaked through
+        self._text_buf += text
+        cleaned = self._strip_channel_text()
+        return marker + cleaned
+
+    def flush(self) -> str:
+        """Flush any remaining buffered data (call at end of stream)."""
+        out = self._text_buf
+        self._text_buf = ""
+        return out
+
+    def _strip_channel_text(self) -> str:
+        """Strip channel-token text and inject think markers (fallback path)."""
+        buf = self._text_buf
+        result: list[str] = []
+        while buf:
+            if buf[0] == "<":
+                if buf.startswith("<|channel>thought"):
+                    buf = buf[len("<|channel>thought"):]
+                    if buf.startswith("\n"):
+                        buf = buf[1:]
+                    self._in_thought = True
+                    result.append("<think>")
+                    continue
+                if buf.startswith("<|channel>on"):
+                    buf = buf[len("<|channel>on"):]
+                    if buf.startswith("\n"):
+                        buf = buf[1:]
+                    if self._in_thought:
+                        self._in_thought = False
+                        result.append("</think>")
+                    continue
+                if buf.startswith("<channel|>"):
+                    buf = buf[len("<channel|>"):]
+                    if buf.startswith("\n"):
+                        buf = buf[1:]
+                    if self._in_thought:
+                        self._in_thought = False
+                        result.append("</think>")
+                    continue
+                # Partial prefix — wait for more data
+                if any(p.startswith(buf) for p in _GEMMA4_CHANNEL_PREFIXES):
+                    break
+                result.append(buf[0])
+                buf = buf[1:]
+            else:
+                next_lt = buf.find("<")
+                if next_lt == -1:
+                    result.append(buf)
+                    buf = ""
+                else:
+                    result.append(buf[:next_lt])
+                    buf = buf[next_lt:]
+        self._text_buf = buf
+        return "".join(result)
 
 
 def _auto_max_tokens(lm: "LoadedModel") -> int:
@@ -108,8 +280,8 @@ class TextEngine:
     """
     Wraps mlx-lm for text generation with LRU model caching.
 
-    Thread-safe: uses a lock for model loading/unloading.
-    Multiple concurrent requests for the same loaded model are fine.
+    Thread-safe: uses a lock for model loading/unloading and a separate
+    lock to serialize GPU inference (MLX Metal crashes on concurrent generates).
     """
 
     _REAPER_INTERVAL = 30  # seconds between TTL reaper sweeps
@@ -119,6 +291,7 @@ class TextEngine:
         self._ttl_seconds = ttl_seconds
         self._models: OrderedDict[str, LoadedModel] = OrderedDict()
         self._lock = threading.Lock()
+        self._generate_lock = threading.Lock()
         self._reaper_stop = threading.Event()
         self._reaper_thread: threading.Thread | None = None
         if self._ttl_seconds > 0:
@@ -159,11 +332,57 @@ class TextEngine:
             self._reaper_thread.join(timeout=5)
             self._reaper_thread = None
 
+    @staticmethod
+    def _ensure_chat_template(tokenizer: Any, repo_id: str) -> None:
+        """Fetch chat_template from transformers if missing from tokenizer files.
+
+        Also infers the tool parser when the chat template is added late
+        (mlx-lm only runs inference at load time, before this fallback).
+        """
+        if getattr(tokenizer, "chat_template", None):
+            # Template already present — but tool parser may still be missing
+            # if the template was set by this method in a previous call.
+            pass
+        else:
+            try:
+                from transformers import AutoTokenizer as _AT
+                ref_tok = _AT.from_pretrained(repo_id, trust_remote_code=True)
+                tmpl = getattr(ref_tok, "chat_template", None)
+                if tmpl:
+                    tokenizer.chat_template = tmpl
+            except Exception:
+                pass
+
+        # If the tokenizer has a chat_template but no tool parser, try to infer one.
+        if (
+            getattr(tokenizer, "chat_template", None)
+            and not getattr(tokenizer, "has_tool_calling", False)
+        ):
+            try:
+                from mlx_lm.tokenizer_utils import _infer_tool_parser
+                import importlib
+
+                parser_type = _infer_tool_parser(tokenizer.chat_template)
+                if parser_type is not None:
+                    tool_mod = importlib.import_module(
+                        f"mlx_lm.tool_parsers.{parser_type}"
+                    )
+                    tokenizer._tool_parser = tool_mod.parse_tool_call
+                    tokenizer._tool_call_start = tool_mod.tool_call_start
+                    tokenizer._tool_call_end = tool_mod.tool_call_end
+                    log.info(
+                        "Late-inferred tool parser %r for %s",
+                        parser_type, repo_id,
+                    )
+            except Exception:
+                pass
+
     def _load_impl(self, repo_id: str) -> LoadedModel:
         """Actually load a model using mlx_lm.load. Called under lock."""
         from mlx_lm import load as mlx_load
         path = _resolve_model_path(repo_id)
         model, tokenizer = mlx_load(path)
+        self._ensure_chat_template(tokenizer, repo_id)
         return LoadedModel(repo_id=repo_id, model=model, tokenizer=tokenizer)
 
     def load(self, repo_id: str) -> LoadedModel:
@@ -218,13 +437,14 @@ class TextEngine:
             }
             if tools:
                 kwargs["tools"] = tools
-            if not enable_thinking:
-                try:
-                    return tokenizer.apply_chat_template(
-                        messages, **kwargs, enable_thinking=False
-                    )
-                except TypeError:
-                    pass  # model doesn't support the flag — fall through
+            # Pass enable_thinking explicitly — some templates (e.g. Gemma-4)
+            # default to False and need this to activate thinking mode.
+            try:
+                return tokenizer.apply_chat_template(
+                    messages, **kwargs, enable_thinking=enable_thinking
+                )
+            except TypeError:
+                pass  # model doesn't support the flag — fall through
             try:
                 return tokenizer.apply_chat_template(messages, **kwargs)
             except TypeError:
@@ -318,7 +538,13 @@ class TextEngine:
             kwargs["draft_model"] = draft_lm.model
             kwargs["num_draft_tokens"] = num_draft_tokens
 
-        text = mlx_generate(lm.model, lm.tokenizer, **kwargs)
+        with self._generate_lock:
+            text = mlx_generate(lm.model, lm.tokenizer, **kwargs)
+
+        # Normalize gemma4 channel tokens to standard think tags
+        if _is_gemma4_model(lm.tokenizer):
+            g4 = _Gemma4Normalizer()
+            text = g4.feed(text) + g4.flush()
 
         # Estimate token counts
         try:
@@ -420,12 +646,24 @@ class TextEngine:
             kwargs["draft_model"] = draft_lm.model
             kwargs["num_draft_tokens"] = num_draft_tokens
 
+        _gemma4 = _is_gemma4_model(lm.tokenizer)
+
         if not strip_thinking:
-            for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
-                if hasattr(response, "text"):
-                    yield response.text
-                elif isinstance(response, str):
-                    yield response
+            g4 = _Gemma4Normalizer() if _gemma4 else None
+            with self._generate_lock:
+                for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
+                    text = response.text if hasattr(response, "text") else response
+                    if g4:
+                        token_id = getattr(response, "token", None)
+                        normalized = g4.feed(text, token_id=token_id)
+                        if normalized:
+                            yield normalized
+                    else:
+                        yield text
+            if g4:
+                remainder = g4.flush()
+                if remainder:
+                    yield remainder
             return
 
         # State machine to strip <think>...</think> blocks from streamed tokens.
@@ -444,81 +682,98 @@ class TextEngine:
         # model doesn't use think-tag pairs and switch to pass-through mode.
         _THINK_PASSTHROUGH_TOKENS = 10_000  # chars before assuming model never closes </think>
 
-        inside_think = bool(re.search(r"<think>\s*$", prompt))
+        inside_think = bool(re.search(r"<think>\s*$", prompt)) or _gemma4
         buf = ""
         think_chars = 0  # chars suppressed while inside_think=True
+        g4 = _Gemma4Normalizer() if _gemma4 else None
 
-        for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
-            chunk = response.text if hasattr(response, "text") else response
-            buf += chunk
-
-            while buf:
-                if inside_think:
-                    # Look for </think> closing tag
-                    end_idx = buf.find("</think>")
-                    if end_idx != -1:
-                        # Properly closed — discard thinking content
-                        think_chars = 0
-                        buf = buf[end_idx + len("</think>"):]
-                        inside_think = False
+        self._generate_lock.acquire()
+        try:
+            for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
+                chunk = response.text if hasattr(response, "text") else response
+                if g4:
+                    token_id = getattr(response, "token", None)
+                    normalized = g4.feed(chunk, token_id=token_id)
+                    if not normalized:
                         continue
-                    # Check if buf ends with a partial match for </think>
-                    tag = "</think>"
-                    keep = 0
-                    for i in range(1, min(len(tag), len(buf)) + 1):
-                        if buf.endswith(tag[:i]):
-                            keep = i
-                    suppressed = buf[:-keep] if keep else buf
-                    think_chars += len(suppressed)
-                    buf = buf[-keep:] if keep else ""
-
-                    # If a reasoning_budget was set and we've exceeded it
-                    # (rough char-to-token estimate: 4 chars per token), force
-                    # the end of the thinking phase and start yielding text.
-                    if reasoning_budget is not None and think_chars > reasoning_budget * 4:
-                        inside_think = False
-                        think_chars = 0
-                        continue
-
-                    # If we've suppressed too much without a close tag, this
-                    # model doesn't use proper think-tag pairs — yield as plain text.
-                    if think_chars > _THINK_PASSTHROUGH_TOKENS:
-                        inside_think = False
-                        think_chars = 0
-                        if suppressed:
-                            yield suppressed
-                        continue
-                    break
+                    buf += normalized
                 else:
-                    # Look for <think> opening tag
-                    start_idx = buf.find("<think>")
-                    if start_idx != -1:
-                        # Yield everything before the tag
-                        if start_idx > 0:
-                            yield buf[:start_idx]
-                        buf = buf[start_idx + len("<think>"):]
-                        inside_think = True
-                        continue
-                    # Check if buf ends with a partial match for "<think>"
-                    tag = "<think>"
-                    keep = 0
-                    for i in range(1, min(len(tag), len(buf)) + 1):
-                        if buf.endswith(tag[:i]):
-                            keep = i
-                    if keep:
-                        safe = buf[:-keep]
-                        if safe:
-                            yield safe
-                        buf = buf[-keep:]
-                    else:
-                        if buf:
-                            yield buf
-                        buf = ""
-                    break
+                    buf += chunk
 
-        # Flush any remaining buffer outside think blocks
-        if buf and not inside_think:
-            yield buf
+                while buf:
+                    if inside_think:
+                        # Look for </think> closing tag
+                        end_idx = buf.find("</think>")
+                        if end_idx != -1:
+                            # Properly closed — discard thinking content
+                            think_chars = 0
+                            buf = buf[end_idx + len("</think>"):]
+                            inside_think = False
+                            continue
+                        # Check if buf ends with a partial match for </think>
+                        tag = "</think>"
+                        keep = 0
+                        for i in range(1, min(len(tag), len(buf)) + 1):
+                            if buf.endswith(tag[:i]):
+                                keep = i
+                        suppressed = buf[:-keep] if keep else buf
+                        think_chars += len(suppressed)
+                        buf = buf[-keep:] if keep else ""
+
+                        # If a reasoning_budget was set and we've exceeded it
+                        # (rough char-to-token estimate: 4 chars per token), force
+                        # the end of the thinking phase and start yielding text.
+                        if reasoning_budget is not None and think_chars > reasoning_budget * 4:
+                            inside_think = False
+                            think_chars = 0
+                            continue
+
+                        # If we've suppressed too much without a close tag, this
+                        # model doesn't use proper think-tag pairs — yield as plain text.
+                        if think_chars > _THINK_PASSTHROUGH_TOKENS:
+                            inside_think = False
+                            think_chars = 0
+                            if suppressed:
+                                yield suppressed
+                            continue
+                        break
+                    else:
+                        # Look for <think> opening tag
+                        start_idx = buf.find("<think>")
+                        if start_idx != -1:
+                            # Yield everything before the tag
+                            if start_idx > 0:
+                                yield buf[:start_idx]
+                            buf = buf[start_idx + len("<think>"):]
+                            inside_think = True
+                            continue
+                        # Check if buf ends with a partial match for "<think>"
+                        tag = "<think>"
+                        keep = 0
+                        for i in range(1, min(len(tag), len(buf)) + 1):
+                            if buf.endswith(tag[:i]):
+                                keep = i
+                        if keep:
+                            safe = buf[:-keep]
+                            if safe:
+                                yield safe
+                            buf = buf[-keep:]
+                        else:
+                            if buf:
+                                yield buf
+                            buf = ""
+                        break
+
+            # Flush remaining gemma4 normalization buffer
+            if g4:
+                remainder = g4.flush()
+                if remainder:
+                    buf += remainder
+            # Flush any remaining buffer outside think blocks
+            if buf and not inside_think:
+                yield buf
+        finally:
+            self._generate_lock.release()
 
     def get_tokenizer(self, repo_id: str) -> Any:
         """Return the tokenizer for a model (loads if needed)."""

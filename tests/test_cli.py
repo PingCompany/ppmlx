@@ -320,7 +320,7 @@ def test_logs_json_output(tmp_path):
 
     with patch("ppmlx.config.get_ppmlx_dir", return_value=tmp_path), \
          patch("ppmlx.db.get_db", return_value=db):
-        result = runner.invoke(app, ["logs", "--json"])
+        result = runner.invoke(app, ["config", "logs", "--json"])
     assert result.exit_code == 0
     parsed = json_mod.loads(result.output)
     assert isinstance(parsed, list)

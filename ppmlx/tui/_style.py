@@ -40,14 +40,16 @@ def version_str() -> str:
 COL_W = {
     "cursor":  4,   # "  ▸ " or "    "
     "check":   4,   # "[x] " or "[ ] "
-    "flag":    3,   # "★✓●"
-    "alias":  28,
+    "flag":    5,   # "★ ✓ ●"
+    "alias":  40,
     "params":  8,
     "size":   10,
 }
 
 
 def _pad(text: str, width: int, align: str = "left") -> str:
+    if len(text) > width and width > 1:
+        text = text[: width - 1] + "…"
     if align == "right":
         return text.rjust(width)
     return text.ljust(width)
@@ -115,13 +117,14 @@ def render_model_row(
         fragments.append((cb_style if not is_cursor else style, f"{checkbox} "))
 
     # Status flags
-    flags = ""
+    flag_parts: list[str] = []
     if getattr(row, "is_favorite", False):
-        flags += "★"
+        flag_parts.append("★")
     if getattr(row, "downloaded", False):
-        flags += "✓"
+        flag_parts.append("✓")
     if getattr(row, "is_loaded", False):
-        flags += "●"
+        flag_parts.append("●")
+    flags = " ".join(flag_parts)
     fragments.append(("class:star" if not is_cursor else style, _pad(flags, w["flag"])))
     fragments.append((style, " "))
 
