@@ -1,7 +1,8 @@
-"""Interactive component installer / uninstaller for ppmlx.
+"""Component manager for ppmlx optional dependencies.
 
-Manages optional heavy dependencies (voice, vision, embeddings, analytics)
-that are not included in the base install to keep the footprint small.
+Optional heavy packages (voice, vision, embeddings, analytics) are kept
+out of the base install to keep the footprint small. This module provides
+an interactive TUI to install / uninstall them on demand.
 """
 from __future__ import annotations
 
@@ -11,24 +12,18 @@ import sys
 from dataclasses import dataclass, field
 
 from rich.console import Console
-from rich.table import Table
 
 console = Console()
-
-_CHECKMARK = "[green]✓[/green]"
-_CROSS     = "[red]✗[/red]"
 
 
 @dataclass
 class Component:
-    """An optional installable component."""
     key: str
     label: str
     description: str
-    packages: list[str]            # pip packages to install
-    check_imports: list[str]       # modules to import to verify install
-    size_hint: str                 # rough download size (no markup)
-    extras_key: str | None = None  # pyproject extras group name
+    packages: list[str]
+    check_imports: list[str]
+    size_hint: str
     requires_brew: list[str] = field(default_factory=list)
 
 
@@ -40,7 +35,6 @@ COMPONENTS: list[Component] = [
         packages=["mlx-vlm>=0.1.18"],
         check_imports=["mlx_vlm"],
         size_hint="~500 MB",
-        extras_key="vision",
     ),
     Component(
         key="embeddings",
@@ -49,7 +43,6 @@ COMPONENTS: list[Component] = [
         packages=["mlx-embeddings>=0.0.5"],
         check_imports=["mlx_embeddings"],
         size_hint="~200 MB",
-        extras_key="embeddings",
     ),
     Component(
         key="voice",
@@ -57,8 +50,7 @@ COMPONENTS: list[Component] = [
         description="Push-to-talk (Whisper STT) + spoken output (Voxtral TTS)",
         packages=["mlx-whisper>=0.4", "mlx-audio>=0.4", "sounddevice>=0.4", "soundfile>=0.12"],
         check_imports=["mlx_whisper", "mlx_audio", "sounddevice", "soundfile"],
-        size_hint="~2 GB (models on first use)",
-        extras_key="voice",
+        size_hint="~2 GB",
         requires_brew=["portaudio"],
     ),
     Component(
@@ -68,17 +60,15 @@ COMPONENTS: list[Component] = [
         packages=["posthog>=7.9,<8"],
         check_imports=["posthog"],
         size_hint="~200 KB",
-        extras_key="analytics",
     ),
 ]
 
 _COMPONENT_MAP = {c.key: c for c in COMPONENTS}
 
 
-# ── Helpers ────────────────────────────────────────────────────────────
+# ── State helpers ──────────────────────────────────────────────────────
 
 def _is_installed(component: Component) -> bool:
-    """Return True if all required imports succeed."""
     for mod in component.check_imports:
         try:
             importlib.import_module(mod.replace("-", "_"))
@@ -89,240 +79,220 @@ def _is_installed(component: Component) -> bool:
 
 def _brew_installed(formula: str) -> bool:
     try:
-        r = subprocess.run(["brew", "list", formula], capture_output=True, timeout=5)
-        return r.returncode == 0
+        return subprocess.run(
+            ["brew", "list", formula], capture_output=True, timeout=5,
+        ).returncode == 0
     except Exception:
         return False
 
 
 def _run_pip(args: list[str], timeout: int = 300) -> bool:
-    cmd = [sys.executable, "-m", "pip"] + args
-    console.print(f"  [dim]{' '.join(cmd)}[/dim]")
-    return subprocess.run(cmd, timeout=timeout).returncode == 0
+    return subprocess.run(
+        [sys.executable, "-m", "pip"] + args, timeout=timeout,
+    ).returncode == 0
 
 
-# ── Install ────────────────────────────────────────────────────────────
+# ── Install / uninstall ────────────────────────────────────────────────
 
-def _install_component(component: Component) -> bool:
-    """Install a component's packages. Returns True on success."""
-    for formula in component.requires_brew:
+def _install(comp: Component) -> bool:
+    for formula in comp.requires_brew:
         if not _brew_installed(formula):
-            console.print(f"  Installing brew dep: [cyan]{formula}[/cyan]")
             if subprocess.run(["brew", "install", formula], timeout=120).returncode != 0:
-                console.print(f"  [red]brew install {formula} failed[/red]")
                 return False
-    return _run_pip(["install", "--quiet"] + component.packages)
+    return _run_pip(["install", "--quiet"] + comp.packages)
+
+
+def _uninstall(comp: Component) -> bool:
+    names = [p.split(">=")[0].split("==")[0].split("<")[0].strip() for p in comp.packages]
+    return _run_pip(["uninstall", "--yes"] + names)
 
 
 def install_component(key: str) -> bool:
-    """Install a single component by key. Returns True on success."""
     comp = _COMPONENT_MAP.get(key)
     if not comp:
-        console.print(f"[red]Unknown component: {key!r}[/red]")
-        console.print(f"Available: {', '.join(_COMPONENT_MAP)}")
+        console.print(f"[red]Unknown component: {key!r}. Available: {', '.join(_COMPONENT_MAP)}[/red]")
         return False
     if _is_installed(comp):
         console.print(f"[green]{comp.label} is already installed.[/green]")
         return True
     console.print(f"Installing [bold]{comp.label}[/bold]…")
-    ok = _install_component(comp)
-    if ok:
-        console.print(f"  {_CHECKMARK} [green]{comp.label} installed[/green]")
-    else:
-        console.print(f"  {_CROSS} [red]Installation failed.[/red]")
-        console.print(f"  [dim]Try manually: pip install {' '.join(comp.packages)}[/dim]")
+    ok = _install(comp)
+    console.print(f"  [green]✓ Done[/green]" if ok else f"  [red]✗ Failed[/red]")
+    if not ok:
+        console.print(f"  [dim]Try: pip install {' '.join(comp.packages)}[/dim]")
     return ok
 
 
-# ── Uninstall ──────────────────────────────────────────────────────────
-
-def _uninstall_component(component: Component) -> bool:
-    """Uninstall a component's pip packages. Returns True on success."""
-    # Extract bare package names (strip version specifiers)
-    pkg_names = [p.split(">=")[0].split("==")[0].split("<")[0].strip()
-                 for p in component.packages]
-    return _run_pip(["uninstall", "--yes"] + pkg_names)
-
-
 def uninstall_component(key: str) -> bool:
-    """Uninstall a component by key. Returns True on success."""
     comp = _COMPONENT_MAP.get(key)
     if not comp:
-        console.print(f"[red]Unknown component: {key!r}[/red]")
-        console.print(f"Available: {', '.join(_COMPONENT_MAP)}")
+        console.print(f"[red]Unknown component: {key!r}. Available: {', '.join(_COMPONENT_MAP)}[/red]")
         return False
     if not _is_installed(comp):
         console.print(f"[yellow]{comp.label} is not installed.[/yellow]")
         return True
-    console.print(f"Uninstalling [bold]{comp.label}[/bold]…")
-    ok = _uninstall_component(comp)
-    if ok:
-        console.print(f"  {_CHECKMARK} [green]{comp.label} removed[/green]")
-    else:
-        console.print(f"  {_CROSS} [red]Uninstall failed.[/red]")
+    console.print(f"Removing [bold]{comp.label}[/bold]…")
+    ok = _uninstall(comp)
+    console.print(f"  [green]✓ Removed[/green]" if ok else f"  [red]✗ Failed[/red]")
     return ok
 
 
-# ── Status table ───────────────────────────────────────────────────────
+# ── Interactive TUI ────────────────────────────────────────────────────
 
-def status_table() -> None:
-    """Print a table showing which components are installed."""
-    table = Table(title="ppmlx components", box=None, padding=(0, 2))
-    table.add_column("", width=2)
-    table.add_column("Component", style="bold")
-    table.add_column("Description", style="dim")
-    table.add_column("Size", style="dim", justify="right")
-    table.add_column("Status", justify="right")
+def _render(components: list[Component], cursor: int, statuses: list[bool]) -> str:
+    """Build the full screen string for the addons TUI."""
+    lines: list[str] = []
+    lines.append("\033[1mppmlx addons\033[0m\n")
 
-    for comp in COMPONENTS:
-        ok = _is_installed(comp)
-        mark = _CHECKMARK if ok else _CROSS
-        status = "[green]installed[/green]" if ok else "[dim]not installed[/dim]"
-        table.add_row(mark, comp.label, comp.description, comp.size_hint, status)
+    col_key   = 12
+    col_label = 24
+    col_size  = 10
 
-    console.print(table)
-    console.print()
-    console.print("[dim]Install:   ppmlx install <component>[/dim]")
-    console.print("[dim]Uninstall: ppmlx install --remove <component>[/dim]")
+    # Header
+    lines.append(
+        f"  {'':2}  \033[2m{'Component':<{col_label}}{'Size':>{col_size}}  Description\033[0m"
+    )
 
+    for i, (comp, installed) in enumerate(zip(components, statuses)):
+        selected = i == cursor
+        prefix = "\033[1;36m›\033[0m " if selected else "  "
+        status = "\033[32m✓ installed\033[0m " if installed else "\033[2m○ not installed\033[0m"
 
-# ── Interactive wizards ────────────────────────────────────────────────
+        # Highlight selected row
+        row_style = "\033[7m" if selected else ""
+        reset     = "\033[0m" if selected else ""
 
-def _q_style():
-    import questionary
-    return questionary.Style([
-        ("checkbox-selected", "fg:ansigreen bold"),
-        ("selected",          "fg:ansigreen"),
-        ("pointer",           "fg:ansicyan bold"),
-        ("highlighted",       "fg:ansicyan"),
-        ("answer",            "fg:ansigreen bold"),
-        ("question",          "bold"),
-    ])
-
-
-def install_interactive() -> None:
-    """Interactive install wizard — checkbox picker for not-yet-installed components."""
-    import questionary
-
-    console.print()
-    console.print("[bold]ppmlx component installer[/bold]")
-    console.print("[dim]Base install is lean (~400 MB). Add components as needed.[/dim]")
-    console.print()
-
-    # Show status table first
-    status_table()
-
-    installable = [c for c in COMPONENTS if not _is_installed(c)]
-    if not installable:
-        console.print("[green]All components are already installed.[/green]")
-        return
-
-    choices = [
-        questionary.Choice(
-            # Plain text — no Rich markup; questionary uses its own renderer
-            title=f"{comp.label}  ({comp.size_hint})  —  {comp.description}",
-            value=comp.key,
+        lines.append(
+            f"{prefix}{row_style}"
+            f"{status:28}{comp.label:<{col_label}}"
+            f"{comp.size_hint:>{col_size}}  {comp.description}"
+            f"{reset}"
         )
-        for comp in installable
-    ]
 
-    selected_keys: list[str] | None = questionary.checkbox(
-        "Select components to install:",
-        choices=choices,
-        style=_q_style(),
-    ).ask()
+    lines.append("")
+    lines.append(
+        "\033[2m"
+        "  \033[1mi\033[0m\033[2m install   "
+        "\033[1mu\033[0m\033[2m uninstall   "
+        "\033[1mq\033[0m\033[2m / Esc  quit"
+        "\033[0m"
+    )
+    return "\n".join(lines)
 
-    if not selected_keys:
-        console.print("[dim]Nothing selected.[/dim]")
-        return
 
-    for key in selected_keys:
-        comp = _COMPONENT_MAP[key]
-        console.print(f"\nInstalling [bold]{comp.label}[/bold]…")
-        ok = _install_component(comp)
+def addons_tui() -> None:
+    """Full-screen interactive addon manager."""
+    import os
+    import tty
+    import termios
+
+    components = list(COMPONENTS)
+    cursor = 0
+    statuses = [_is_installed(c) for c in components]
+
+    def _refresh() -> None:
+        # Clear screen and redraw
+        print("\033[2J\033[H", end="", flush=True)
+        print(_render(components, cursor, statuses), flush=True)
+
+    def _read_key() -> str:
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            ch2 = sys.stdin.read(1)
+            if ch2 == "[":
+                ch3 = sys.stdin.read(1)
+                return {"A": "up", "B": "down"}.get(ch3, "")
+            return "esc"
+        return ch
+
+    def _do_install() -> None:
+        comp = components[cursor]
+        if statuses[cursor]:
+            print("\033[2J\033[H", end="")
+            console.print(f"[yellow]{comp.label} is already installed.[/yellow]")
+            input("\nPress Enter to continue…")
+            return
+        print("\033[2J\033[H", end="")
+        console.print(f"Installing [bold]{comp.label}[/bold] ({comp.size_hint})…\n")
+        ok = _install(comp)
+        statuses[cursor] = _is_installed(comp)  # re-check
         if ok:
-            console.print(f"  {_CHECKMARK} [green]{comp.label} installed[/green]")
+            console.print(f"\n[green]✓ {comp.label} installed.[/green]")
         else:
-            console.print(f"  {_CROSS} [red]{comp.label} failed[/red]")
-            console.print(f"  [dim]Try manually: pip install {' '.join(comp.packages)}[/dim]")
+            console.print(f"\n[red]✗ Installation failed.[/red]")
+            console.print(f"[dim]Try: pip install {' '.join(comp.packages)}[/dim]")
+        input("\nPress Enter to continue…")
 
-    console.print("\n[green]Done.[/green] Run [bold]ppmlx install --status[/bold] to verify.")
-
-
-def uninstall_interactive() -> None:
-    """Interactive uninstall wizard — checkbox picker for installed components."""
-    import questionary
-
-    console.print()
-    console.print("[bold]ppmlx component uninstaller[/bold]")
-    console.print()
-
-    installed = [c for c in COMPONENTS if _is_installed(c)]
-    if not installed:
-        console.print("[dim]No optional components are installed.[/dim]")
-        return
-
-    choices = [
-        questionary.Choice(
-            title=f"{comp.label}  ({comp.size_hint})  —  {comp.description}",
-            value=comp.key,
-        )
-        for comp in installed
-    ]
-
-    selected_keys: list[str] | None = questionary.checkbox(
-        "Select components to remove:",
-        choices=choices,
-        style=_q_style(),
-    ).ask()
-
-    if not selected_keys:
-        console.print("[dim]Nothing selected.[/dim]")
-        return
-
-    # Confirm
-    labels = ", ".join(_COMPONENT_MAP[k].label for k in selected_keys)
-    confirmed = questionary.confirm(
-        f"Remove {labels}?", default=False,
-    ).ask()
-    if not confirmed:
-        console.print("[dim]Cancelled.[/dim]")
-        return
-
-    for key in selected_keys:
-        comp = _COMPONENT_MAP[key]
-        console.print(f"\nRemoving [bold]{comp.label}[/bold]…")
-        ok = _uninstall_component(comp)
+    def _do_uninstall() -> None:
+        comp = components[cursor]
+        if not statuses[cursor]:
+            print("\033[2J\033[H", end="")
+            console.print(f"[yellow]{comp.label} is not installed.[/yellow]")
+            input("\nPress Enter to continue…")
+            return
+        print("\033[2J\033[H", end="")
+        console.print(f"Removing [bold]{comp.label}[/bold]…\n")
+        ok = _uninstall(comp)
+        statuses[cursor] = _is_installed(comp)  # re-check
         if ok:
-            console.print(f"  {_CHECKMARK} [green]{comp.label} removed[/green]")
+            console.print(f"\n[green]✓ {comp.label} removed.[/green]")
         else:
-            console.print(f"  {_CROSS} [red]Removal failed[/red]")
+            console.print(f"\n[red]✗ Removal failed.[/red]")
+        input("\nPress Enter to continue…")
 
-    console.print("\n[green]Done.[/green]")
+    if not sys.stdin.isatty():
+        # Non-interactive — just print status
+        _print_status_plain(components, statuses)
+        return
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        _refresh()
+        while True:
+            key = _read_key()
+            if key in ("q", "esc", "\x03"):
+                break
+            elif key == "up":
+                cursor = (cursor - 1) % len(components)
+                _refresh()
+            elif key == "down":
+                cursor = (cursor + 1) % len(components)
+                _refresh()
+            elif key == "i":
+                _do_install()
+                _refresh()
+            elif key == "u":
+                _do_uninstall()
+                _refresh()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        print("\033[2J\033[H", end="")  # clear on exit
+
+
+def _print_status_plain(components: list[Component], statuses: list[bool]) -> None:
+    for comp, installed in zip(components, statuses):
+        mark = "✓" if installed else "✗"
+        console.print(f"  {mark}  {comp.label:<26} {comp.size_hint:>10}  {comp.description}")
 
 
 # ── On-demand prompt ───────────────────────────────────────────────────
 
 def prompt_install_if_missing(key: str, feature_name: str) -> bool:
-    """If a component is missing, offer to install it interactively.
-
-    Returns True if available after the prompt.
-    """
+    """Offer to install a missing component interactively."""
     comp = _COMPONENT_MAP.get(key)
-    if not comp:
-        return False
-    if _is_installed(comp):
-        return True
+    if not comp or _is_installed(comp):
+        return comp is not None and _is_installed(comp)
 
     import questionary
     console.print(
-        f"\n[yellow]{feature_name} requires the "
-        f"[bold]{comp.label}[/bold] component ({comp.size_hint}).[/yellow]"
+        f"\n[yellow]{feature_name} requires [bold]{comp.label}[/bold] ({comp.size_hint}).[/yellow]"
     )
     console.print(f"[dim]{comp.description}[/dim]\n")
 
     if not questionary.confirm(f"Install {comp.label} now?", default=True).ask():
-        console.print(f"[dim]Skipped. Run: ppmlx install {key}[/dim]")
+        console.print(f"[dim]Run: ppmlx addons[/dim]")
         return False
 
     return install_component(key)

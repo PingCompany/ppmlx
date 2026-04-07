@@ -595,45 +595,28 @@ def main(
 
 
 @app.command()
-def install(
-    component: Optional[str] = typer.Argument(None, help="Component: vision, embeddings, voice, analytics"),
-    status: bool = typer.Option(False, "--status", "-s", help="Show installation status"),
-    remove: bool = typer.Option(False, "--remove", "-r", help="Remove (uninstall) instead of install"),
+def addons(
+    component: Optional[str] = typer.Argument(None, help="Component key: vision, embeddings, voice, analytics"),
+    remove: bool = typer.Option(False, "--remove", "-r", help="Uninstall instead of install"),
 ):
-    """Install or remove optional components.
+    """Manage optional components (vision, voice, embeddings, analytics).
 
-    Run without arguments for interactive mode. Components are kept
-    separate from the base install to avoid bloating the core package.
+    Without arguments opens an interactive menu.
+    Press ↑↓ to navigate, i to install, u to uninstall, q to quit.
 
     \b
     Examples:
-      ppmlx install                    # interactive install picker
-      ppmlx install voice              # install voice I/O directly
-      ppmlx install --remove           # interactive uninstall picker
-      ppmlx install --remove voice     # remove voice I/O directly
-      ppmlx install --status           # show what's installed
+      ppmlx addons                  # interactive menu
+      ppmlx addons voice            # install voice directly
+      ppmlx addons --remove voice   # remove voice directly
     """
-    from ppmlx.installer import (
-        status_table, install_interactive, install_component,
-        uninstall_interactive, uninstall_component,
-    )
-
-    if status:
-        status_table()
-        return
-
-    if remove:
-        if component:
-            ok = uninstall_component(component)
-            raise typer.Exit(0 if ok else 1)
-        uninstall_interactive()
-        return
+    from ppmlx.installer import install_component, uninstall_component, addons_tui
 
     if component:
-        ok = install_component(component)
+        ok = (uninstall_component if remove else install_component)(component)
         raise typer.Exit(0 if ok else 1)
 
-    install_interactive()
+    addons_tui()
 
 
 @app.command()
