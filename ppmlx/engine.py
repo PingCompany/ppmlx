@@ -387,6 +387,21 @@ class TextEngine:
         except TypeError:
             # Older mlx-lm doesn't support tokenizer_config kwarg
             model, tokenizer = mlx_load(path)
+        except AttributeError:
+            # Newer transformers has a bug in _patch_mistral_regex where it calls
+            # .backend_tokenizer on the raw tokenizers.Tokenizer object (which doesn't
+            # have that attribute). Fall back to loading without the flag — it only
+            # suppresses a regex warning and is safe to skip.
+            # Temporarily silence the resulting "incorrect regex" warning from
+            # the transformers tokenizer logger so it doesn't confuse users.
+            import logging as _logging
+            _tok_log = _logging.getLogger("transformers.tokenization_utils_tokenizers")
+            _saved_level = _tok_log.level
+            _tok_log.setLevel(_logging.ERROR)
+            try:
+                model, tokenizer = mlx_load(path)
+            finally:
+                _tok_log.setLevel(_saved_level)
         self._ensure_chat_template(tokenizer, repo_id)
         return LoadedModel(repo_id=repo_id, model=model, tokenizer=tokenizer)
 

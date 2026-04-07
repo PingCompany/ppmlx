@@ -5,12 +5,13 @@ all running locally on Apple Silicon via MLX.
 
 Dependencies (optional extras):
     pip install ppmlx[voice]
-    # or manually: pip install mlx-whisper mlx-audio sounddevice soundfile
+    # or manually: pip install mlx-whisper mlx-audio sounddevice soundfile pynput
 """
 from __future__ import annotations
 
 import logging
-import tempfile
+import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,9 @@ class VoiceConfig:
     silence_threshold: float = 0.01  # RMS threshold for silence detection
     silence_duration: float = 1.5  # Seconds of silence to stop recording
     max_record_seconds: float = 30.0  # Maximum recording duration
+    # Push-to-talk: hold ptt_key while speaking, release to transcribe.
+    ptt_mode: bool = False
+    ptt_key: str = "space"  # Accepts 'space', 'f5', single chars, …
 
 
 class VoiceInput:
@@ -53,20 +57,96 @@ class VoiceInput:
                 "Install with: pip install mlx-whisper"
             )
 
-    def record_and_transcribe(self) -> str:
-        """Record from microphone until silence, then transcribe.
+    @staticmethod
+    def _check_ffmpeg() -> None:
+        """Raise a clear error if ffmpeg is not on PATH (required for file transcription)."""
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "ffmpeg is required to transcribe audio files but was not found on PATH.\n"
+                "Install it with:  brew install ffmpeg"
+            )
 
-        Returns the transcribed text.
+    def record_and_transcribe(self) -> str:
+        """Record from microphone, then transcribe.
+
+        Uses push-to-talk (hold key, release to send) when ptt_mode is True,
+        otherwise records until silence is detected.
+
+        Returns the transcribed text, or "" if nothing was captured.
         """
         self._load_whisper()
-        audio = self._record_until_silence()
+        if self.config.ptt_mode:
+            audio = self._record_ptt()
+        else:
+            audio = self._record_until_silence()
         if audio is None or len(audio) == 0:
             return ""
+        # Skip clips that are too short to contain real speech (< 0.3 s)
+        if len(audio) < self.config.sample_rate * 0.3:
+            return ""
         return self._transcribe(audio)
+
+    def _record_ptt(self) -> Any | None:
+        """Record audio while the configured PTT key is held down.
+
+        Blocks until the key is first pressed, then records until it is released.
+        Returns a 1-D float32 numpy array at self.config.sample_rate Hz, or None.
+        """
+        try:
+            import sounddevice as sd
+            import numpy as np
+        except ImportError:
+            raise ImportError(
+                "sounddevice is required for microphone recording. "
+                "Install with: brew install portaudio && pip install sounddevice"
+            )
+        try:
+            from pynput import keyboard as kb
+        except ImportError:
+            raise ImportError(
+                "pynput is required for push-to-talk. "
+                "Install with: pip install pynput  (or reinstall ppmlx[voice])"
+            )
+
+        target_key = _parse_pynput_key(self.config.ptt_key, kb)
+
+        press_event = threading.Event()
+        release_event = threading.Event()
+
+        def on_press(key: Any) -> None:
+            if _key_matches(key, target_key):
+                press_event.set()
+
+        def on_release(key: Any) -> None:
+            if _key_matches(key, target_key):
+                release_event.set()
+
+        listener = kb.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+
+        try:
+            press_event.wait()  # block until key goes down
+
+            sr = self.config.sample_rate
+            chunk_size = int(sr * 0.05)  # 50 ms chunks
+            chunks: list[Any] = []
+
+            with sd.InputStream(samplerate=sr, channels=1, dtype="float32",
+                                blocksize=chunk_size) as stream:
+                while not release_event.is_set():
+                    data, _ = stream.read(chunk_size)
+                    chunks.append(data.copy())
+        finally:
+            listener.stop()
+
+        if not chunks:
+            return None
+        return np.concatenate(chunks, axis=0).flatten()
 
     def transcribe_file(self, path: str | Path) -> str:
         """Transcribe an audio file."""
         self._load_whisper()
+        self._check_ffmpeg()  # mlx_whisper shells out to ffmpeg for file decoding
         result = self._whisper.transcribe(
             str(path),
             path_or_hf_repo=self.config.stt_model,
@@ -121,21 +201,24 @@ class VoiceInput:
         return np.concatenate(chunks, axis=0).flatten()
 
     def _transcribe(self, audio: Any) -> str:
-        """Transcribe a numpy audio array."""
-        import soundfile as sf
+        """Transcribe a numpy audio array.
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            sf.write(f.name, audio, self.config.sample_rate)
-            tmp_path = f.name
+        Passes the array directly to mlx_whisper (which accepts both file paths
+        and numpy arrays), avoiding the ffmpeg dependency that the file-path
+        code path requires.
 
-        try:
-            result = self._whisper.transcribe(
-                tmp_path,
-                path_or_hf_repo=self.config.stt_model,
-            )
-            return result.get("text", "").strip()
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+        condition_on_previous_text=False prevents Whisper from auto-completing
+        prior context (the main cause of "Thank you" hallucinations on short clips).
+        no_speech_threshold filters segments where Whisper itself isn't confident
+        speech was present.
+        """
+        result = self._whisper.transcribe(
+            audio,
+            path_or_hf_repo=self.config.stt_model,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+        )
+        return result.get("text", "").strip()
 
 
 class VoiceOutput:
@@ -224,3 +307,74 @@ class VoiceOutput:
             sf.write(str(path), combined, sr)
 
         return path
+
+
+# ---------------------------------------------------------------------------
+# Push-to-talk helpers (module level so they can be unit-tested independently)
+# ---------------------------------------------------------------------------
+
+def _parse_pynput_key(key_str: str, kb: Any) -> Any:
+    """Translate a human-friendly key name to a pynput Key or KeyCode.
+
+    Supported formats
+    -----------------
+    - Named special keys: 'space', 'enter', 'tab', 'esc'/'escape',
+      'backspace', 'delete', 'home', 'end', 'up', 'down', 'left', 'right',
+      'ctrl'/'ctrl_l'/'ctrl_r', 'shift'/'shift_l'/'shift_r',
+      'alt'/'alt_l'/'alt_r', 'cmd'/'super', 'caps_lock', 'insert',
+      'page_up', 'page_down', 'num_lock', 'scroll_lock', 'pause', 'menu'
+    - Function keys: 'f1' … 'f20'
+    - Single printable character: 'r', 'g', '0', …
+    """
+    import re
+
+    key_str = key_str.strip().lower()
+
+    _NAMED: dict[str, Any] = {
+        "space": kb.Key.space,
+        "enter": kb.Key.enter, "return": kb.Key.enter,
+        "tab": kb.Key.tab,
+        "esc": kb.Key.esc, "escape": kb.Key.esc,
+        "backspace": kb.Key.backspace,
+        "delete": kb.Key.delete,
+        "home": kb.Key.home, "end": kb.Key.end,
+        "up": kb.Key.up, "down": kb.Key.down,
+        "left": kb.Key.left, "right": kb.Key.right,
+        "ctrl": kb.Key.ctrl_l, "ctrl_l": kb.Key.ctrl_l, "ctrl_r": kb.Key.ctrl_r,
+        "shift": kb.Key.shift_l, "shift_l": kb.Key.shift_l, "shift_r": kb.Key.shift_r,
+        "alt": kb.Key.alt_l, "alt_l": kb.Key.alt_l, "alt_r": kb.Key.alt_r,
+        "cmd": kb.Key.cmd, "super": kb.Key.cmd,
+        "caps_lock": kb.Key.caps_lock,
+        "insert": kb.Key.insert,
+        "page_up": kb.Key.page_up, "page_down": kb.Key.page_down,
+        "num_lock": kb.Key.num_lock,
+        "scroll_lock": kb.Key.scroll_lock,
+        "pause": kb.Key.pause,
+        "menu": kb.Key.menu,
+    }
+
+    if key_str in _NAMED:
+        return _NAMED[key_str]
+
+    # Function keys f1–f20
+    m = re.match(r"^f(\d{1,2})$", key_str)
+    if m:
+        n = int(m.group(1))
+        fkey = getattr(kb.Key, f"f{n}", None)
+        if fkey is not None:
+            return fkey
+
+    # Single printable character
+    if len(key_str) == 1:
+        return kb.KeyCode.from_char(key_str)
+
+    raise ValueError(
+        f"Unknown PTT key: {key_str!r}. "
+        "Use 'space', 'f5', 'ctrl', or a single character like 'r'. "
+        "Set [voice] ptt_key in ~/.ppmlx/config.toml."
+    )
+
+
+def _key_matches(pressed: Any, target: Any) -> bool:
+    """Return True if the pynput key event matches the target key."""
+    return pressed == target

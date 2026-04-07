@@ -947,12 +947,24 @@ def agent(
     # Set up voice if requested
     voice_in = None
     voice_out = None
+    vcfg = None
     if voice:
         from ppmlx.installer import prompt_install_if_missing
         if not prompt_install_if_missing("voice", "Voice mode"):
             raise typer.Exit(1)
         from ppmlx.voice import VoiceConfig, VoiceInput, VoiceOutput
-        vcfg = VoiceConfig()
+        from ppmlx.config import load_config as _load_cfg
+        _vc = _load_cfg().voice
+        vcfg = VoiceConfig(
+            stt_model=_vc.stt_model,
+            tts_model=_vc.tts_model,
+            tts_voice=_vc.tts_voice,
+            ptt_mode=_vc.ptt_mode,
+            ptt_key=_vc.ptt_key,
+            silence_threshold=_vc.silence_threshold,
+            silence_duration=_vc.silence_duration,
+        )
+        # CLI args override config-file values
         if stt_model:
             vcfg.stt_model = stt_model
         if tts_model:
@@ -962,6 +974,10 @@ def agent(
         voice_in = VoiceInput(vcfg)
         voice_out = VoiceOutput(vcfg)
         console.print("[green]Voice mode enabled[/green]")
+        if vcfg.ptt_mode:
+            console.print(f"  Input: push-to-talk ([bold]{vcfg.ptt_key.upper()}[/bold])")
+        else:
+            console.print("  Input: auto-silence")
         console.print(f"  STT: {vcfg.stt_model}")
         console.print(f"  TTS: {vcfg.tts_model}")
 
@@ -979,7 +995,7 @@ def agent(
         f"  Max iterations: {max_iterations}\n"
         f"  Working dir: {agent_cfg.working_dir}\n\n"
         f"[dim]Type your instructions. The agent will plan and execute.\n"
-        f"{'Press Enter for voice input. ' if voice else ''}"
+        f"{'Hold [' + vcfg.ptt_key.upper() + '] to record, release to send. ' if (voice and vcfg and vcfg.ptt_mode) else ('Press Enter for voice input. ' if voice else '')}"
         f"Type /exit to quit.[/dim]",
         title="Agent",
         border_style="green" if not sandbox else "red",
@@ -1018,8 +1034,13 @@ def agent(
     # REPL loop
     while True:
         try:
-            if voice and voice_in:
-                console.print("\n[bold cyan]🎤 Listening...[/bold cyan] (speak, then pause)")
+            if voice and voice_in and vcfg:
+                if vcfg.ptt_mode:
+                    console.print(
+                        f"\n[bold cyan]🎤 Hold [{vcfg.ptt_key.upper()}] to record…[/bold cyan]"
+                    )
+                else:
+                    console.print("\n[bold cyan]🎤 Listening…[/bold cyan] (speak, then pause)")
                 user_input = voice_in.record_and_transcribe()
                 if not user_input:
                     console.print("[dim]No speech detected.[/dim]")

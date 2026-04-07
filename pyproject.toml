@@ -1,6 +1,6 @@
 [project]
 name = "ppmlx"
-version = "0.8.1"
+version = "0.8.2"
 description = "CLI for running LLMs on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -45,6 +45,7 @@ voice = [
     "mlx-audio>=0.4 ; sys_platform == 'darwin'",
     "sounddevice>=0.4",
     "soundfile>=0.12",
+    "pynput>=1.7",
 ]
 # Analytics (anonymous usage stats)
 analytics = ["posthog>=7.9,<8"]

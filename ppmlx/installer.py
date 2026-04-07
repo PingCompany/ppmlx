@@ -95,13 +95,13 @@ def _pip_install(packages: list[str], timeout: int = 300) -> bool:
 
     if shutil.which("uv"):
         env = {**os.environ, "VIRTUAL_ENV": venv}
-        r = subprocess.run(["uv", "pip", "install"] + packages, env=env, timeout=timeout)
+        r = subprocess.run(["uv", "pip", "install"] + packages, env=env, capture_output=True, timeout=timeout)
         if r.returncode == 0:
             return True
 
     return subprocess.run(
         [sys.executable, "-m", "pip", "install", "--quiet"] + packages,
-        timeout=timeout,
+        capture_output=True, timeout=timeout,
     ).returncode == 0
 
 
@@ -114,13 +114,13 @@ def _pip_uninstall(package_names: list[str], timeout: int = 300) -> bool:
 
     if shutil.which("uv"):
         env = {**os.environ, "VIRTUAL_ENV": venv}
-        r = subprocess.run(["uv", "pip", "uninstall"] + package_names, env=env, timeout=timeout)
+        r = subprocess.run(["uv", "pip", "uninstall"] + package_names, env=env, capture_output=True, timeout=timeout)
         if r.returncode == 0:
             return True
 
     return subprocess.run(
         [sys.executable, "-m", "pip", "uninstall", "--yes"] + package_names,
-        timeout=timeout,
+        capture_output=True, timeout=timeout,
     ).returncode == 0
 
 
@@ -129,7 +129,7 @@ def _pip_uninstall(package_names: list[str], timeout: int = 300) -> bool:
 def _install(comp: Component) -> bool:
     for formula in comp.requires_brew:
         if not _brew_installed(formula):
-            if subprocess.run(["brew", "install", formula], timeout=120).returncode != 0:
+            if subprocess.run(["brew", "install", formula], capture_output=True, timeout=120).returncode != 0:
                 return False
     return _pip_install(comp.packages)
 
@@ -148,7 +148,8 @@ def install_component(key: str) -> bool:
         console.print(f"[green]{comp.label} is already installed.[/green]")
         return True
     console.print(f"Installing [bold]{comp.label}[/bold]…")
-    ok = _install(comp)
+    with console.status("[cyan]Downloading and installing packages — this may take a moment…[/cyan]"):
+        ok = _install(comp)
     console.print(f"  [green]✓ Done[/green]" if ok else f"  [red]✗ Failed[/red]")
     if not ok:
         console.print(f"  [dim]Try: pip install {' '.join(comp.packages)}[/dim]")
@@ -164,7 +165,8 @@ def uninstall_component(key: str) -> bool:
         console.print(f"[yellow]{comp.label} is not installed.[/yellow]")
         return True
     console.print(f"Removing [bold]{comp.label}[/bold]…")
-    ok = _uninstall(comp)
+    with console.status("[cyan]Removing packages…[/cyan]"):
+        ok = _uninstall(comp)
     console.print(f"  [green]✓ Removed[/green]" if ok else f"  [red]✗ Failed[/red]")
     return ok
 
@@ -246,7 +248,8 @@ def addons_tui() -> None:
             return
         print("\033[2J\033[H", end="")
         console.print(f"Installing [bold]{comp.label}[/bold] ({comp.size_hint})…\n")
-        ok = _install(comp)
+        with console.status("[cyan]Downloading and installing packages — this may take a moment…[/cyan]"):
+            ok = _install(comp)
         statuses[cursor] = _is_installed(comp)  # re-check
         if ok:
             console.print(f"\n[green]✓ {comp.label} installed.[/green]")
@@ -264,7 +267,8 @@ def addons_tui() -> None:
             return
         print("\033[2J\033[H", end="")
         console.print(f"Removing [bold]{comp.label}[/bold]…\n")
-        ok = _uninstall(comp)
+        with console.status("[cyan]Removing packages…[/cyan]"):
+            ok = _uninstall(comp)
         statuses[cursor] = _is_installed(comp)  # re-check
         if ok:
             console.print(f"\n[green]✓ {comp.label} removed.[/green]")

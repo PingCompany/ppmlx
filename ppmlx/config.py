@@ -92,6 +92,21 @@ class AnalyticsConfig:
 
 
 @dataclass
+class VoiceSettings:
+    """Voice I/O settings — written to [voice] in config.toml."""
+    stt_model: str = "mlx-community/whisper-large-v3-turbo"
+    tts_model: str = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
+    tts_voice: str | None = None
+    # Push-to-talk: hold ptt_key to record, release to send.
+    # Set ptt_mode = true to enable; ptt_key accepts 'space', 'f5', single chars, …
+    ptt_mode: bool = False
+    ptt_key: str = "space"
+    # Auto-silence params (used when ptt_mode = false)
+    silence_threshold: float = 0.01
+    silence_duration: float = 1.5
+
+
+@dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
@@ -103,6 +118,7 @@ class Config:
     ui: UIConfig = field(default_factory=UIConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
+    voice: VoiceSettings = field(default_factory=VoiceSettings)
 
 
 def get_ppmlx_dir() -> Path:
@@ -235,6 +251,15 @@ def _apply_toml(cfg: Config, data: dict) -> None:
             cfg.analytics.project_api_key = str(an["website_id"]).strip()
         if "respect_do_not_track" in an:
             cfg.analytics.respect_do_not_track = bool(an["respect_do_not_track"])
+    if "voice" in data:
+        v = data["voice"]
+        if "stt_model" in v: cfg.voice.stt_model = str(v["stt_model"])
+        if "tts_model" in v: cfg.voice.tts_model = str(v["tts_model"])
+        if "tts_voice" in v: cfg.voice.tts_voice = str(v["tts_voice"]) if v["tts_voice"] else None
+        if "ptt_mode" in v: cfg.voice.ptt_mode = bool(v["ptt_mode"])
+        if "ptt_key" in v: cfg.voice.ptt_key = str(v["ptt_key"]).strip().lower()
+        if "silence_threshold" in v: cfg.voice.silence_threshold = float(v["silence_threshold"])
+        if "silence_duration" in v: cfg.voice.silence_duration = float(v["silence_duration"])
 
 
 def _apply_env(cfg: Config) -> None:

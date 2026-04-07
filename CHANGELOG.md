@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-04-07
+
+### Added
+- **Push-to-talk** voice input: hold a key to record, release to send — configurable via `[voice] ptt_mode` and `ptt_key` in `~/.ppmlx/config.toml`
+- `[voice]` config section: `stt_model`, `tts_model`, `tts_voice`, `ptt_mode`, `ptt_key`, `silence_threshold`, `silence_duration`
+- `pynput` added to `ppmlx[voice]` extras for PTT key detection
+
+### Fixed
+- **"Thank you" hallucination**: pass `condition_on_previous_text=False` and `no_speech_threshold=0.6` to Whisper; skip clips < 0.3 s
+- **ffmpeg not required for live recording**: pass numpy array directly to mlx_whisper instead of writing a temp WAV (ffmpeg only needed for `transcribe_file`)
+- **Tokenizer regex warning silenced**: suppress the "incorrect regex pattern" log on Qwen/Mistral-derived models when transformers has the `_patch_mistral_regex` bug
+- **`AttributeError` on model load**: catch `_patch_mistral_regex` crash in newer transformers and fall back gracefully
+- Installer now shows a spinner + captures subprocess output during addon install/uninstall
+
 ## [0.8.1] - 2026-04-07
 
 ### Fixed
