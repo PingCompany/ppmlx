@@ -839,6 +839,170 @@ def gateway(
 
 
 @app.command()
+def agent(
+    model: Optional[str] = typer.Argument(None, help="Model name or alias"),
+    system: Optional[str] = typer.Option(None, "--system", "-s", help="System prompt"),
+    sandbox: bool = typer.Option(False, "--sandbox", help="Sandbox mode (read-only tools)"),
+    voice: bool = typer.Option(False, "--voice", "-v", help="Enable voice input/output"),
+    stt_model: Optional[str] = typer.Option(None, "--stt-model", help="STT model (default: whisper-large-v3-turbo)"),
+    tts_model: Optional[str] = typer.Option(None, "--tts-model", help="TTS model (default: Voxtral-4B-TTS)"),
+    tts_voice: Optional[str] = typer.Option(None, "--tts-voice", help="TTS voice name"),
+    max_iterations: int = typer.Option(10, "--max-iterations", help="Max agent iterations per turn"),
+    temperature: Optional[float] = typer.Option(None, "--temperature", "-t"),
+    max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
+):
+    """Interactive agent with tool execution (bash, file read/write).
+
+    The agent can read files, write files, list directories, and run
+    shell commands on your machine. Use --sandbox for read-only mode.
+
+    With --voice, enables push-to-talk voice input (Whisper STT) and
+    spoken responses (Voxtral TTS). All processing runs locally on
+    Apple Silicon via MLX.
+    """
+    _track_usage("agent_started", {"voice": voice, "sandbox": sandbox})
+
+    if not model:
+        model = _pick_model()
+    from ppmlx.models import resolve_alias, get_model_path, download_model, ModelNotFoundError
+    from ppmlx.memory import check_memory_warning
+
+    try:
+        repo_id = resolve_alias(model)
+    except ModelNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    local_path = get_model_path(repo_id)
+    if not local_path:
+        console.print(f"[yellow]Downloading {model}...[/yellow]")
+        try:
+            download_model(model)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Download cancelled.[/yellow]")
+            raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    warning = check_memory_warning(get_model_path(repo_id))
+    if warning:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+    # Set up agent
+    from ppmlx.agent import AgentConfig, AgentRuntime, AgentStep
+
+    agent_cfg = AgentConfig(
+        model=repo_id,
+        max_iterations=max_iterations,
+        sandbox=sandbox,
+        temperature=temperature or 0.7,
+        max_tokens=max_tokens,
+    )
+
+    # Set up voice if requested
+    voice_in = None
+    voice_out = None
+    if voice:
+        try:
+            from ppmlx.voice import VoiceConfig, VoiceInput, VoiceOutput
+            vcfg = VoiceConfig()
+            if stt_model:
+                vcfg.stt_model = stt_model
+            if tts_model:
+                vcfg.tts_model = tts_model
+            if tts_voice:
+                vcfg.tts_voice = tts_voice
+            voice_in = VoiceInput(vcfg)
+            voice_out = VoiceOutput(vcfg)
+            console.print("[green]Voice mode enabled[/green]")
+            console.print(f"  STT: {vcfg.stt_model}")
+            console.print(f"  TTS: {vcfg.tts_model}")
+        except ImportError as e:
+            console.print(f"[red]Voice dependencies missing: {e}[/red]")
+            console.print("[dim]Install with: pip install mlx-whisper mlx-audio sounddevice soundfile[/dim]")
+            raise typer.Exit(1)
+
+    # Display agent info
+    from ppmlx.agent import BUILTIN_TOOL_DEFINITIONS
+    mode_str = "[red]SANDBOX[/red] " if sandbox else ""
+    tool_names = [t["function"]["name"] for t in BUILTIN_TOOL_DEFINITIONS]
+    if sandbox:
+        tool_names = [n for n in tool_names if n != "write_file"]
+    tools_str = ", ".join(tool_names)
+    console.print(Panel(
+        f"[bold green]ppmlx agent[/bold green] {mode_str}\n"
+        f"  Model: {model}\n"
+        f"  Tools: {tools_str}\n"
+        f"  Max iterations: {max_iterations}\n"
+        f"  Working dir: {agent_cfg.working_dir}\n\n"
+        f"[dim]Type your instructions. The agent will plan and execute.\n"
+        f"{'Press Enter for voice input. ' if voice else ''}"
+        f"Type /exit to quit.[/dim]",
+        title="Agent",
+        border_style="green" if not sandbox else "red",
+    ))
+
+    def _on_step(step: AgentStep) -> None:
+        """Display agent step progress."""
+        if step.tool_calls:
+            for tc in step.tool_calls:
+                name = tc.get("name", "?")
+                args = tc.get("arguments", "")
+                if isinstance(args, str) and len(args) > 100:
+                    args = args[:100] + "..."
+                console.print(f"  [yellow]⚡ {name}[/yellow] [dim]{args}[/dim]")
+            for tr in step.tool_results:
+                color = "red" if tr.is_error else "green"
+                output = tr.output
+                if len(output) > 200:
+                    output = output[:200] + f"... ({len(tr.output)} chars)"
+                console.print(f"  [{color}]→ {output}[/{color}]")
+
+    runtime = AgentRuntime(config=agent_cfg, on_step=_on_step)
+
+    # REPL loop
+    while True:
+        try:
+            if voice and voice_in:
+                console.print("\n[bold cyan]🎤 Listening...[/bold cyan] (speak, then pause)")
+                user_input = voice_in.record_and_transcribe()
+                if not user_input:
+                    console.print("[dim]No speech detected.[/dim]")
+                    continue
+                console.print(f"[cyan]You:[/cyan] {user_input}")
+            else:
+                user_input = console.input("\n[bold cyan]You:[/bold cyan] ").strip()
+
+            if not user_input:
+                continue
+            if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
+                break
+
+            # Run agent
+            console.print()
+            answer, steps = runtime.run(user_input, system_prompt=system)
+
+            # Display answer
+            console.print(f"\n[bold green]Agent:[/bold green] {answer}")
+
+            # Speak the answer
+            if voice and voice_out and answer:
+                try:
+                    voice_out.speak(answer)
+                except Exception as e:
+                    log.debug("TTS failed: %s", e)
+
+        except KeyboardInterrupt:
+            console.print("\n[dim]Use /exit to quit.[/dim]")
+            continue
+        except EOFError:
+            break
+
+    console.print("[dim]Agent session ended.[/dim]")
+
+
+@app.command()
 def run(
     model: Optional[str] = typer.Argument(None, help="Model name or alias"),
     system: Optional[str] = typer.Option(None, "--system", "-s", help="System prompt"),

@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-07
+
+### Added
+- **Agent mode** (`ppmlx agent`): interactive agent REPL with tool execution
+  - Built-in tools: `bash`, `read_file`, `write_file`, `list_files`
+  - `--sandbox` flag for read-only mode (disables write/destructive commands)
+  - Live tool execution display with color-coded results
+  - Multi-turn conversations with full context
+  - Configurable max iterations, temperature, model
+- **Voice mode** (`ppmlx agent --voice`): voice-powered agent
+  - Push-to-talk with automatic silence detection
+  - Speech-to-text via Whisper on MLX (`mlx-whisper`)
+  - Text-to-speech via Voxtral TTS on MLX (`mlx-audio`)
+  - All processing runs locally on Apple Silicon — fully offline
+  - Configurable STT/TTS models and voices
+  - `--stt-model`, `--tts-model`, `--tts-voice` options
+- `ppmlx/voice.py` — `VoiceInput` (STT) and `VoiceOutput` (TTS) classes
+- `[voice]` optional dependency group: `pip install ppmlx[voice]`
+
 ## [0.7.1] - 2026-04-07
 
 ### Fixed

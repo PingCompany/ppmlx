@@ -1,6 +1,6 @@
 [project]
 name = "ppmlx"
-version = "0.7.1"
+version = "0.8.0"
 description = "CLI for running LLMs on Apple Silicon via MLX"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -40,6 +40,12 @@ dependencies = [
 
 [project.optional-dependencies]
 embeddings = ["mlx-embeddings>=0.0.5 ; sys_platform == 'darwin'"]
+voice = [
+    "mlx-whisper>=0.4 ; sys_platform == 'darwin'",
+    "mlx-audio>=0.4 ; sys_platform == 'darwin'",
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
+]
 
 [project.urls]
 Homepage = "https://ppmlx.dev"
