@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-07
+
+### Added
+- Auto draft model pairing for speculative decoding (`DRAFT_PAIRS` registry)
+- `get_draft_model()` auto-detects best draft model for a target (e.g. qwen3.5:9b -> 0.8b)
+- `auto_speculative` config option (`[defaults]`, env `PPMLX_AUTO_SPECULATIVE`)
+- User-defined draft pairs via `~/.ppmlx/draft_pairs.json`
+- Server auto-speculative: automatically pairs draft models when `auto_speculative=true`
+- `ppmlx config bench --speculative` flag for normal vs speculative side-by-side comparison
+- `ppmlx config bench --draft-model` and `--speculative-tokens` options
+- `print_speculative_comparison()` with speedup percentages and multipliers
+- Gemma-4 channel token normalization (`_Gemma4Normalizer` state machine)
+- KV-cache patch for `RotatingKVCache` crash when prompt exceeds sliding window
+- Thinking model detection for Gemma-4-style `<|think|>` markers
+- Registry fetch module
+- TUI config refactor
+
 ## [0.4.1] - 2026-03-31
 
 ### Changed
