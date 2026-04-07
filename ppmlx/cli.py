@@ -595,6 +595,35 @@ def main(
 
 
 @app.command()
+def install(
+    component: Optional[str] = typer.Argument(None, help="Component to install: voice, embeddings"),
+    status: bool = typer.Option(False, "--status", "-s", help="Show installation status"),
+):
+    """Install optional components (voice, embeddings).
+
+    Run without arguments for interactive mode. Components are kept
+    separate from the base install to avoid bloating the core package.
+
+    \b
+    Examples:
+      ppmlx install              # interactive picker
+      ppmlx install voice        # install voice I/O directly
+      ppmlx install --status     # show what's installed
+    """
+    from ppmlx.installer import status_table, install_interactive, install_component
+
+    if status:
+        status_table()
+        return
+
+    if component:
+        ok = install_component(component)
+        raise typer.Exit(0 if ok else 1)
+
+    install_interactive()
+
+
+@app.command()
 def launch(
     action: Optional[str] = typer.Argument(None, help="Action: run, serve, claude, codex, opencode, openwebui, pi"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model name or alias"),
@@ -904,24 +933,22 @@ def agent(
     voice_in = None
     voice_out = None
     if voice:
-        try:
-            from ppmlx.voice import VoiceConfig, VoiceInput, VoiceOutput
-            vcfg = VoiceConfig()
-            if stt_model:
-                vcfg.stt_model = stt_model
-            if tts_model:
-                vcfg.tts_model = tts_model
-            if tts_voice:
-                vcfg.tts_voice = tts_voice
-            voice_in = VoiceInput(vcfg)
-            voice_out = VoiceOutput(vcfg)
-            console.print("[green]Voice mode enabled[/green]")
-            console.print(f"  STT: {vcfg.stt_model}")
-            console.print(f"  TTS: {vcfg.tts_model}")
-        except ImportError as e:
-            console.print(f"[red]Voice dependencies missing: {e}[/red]")
-            console.print("[dim]Install with: pip install mlx-whisper mlx-audio sounddevice soundfile[/dim]")
+        from ppmlx.installer import prompt_install_if_missing
+        if not prompt_install_if_missing("voice", "Voice mode"):
             raise typer.Exit(1)
+        from ppmlx.voice import VoiceConfig, VoiceInput, VoiceOutput
+        vcfg = VoiceConfig()
+        if stt_model:
+            vcfg.stt_model = stt_model
+        if tts_model:
+            vcfg.tts_model = tts_model
+        if tts_voice:
+            vcfg.tts_voice = tts_voice
+        voice_in = VoiceInput(vcfg)
+        voice_out = VoiceOutput(vcfg)
+        console.print("[green]Voice mode enabled[/green]")
+        console.print(f"  STT: {vcfg.stt_model}")
+        console.print(f"  TTS: {vcfg.tts_model}")
 
     # Display agent info
     from ppmlx.agent import BUILTIN_TOOL_DEFINITIONS
