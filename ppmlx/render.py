@@ -10,7 +10,6 @@ from typing import Iterator
 
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.text import Text
 
 
 def print_response(

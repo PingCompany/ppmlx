@@ -848,13 +848,13 @@ def _serve_gateway(
         f"   Listening on [link]http://{cfg.host}:{cfg.port}[/link]\n"
         f"   Local server: {cfg.local_server}\n"
         f"   Routes:\n" + "\n".join(route_lines) + "\n"
-        f"\n   Endpoints:\n"
-        f"     POST /v1/chat/completions  (routed)\n"
-        f"     POST /v1/completions       (routed)\n"
-        f"     POST /v1/embeddings        (local)\n"
-        f"     GET  /v1/models            (aggregated)\n"
-        f"     GET  /gateway/routes       (routing table)\n"
-        f"     GET  /health",
+        "\n   Endpoints:\n"
+        "     POST /v1/chat/completions  (routed)\n"
+        "     POST /v1/completions       (routed)\n"
+        "     POST /v1/embeddings        (local)\n"
+        "     GET  /v1/models            (aggregated)\n"
+        "     GET  /gateway/routes       (routing table)\n"
+        "     GET  /health",
         title="ppmlx gateway",
         border_style="cyan",
     ))
@@ -2146,7 +2146,7 @@ def config_cmd(
             raise typer.Exit(1)
         msgs = []
         if hf_token is not None:
-            msgs.append(f"HuggingFace token saved")
+            msgs.append("HuggingFace token saved")
         if thinking is not None:
             msgs.append(f"Thinking {'enabled' if thinking else 'disabled'}")
         if reasoning_budget is not None:
@@ -2538,8 +2538,8 @@ def rag_list():
     console.print(table)
 
 
-@rag_app.command()
-def rm(
+@rag_app.command("rm")
+def rm_collection(
     collection: str = typer.Argument(..., help="Collection name to delete"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ):
@@ -2655,7 +2655,7 @@ def process(
             table.add_row(rel_path, size_str, out)
 
         console.print(table)
-        console.print(f"\n[dim]Run without --dry-run to process these files.[/dim]")
+        console.print("\n[dim]Run without --dry-run to process these files.[/dim]")
         return
 
     # Resume support
@@ -2749,7 +2749,7 @@ def process(
     if stats.failed == 0:
         checkpoint.cleanup(dir_path)
     else:
-        console.print(f"[yellow]Checkpoint saved. Re-run with --resume to retry failed files.[/yellow]")
+        console.print("[yellow]Checkpoint saved. Re-run with --resume to retry failed files.[/yellow]")
 
     if stats.failed > 0:
         raise typer.Exit(1)

@@ -29,13 +29,13 @@ ppmlx serve                 # start API server on :6767
 ### curl | sh (one-liner)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PingCompany/ppmlx/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/the-focus-company/ppmlx/main/scripts/install.sh | sh
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/PingCompany/ppmlx
+git clone https://github.com/the-focus-company/ppmlx
 cd ppmlx
 uv tool install .
 ```

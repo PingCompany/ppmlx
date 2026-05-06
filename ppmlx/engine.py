@@ -5,7 +5,10 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Iterator, NamedTuple
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple
+
+if TYPE_CHECKING:
+    from ppmlx.config import KVCacheConfig
 
 log = logging.getLogger("ppmlx.engine")
 
@@ -17,7 +20,6 @@ def _patch_rotating_kv_cache():
     """
     try:
         from mlx_lm.models.cache import RotatingKVCache
-        import mlx.core as mx
 
         _orig_temporal_order = RotatingKVCache._temporal_order
         _cache_trim_warned = set()

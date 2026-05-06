@@ -719,13 +719,7 @@ def test_stream_generate_with_draft_model():
 # ---------------------------------------------------------------------------
 def test_generate_without_draft_model_no_speculative_kwargs():
     """Without draft_model, mlx_lm.generate should NOT receive speculative kwargs."""
-    fake, mock_model, mock_tokenizer = _make_fake_mlx_lm(generate_return="normal")
-# TTL / auto-unload tests
-# ---------------------------------------------------------------------------
-def test_last_used_at_updated_on_load():
-    """last_used_at is set when a model is loaded."""
-    import time
-    fake, _, _ = _make_fake_mlx_lm()
+    fake, _, _ = _make_fake_mlx_lm(generate_return="normal")
     _install_fake(fake)
 
     from ppmlx.engine import TextEngine, reset_engine
@@ -778,7 +772,7 @@ def test_draft_model_uses_lru_cache():
 # ---------------------------------------------------------------------------
 # 24. Draft model participates in LRU eviction
 # ---------------------------------------------------------------------------
-def test_last_used_at_updated_on_load():
+def test_load_updates_last_used_at():
     """last_used_at is set when a model is loaded."""
     import time
     fake, _, _ = _make_fake_mlx_lm()

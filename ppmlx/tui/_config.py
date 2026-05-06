@@ -112,7 +112,6 @@ def config_menu() -> None:
     cur_tts_volume = voice.get("tts_volume", 1.10)
     cur_ptt_mode = voice.get("ptt_mode", False)
     cur_ptt_key = voice.get("ptt_key", "space")
-    cur_silence_threshold = voice.get("silence_threshold", 0.01)
     cur_silence_duration = voice.get("silence_duration", 1.5)
 
     tts_speed_options = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]
@@ -291,7 +290,6 @@ def config_menu() -> None:
         fragments.append(("class:dim", f"  {cfg_path}\n\n"))
 
         cur_sel = selectable[state["cursor"]]
-        cur_item = rows[cur_sel]
 
         for i, row in enumerate(rows):
             if isinstance(row, _Group):

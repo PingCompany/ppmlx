@@ -5,14 +5,14 @@ import platform
 import threading
 from typing import Any
 
+from ppmlx import __version__
+
 try:
     from posthog import Posthog as _Posthog
 except ImportError:
     _Posthog = None  # type: ignore[assignment]
 
 Posthog = _Posthog
-
-from ppmlx import __version__
 
 
 def _truthy(value: Any, default: bool = False) -> bool:

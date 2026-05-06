@@ -156,7 +156,7 @@ def _download_voice_models() -> None:
                 console.print(f"  [green]✓ {label} model ready[/green]")
             except Exception as e:
                 console.print(f"  [yellow]⚠ {label} download failed: {e}[/yellow]")
-                console.print(f"  [dim]Will download on first use.[/dim]")
+                console.print("  [dim]Will download on first use.[/dim]")
             finally:
                 os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
 
@@ -185,7 +185,7 @@ def install_component(key: str) -> bool:
     console.print(f"Installing [bold]{comp.label}[/bold]…")
     with console.status("[cyan]Downloading and installing packages — this may take a moment…[/cyan]"):
         ok = _install(comp)
-    console.print(f"  [green]✓ Done[/green]" if ok else f"  [red]✗ Failed[/red]")
+    console.print("  [green]✓ Done[/green]" if ok else "  [red]✗ Failed[/red]")
     if not ok:
         console.print(f"  [dim]Try: pip install {' '.join(comp.packages)}[/dim]")
         return False
@@ -206,7 +206,7 @@ def uninstall_component(key: str) -> bool:
     console.print(f"Removing [bold]{comp.label}[/bold]…")
     with console.status("[cyan]Removing packages…[/cyan]"):
         ok = _uninstall(comp)
-    console.print(f"  [green]✓ Removed[/green]" if ok else f"  [red]✗ Failed[/red]")
+    console.print("  [green]✓ Removed[/green]" if ok else "  [red]✗ Failed[/red]")
     return ok
 
 
@@ -217,7 +217,6 @@ def _render(components: list[Component], cursor: int, statuses: list[bool]) -> s
     lines: list[str] = []
     lines.append("\033[1mppmlx addons\033[0m\n")
 
-    col_key   = 12
     col_label = 24
     col_size  = 10
 
@@ -255,7 +254,6 @@ def _render(components: list[Component], cursor: int, statuses: list[bool]) -> s
 
 def addons_tui() -> None:
     """Full-screen interactive addon manager."""
-    import os
     import tty
     import termios
 
@@ -293,7 +291,7 @@ def addons_tui() -> None:
         if ok:
             console.print(f"\n[green]✓ {comp.label} installed.[/green]")
         else:
-            console.print(f"\n[red]✗ Installation failed.[/red]")
+            console.print("\n[red]✗ Installation failed.[/red]")
             console.print(f"[dim]Try: pip install {' '.join(comp.packages)}[/dim]")
         input("\nPress Enter to continue…")
 
@@ -312,7 +310,7 @@ def addons_tui() -> None:
         if ok:
             console.print(f"\n[green]✓ {comp.label} removed.[/green]")
         else:
-            console.print(f"\n[red]✗ Removal failed.[/red]")
+            console.print("\n[red]✗ Removal failed.[/red]")
         input("\nPress Enter to continue…")
 
     if not sys.stdin.isatty():
@@ -367,7 +365,7 @@ def prompt_install_if_missing(key: str, feature_name: str) -> bool:
     console.print(f"[dim]{comp.description}[/dim]\n")
 
     if not questionary.confirm(f"Install {comp.label} now?", default=True).ask():
-        console.print(f"[dim]Run: ppmlx addons[/dim]")
+        console.print("[dim]Run: ppmlx addons[/dim]")
         return False
 
     return install_component(key)

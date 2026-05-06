@@ -536,7 +536,7 @@ def _tool_find_files(
         suffix = "/" if fp.is_dir() else ""
         results.append(f"{rel}{suffix}")
         if len(results) >= 500:
-            results.append(f"... (limit 500 reached)")
+            results.append("... (limit 500 reached)")
             break
     return "\n".join(results) if results else "(no matches)"
 

@@ -8,7 +8,7 @@ Usage:
     uv run python bench_turboquant.py [--model MODEL] [--tokens N] [--prompt-len N]
 """
 from __future__ import annotations
-import argparse, gc, time, sys
+import argparse, gc, time
 
 def _get_memory_mb() -> float:
     """Current process RSS in MB."""
@@ -34,7 +34,7 @@ def _reset_metal_peak():
 
 def run_benchmark(model_id: str, prompt_len: int, gen_tokens: int, use_turboquant: bool, tq_bits: int = 3):
     """Run a single benchmark pass. Returns dict of metrics."""
-    from ppmlx.engine import TextEngine, reset_engine, _patch_turboquant_cache
+    from ppmlx.engine import TextEngine, reset_engine
     import mlx.core as mx
 
     # Reset singleton + caches
@@ -61,7 +61,7 @@ def run_benchmark(model_id: str, prompt_len: int, gen_tokens: int, use_turboquan
     ]
 
     # Warm up: load model
-    print(f"  Loading model...", end=" ", flush=True)
+    print("  Loading model...", end=" ", flush=True)
     lm = engine.load(model_id)
     mx.eval(lm.model.parameters())
     gc.collect()
@@ -85,7 +85,6 @@ def run_benchmark(model_id: str, prompt_len: int, gen_tokens: int, use_turboquan
 
     metal_after, metal_peak = _metal_memory_mb()
     elapsed = t1 - t0
-    total_tokens = result.prompt_tokens + result.completion_tokens
 
     # Estimate KV-cache size
     kv_bytes = 0

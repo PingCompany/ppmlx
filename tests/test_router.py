@@ -113,7 +113,7 @@ class TestAnalyzeComplexity:
             *[{"role": "user", "content": f"Turn {i}: explain and debug"} for i in range(10)],
             {"role": "user", "content": long_code},
         ]
-        tools = [{"type": "function", "function": {"name": f"t{i}", "description": f""}} for i in range(10)]
+        tools = [{"type": "function", "function": {"name": f"t{i}", "description": ""}} for i in range(10)]
         score = analyze_complexity(msgs, tools=tools, max_tokens=16384)
         assert score == 10
 

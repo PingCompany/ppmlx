@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 log = logging.getLogger("ppmlx.turboquant")
