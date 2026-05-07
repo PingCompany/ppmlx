@@ -637,3 +637,40 @@ def test_anthropic_stream_with_tools_disables_thinking(client):
     assert response.status_code == 200
     assert '"type": "text_delta"' in response.text
     assert mock_engine.stream_generate.call_args.kwargs["enable_thinking"] is False
+
+
+@pytest.mark.asyncio
+async def test_parse_think_tags_gemma_channel_thought_marker():
+    from ppmlx.server import _parse_think_tags
+
+    events = [
+        event async for event in _parse_think_tags(
+            _aiter(["<|channel>thought\nreason", "ing", "<channel|>", "final answer"]),
+        )
+    ]
+
+    assert events == [
+        ("thinking", "reason"),
+        ("thinking", "ing"),
+        ("thinking_done", "reasoning"),
+        ("text", "final answer"),
+        ("flush_text", "final answer"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parse_think_tags_gemma_channel_marker_split_across_chunks():
+    from ppmlx.server import _parse_think_tags
+
+    events = [
+        event async for event in _parse_think_tags(
+            _aiter(["<|chan", "nel>thought\nprivate", "<chan", "nel|>visible"]),
+        )
+    ]
+
+    assert events == [
+        ("thinking", "private"),
+        ("thinking_done", "private"),
+        ("text", "visible"),
+        ("flush_text", "visible"),
+    ]

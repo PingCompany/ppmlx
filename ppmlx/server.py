@@ -880,8 +880,8 @@ def _stream_chat(
                 else:
                     enable_thinking = True
 
-                # When thinking is enabled and no tools, we parse
-                # <think> tags ourselves; otherwise let engine strip them.
+                # When thinking is enabled and no tools, we parse thinking
+                # markers ourselves; otherwise let engine strip them.
                 strip_thinking = not enable_thinking or bool(tools)
 
                 extra_kwargs = {}
@@ -965,8 +965,11 @@ def _stream_chat(
                     if buf and not inside_tc:
                         yield _make_chunk_sse(_delta("content", buf))
                 elif enable_thinking and not tools:
-                    # No tools, thinking enabled — parse <think> tags
+                    # No tools, thinking enabled — parse thinking markers
                     # and emit reasoning vs content deltas.
+                    start_tags = ("<think>", "<|channel>thought")
+                    end_tags = ("</think>", "<channel|>")
+                    all_tags = start_tags + end_tags
                     inside_think = False
                     buf = ""
                     thinking_start_ts = None
@@ -977,7 +980,7 @@ def _stream_chat(
                     try:
                         lm = engine._get_or_load(repo_id)
                         prompt = engine._apply_chat_template(lm, messages, enable_thinking=True)
-                        if re.search(r"<think>\s*$", prompt):
+                        if re.search(r"(<think>|<\|channel>thought)\s*$", prompt):
                             inside_think = True
                             thinking_start_ts = time.time()
                     except Exception:
@@ -1004,35 +1007,40 @@ def _stream_chat(
                                     budget_exceeded = True
                                     if thinking_start_ts:
                                         thinking_duration_ms = (time.time() - thinking_start_ts) * 1000
-                                    # Strip any leftover think tags from buffer
-                                    buf = buf.replace("</think>", "").replace("<think>", "")
+                                    # Strip any leftover thinking markers from buffer
+                                    for tag in all_tags:
+                                        buf = buf.replace(tag, "")
                                     if buf:
                                         has_content = True
                                         yield _make_chunk_sse(_delta("content", buf))
                                     buf = ""
                                     break
-                                # Strip leading <think> tag (engine may emit
-                                # it even though template already injected one)
-                                if buf.startswith("<think>"):
-                                    buf = buf[len("<think>"):]
+                                # Strip leading start marker (engine may emit it
+                                # even though template already injected one)
+                                leading_start = next((tag for tag in start_tags if buf.startswith(tag)), None)
+                                if leading_start:
+                                    buf = buf[len(leading_start):]
+                                    if leading_start == "<|channel>thought" and buf.startswith("\n"):
+                                        buf = buf[1:]
                                     continue
-                                end_idx = buf.find("</think>")
-                                if end_idx != -1:
-                                    think_chunk = buf[:end_idx]
+                                end_positions = [(buf.find(tag), tag) for tag in end_tags if buf.find(tag) >= 0]
+                                first_end = min(end_positions, default=(-1, ""), key=lambda x: x[0])
+                                if first_end[0] != -1:
+                                    think_chunk = buf[:first_end[0]]
                                     if think_chunk:
                                         reasoning_chars_count += len(think_chunk)
                                         yield _make_chunk_sse(_delta("reasoning", think_chunk))
-                                    buf = buf[end_idx + len("</think>"):]
+                                    buf = buf[first_end[0] + len(first_end[1]):]
                                     inside_think = False
                                     if thinking_start_ts:
                                         thinking_duration_ms = (time.time() - thinking_start_ts) * 1000
                                     continue
-                                # Check for partial </think> tag at end
+                                # Check for partial thinking marker at end
                                 partial_len = 0
-                                for i in range(1, len("</think>")):
-                                    if buf.endswith("</think>"[:i]):
-                                        partial_len = i
-                                        break
+                                for tag in all_tags:
+                                    for i in range(1, len(tag)):
+                                        if buf.endswith(tag[:i]):
+                                            partial_len = max(partial_len, i)
                                 safe = buf[:len(buf) - partial_len] if partial_len else buf
                                 buf = buf[len(safe):] if partial_len else ""
                                 if safe:
@@ -1043,28 +1051,33 @@ def _stream_chat(
                                 if budget_exceeded:
                                     # After budget exceeded, strip any think
                                     # tags and emit everything as content
-                                    buf = buf.replace("<think>", "").replace("</think>", "")
+                                    for tag in all_tags:
+                                        buf = buf.replace(tag, "")
                                     if buf:
                                         has_content = True
                                         yield _make_chunk_sse(_delta("content", buf))
                                     buf = ""
                                     break
-                                start_idx = buf.find("<think>")
-                                if start_idx != -1:
-                                    before = buf[:start_idx]
+                                start_positions = [(buf.find(tag), tag) for tag in start_tags if buf.find(tag) >= 0]
+                                first_start = min(start_positions, default=(-1, ""), key=lambda x: x[0])
+                                if first_start[0] != -1:
+                                    before = buf[:first_start[0]]
                                     if before:
                                         has_content = True
                                         yield _make_chunk_sse(_delta("content", before))
-                                    buf = buf[start_idx + len("<think>"):]
+                                    buf = buf[first_start[0] + len(first_start[1]):]
+                                    if first_start[1] == "<|channel>thought" and buf.startswith("\n"):
+                                        buf = buf[1:]
                                     inside_think = True
                                     if not thinking_start_ts:
                                         thinking_start_ts = time.time()
                                     continue
-                                # Check for partial <think> tag at end
+                                # Check for partial thinking marker at end
                                 keep = 0
-                                for i in range(1, min(len("<think>"), len(buf)) + 1):
-                                    if buf.endswith("<think>"[:i]):
-                                        keep = i
+                                for tag in all_tags:
+                                    for i in range(1, min(len(tag), len(buf)) + 1):
+                                        if buf.endswith(tag[:i]):
+                                            keep = max(keep, i)
                                 if keep:
                                     safe = buf[:-keep]
                                     buf = buf[-keep:]
@@ -1544,7 +1557,10 @@ async def _async_iter_sync_gen(sync_gen, loop=None):
 # ── Shared think-tag stream parser ──────────────────────────────────
 
 async def _parse_think_tags(raw_stream, *, assume_in_thinking: bool = False):
-    """Parse ``<think>...</think>`` tags from a raw token stream.
+    """Parse model thinking markers from a raw token stream.
+
+    Supports both ``<think>...</think>`` and Gemma-style channel markers like
+    ``<|channel>thought ... <channel|>``.
 
     Yields tuples describing what was parsed:
 
@@ -1554,70 +1570,91 @@ async def _parse_think_tags(raw_stream, *, assume_in_thinking: bool = False):
     * ``("flush_text", full_text)``  — final flush of any buffered text
 
     Some thinking models start *inside* a thinking block because their chat
-    template injects ``<think>`` into the generation prompt. Pass
+    template injects a marker into the generation prompt. Pass
     ``assume_in_thinking=True`` only for those models; otherwise plain model
     text must be treated as answer text, not hidden reasoning.
     """
+    start_tags = ("<think>", "<|channel>thought")
+    end_tags = ("</think>", "<channel|>")
+    all_tags = start_tags + end_tags
+
     in_thinking = assume_in_thinking
     buf = ""
     reasoning_text = ""
     full_text = ""
 
+    def _partial_suffix_len() -> int:
+        for tag in all_tags:
+            for i in range(len(tag) - 1, 0, -1):
+                if buf.endswith(tag[:i]):
+                    return i
+        return 0
+
     async for chunk in raw_stream:
         buf += chunk
         while buf:
             if not in_thinking:
-                think_pos = buf.find("<think>")
-                close_pos = buf.find("</think>")
-                if think_pos == 0:
+                start_positions = [(buf.find(tag), tag) for tag in start_tags if buf.find(tag) >= 0]
+                end_positions = [(buf.find(tag), tag) for tag in end_tags if buf.find(tag) >= 0]
+                first_start = min(start_positions, default=(-1, ""), key=lambda x: x[0])
+                first_end = min(end_positions, default=(-1, ""), key=lambda x: x[0])
+
+                if first_start[0] == 0:
                     in_thinking = True
-                    buf = buf[len("<think>"):]
+                    buf = buf[len(first_start[1]):]
+                    if first_start[1] == "<|channel>thought" and buf.startswith("\n"):
+                        buf = buf[1:]
                     continue
-                elif close_pos == 0:
-                    # Closing tag without matching open (template-injected)
-                    buf = buf[len("</think>"):]
+                if first_end[0] == 0:
+                    # Closing tag without matching open (template-injected).
+                    buf = buf[len(first_end[1]):]
                     if reasoning_text:
                         yield ("thinking_done", reasoning_text)
                     continue
+
+                candidates = [pos for pos, _ in (start_positions + end_positions) if pos > 0]
+                next_tag_pos = min(candidates) if candidates else -1
+                if next_tag_pos < 0:
+                    partial_len = _partial_suffix_len()
+                    if partial_len:
+                        safe = buf[:-partial_len]
+                        buf = buf[-partial_len:]
+                    else:
+                        safe = buf
+                        buf = ""
                 else:
-                    # Check for partial tag at end of buffer
-                    partial = any(
-                        buf.endswith(t[:i])
-                        for t in ("<think>", "</think>")
-                        for i in range(1, len(t))
-                    )
-                    if partial:
-                        break
-                    text_chunk = buf[:think_pos] if think_pos > 0 else buf
-                    buf = buf[len(text_chunk):]
-                    if text_chunk:
-                        full_text += text_chunk
-                        yield ("text", text_chunk)
-                    if not buf:
-                        break
+                    safe = buf[:next_tag_pos]
+                    buf = buf[next_tag_pos:]
+
+                if safe:
+                    full_text += safe
+                    yield ("text", safe)
+                if not buf or _partial_suffix_len():
+                    break
             else:
-                close_pos = buf.find("</think>")
-                if close_pos >= 0:
-                    think_chunk = buf[:close_pos]
-                    buf = buf[close_pos + len("</think>"):]
+                end_positions = [(buf.find(tag), tag) for tag in end_tags if buf.find(tag) >= 0]
+                first_end = min(end_positions, default=(-1, ""), key=lambda x: x[0])
+                if first_end[0] >= 0:
+                    think_chunk = buf[:first_end[0]]
+                    buf = buf[first_end[0] + len(first_end[1]):]
                     in_thinking = False
                     if think_chunk:
                         reasoning_text += think_chunk
                         yield ("thinking", think_chunk)
                     yield ("thinking_done", reasoning_text)
                     continue
+
+                partial_len = _partial_suffix_len()
+                if partial_len:
+                    safe = buf[:-partial_len]
+                    buf = buf[-partial_len:]
                 else:
-                    partial_len = 0
-                    for i in range(1, len("</think>")):
-                        if buf.endswith("</think>"[:i]):
-                            partial_len = i
-                            break
-                    safe = buf[:len(buf) - partial_len] if partial_len else buf
-                    buf = buf[len(safe):] if partial_len else ""
-                    if safe:
-                        reasoning_text += safe
-                        yield ("thinking", safe)
-                    break
+                    safe = buf
+                    buf = ""
+                if safe:
+                    reasoning_text += safe
+                    yield ("thinking", safe)
+                break
 
     # Flush remaining buffer
     if buf:
@@ -1698,7 +1735,10 @@ def _stream_responses(
 
                 tokenizer = engine.get_tokenizer(repo_id)
                 template = getattr(tokenizer, "chat_template", None)
-                assume_in_thinking = bool((not tools) and isinstance(template, str) and "<think>" in template)
+                assume_in_thinking = bool(
+                    (not tools) and isinstance(template, str)
+                    and ("<think>" in template or "<|channel>thought" in template)
+                )
                 if assume_in_thinking:
                     # Qwen-style templates start generation inside a think block.
                     reasoning_idx = 0
@@ -2179,7 +2219,10 @@ def _stream_anthropic(
 
             tokenizer = engine.get_tokenizer(repo_id)
             template = getattr(tokenizer, "chat_template", None)
-            assume_in_thinking = bool(_enable_thinking and isinstance(template, str) and "<think>" in template)
+            assume_in_thinking = bool(
+                _enable_thinking and isinstance(template, str)
+                and ("<think>" in template or "<|channel>thought" in template)
+            )
             if assume_in_thinking:
                 # Qwen-style templates start generation inside a think block.
                 yield _anthropic_sse({

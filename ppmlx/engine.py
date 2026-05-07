@@ -34,6 +34,7 @@ class GenerateResult(NamedTuple):
 
 
 _THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+_CHANNEL_THOUGHT_PATTERN = re.compile(r"<\|channel>thought\n?(.*?)<channel\|>", re.DOTALL)
 
 # Sanity cap: never auto-set max_tokens above this even on huge-context models.
 # 4096 matches GPT-4o / Claude defaults; clients can always request more explicitly.
@@ -55,10 +56,10 @@ def _context_size(lm: "LoadedModel") -> int:
 
 
 def _is_thinking_model(tokenizer: Any) -> bool:
-    """Return True if the tokenizer's chat template contains ``<think>``."""
+    """Return True if the tokenizer's chat template contains thinking markers."""
     template = getattr(tokenizer, "chat_template", None)
     if template and isinstance(template, str):
-        return "<think>" in template
+        return "<think>" in template or "<|channel>thought" in template
     return False
 
 
@@ -70,15 +71,29 @@ def _auto_max_tokens(lm: "LoadedModel") -> int:
 
 def _strip_thinking(text: str) -> tuple[str, str | None]:
     """
-    Strip <think>...</think> blocks from text.
+    Strip thinking blocks from text.
     Returns (answer_text, reasoning_text | None).
 
-    Handles two cases:
+    Handles three cases:
     1. Standard: ``<think>reasoning</think>answer``
     2. Template-injected: output starts *inside* a think block (Qwen3 adds
        ``<think>\\n`` to the generation prompt, so the model output begins with
        the reasoning directly followed by ``</think>``).
+    3. Channel markers: ``<|channel>thought ... <channel|>answer``.
     """
+    channel_match = _CHANNEL_THOUGHT_PATTERN.search(text)
+    if channel_match:
+        reasoning = channel_match.group(1).strip()
+        answer = _CHANNEL_THOUGHT_PATTERN.sub("", text).strip()
+        return answer, (reasoning or None)
+
+    # Fallback: no opening channel marker but a closing <channel|> exists.
+    channel_end_idx = text.find("<channel|>")
+    if channel_end_idx != -1:
+        reasoning = text[:channel_end_idx].strip()
+        answer = text[channel_end_idx + len("<channel|>"):].strip()
+        return answer, (reasoning or None)
+
     match = _THINK_PATTERN.search(text)
     if match:
         reasoning = match.group(1).strip()
@@ -364,25 +379,24 @@ class TextEngine:
                     yield response
             return
 
-        # State machine to strip <think>...</think> blocks from streamed tokens.
-        # Buffers partial tag matches and only yields text outside think blocks.
-        # Qwen3's chat template injects "<think>\n" into the generation prompt,
-        # so the model output begins *inside* a think block.
-        #
-        # State machine to strip <think>...</think> blocks from streamed tokens.
-        # Buffers partial tag matches and only yields text outside think blocks.
-        # Qwen3's chat template injects "<think>\n" into the generation prompt,
-        # so the model output begins *inside* a think block.
-        #
-        # Models that inject <think> but never emit </think> (e.g. GLM-4.7-Flash)
-        # are detected by a token budget: if we suppress more than
-        # _THINK_PASSTHROUGH_TOKENS chars without finding </think>, we assume the
-        # model doesn't use think-tag pairs and switch to pass-through mode.
-        _THINK_PASSTHROUGH_TOKENS = 10_000  # chars before assuming model never closes </think>
+        # State machine to strip thinking markers from streamed tokens.
+        # Supports Qwen-style <think>...</think> and Gemma-style
+        # <|channel>thought ... <channel|> markers.
+        _THINK_PASSTHROUGH_TOKENS = 10_000  # chars before assuming model never closes the marker
+        start_tags = ("<think>", "<|channel>thought")
+        end_tags = ("</think>", "<channel|>")
+        all_tags = start_tags + end_tags
 
-        inside_think = bool(re.search(r"<think>\s*$", prompt))
+        inside_think = bool(re.search(r"(<think>|<\|channel>thought)\s*$", prompt))
         buf = ""
         think_chars = 0  # chars suppressed while inside_think=True
+
+        def _partial_suffix_len() -> int:
+            for tag in all_tags:
+                for i in range(min(len(tag) - 1, len(buf)), 0, -1):
+                    if buf.endswith(tag[:i]):
+                        return i
+            return 0
 
         for response in mlx_stream(lm.model, lm.tokenizer, **kwargs):
             chunk = response.text if hasattr(response, "text") else response
@@ -390,20 +404,16 @@ class TextEngine:
 
             while buf:
                 if inside_think:
-                    # Look for </think> closing tag
-                    end_idx = buf.find("</think>")
-                    if end_idx != -1:
+                    end_positions = [(buf.find(tag), tag) for tag in end_tags if buf.find(tag) >= 0]
+                    first_end = min(end_positions, default=(-1, ""), key=lambda x: x[0])
+                    if first_end[0] >= 0:
                         # Properly closed — discard thinking content
                         think_chars = 0
-                        buf = buf[end_idx + len("</think>"):]
+                        buf = buf[first_end[0] + len(first_end[1]):]
                         inside_think = False
                         continue
-                    # Check if buf ends with a partial match for </think>
-                    tag = "</think>"
-                    keep = 0
-                    for i in range(1, min(len(tag), len(buf)) + 1):
-                        if buf.endswith(tag[:i]):
-                            keep = i
+
+                    keep = _partial_suffix_len()
                     suppressed = buf[:-keep] if keep else buf
                     think_chars += len(suppressed)
                     buf = buf[-keep:] if keep else ""
@@ -416,8 +426,8 @@ class TextEngine:
                         think_chars = 0
                         continue
 
-                    # If we've suppressed too much without a close tag, this
-                    # model doesn't use proper think-tag pairs — yield as plain text.
+                    # If we've suppressed too much without a close marker, this
+                    # model doesn't use proper think-marker pairs — yield as plain text.
                     if think_chars > _THINK_PASSTHROUGH_TOKENS:
                         inside_think = False
                         think_chars = 0
@@ -426,21 +436,19 @@ class TextEngine:
                         continue
                     break
                 else:
-                    # Look for <think> opening tag
-                    start_idx = buf.find("<think>")
-                    if start_idx != -1:
-                        # Yield everything before the tag
-                        if start_idx > 0:
-                            yield buf[:start_idx]
-                        buf = buf[start_idx + len("<think>"):]
+                    start_positions = [(buf.find(tag), tag) for tag in start_tags if buf.find(tag) >= 0]
+                    first_start = min(start_positions, default=(-1, ""), key=lambda x: x[0])
+                    if first_start[0] >= 0:
+                        # Yield everything before the marker
+                        if first_start[0] > 0:
+                            yield buf[:first_start[0]]
+                        buf = buf[first_start[0] + len(first_start[1]):]
+                        if first_start[1] == "<|channel>thought" and buf.startswith("\n"):
+                            buf = buf[1:]
                         inside_think = True
                         continue
-                    # Check if buf ends with a partial match for "<think>"
-                    tag = "<think>"
-                    keep = 0
-                    for i in range(1, min(len(tag), len(buf)) + 1):
-                        if buf.endswith(tag[:i]):
-                            keep = i
+
+                    keep = _partial_suffix_len()
                     if keep:
                         safe = buf[:-keep]
                         if safe:

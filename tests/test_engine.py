@@ -500,3 +500,32 @@ def test_generate_result_unpacks_as_4tuple():
     # Default value for reasoning_tokens
     r2 = GenerateResult("hi", None, 1, 1)
     assert r2.reasoning_tokens == 0
+
+
+def test_strip_thinking_gemma_channel_markers():
+    from ppmlx.engine import _strip_thinking
+
+    text, reasoning = _strip_thinking(
+        "<|channel>thought\nprivate reasoning<channel|>visible answer"
+    )
+    assert text == "visible answer"
+    assert reasoning == "private reasoning"
+
+    text, reasoning = _strip_thinking("private reasoning<channel|>visible answer")
+    assert text == "visible answer"
+    assert reasoning == "private reasoning"
+
+
+def test_stream_generate_strips_gemma_channel_markers():
+    chunks = ["<|chan", "nel>thought\nprivate", "<chan", "nel|>", "visible"]
+    fake, _, _ = _make_fake_mlx_lm(stream_chunks=chunks)
+    _install_fake(fake)
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    engine = TextEngine(max_loaded=2)
+
+    result = list(engine.stream_generate(
+        "some/model", [{"role": "user", "content": "hi"}], strip_thinking=True
+    ))
+    assert "".join(result) == "visible"
