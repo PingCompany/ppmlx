@@ -5,6 +5,8 @@ import pytest
 
 from ppmlx.config import (
     Config,
+    DEFAULT_ANALYTICS_HOST,
+    DEFAULT_ANALYTICS_PROJECT_API_KEY,
     DefaultsConfig,
     LoggingConfig,
     MemoryConfig,
@@ -49,6 +51,8 @@ class TestDefaultValues:
         assert cfg.tool_awareness.mode == "no_tools_only"
         assert cfg.analytics.enabled is False
         assert cfg.analytics.provider == "posthog"
+        assert cfg.analytics.host == DEFAULT_ANALYTICS_HOST
+        assert cfg.analytics.project_api_key == DEFAULT_ANALYTICS_PROJECT_API_KEY
 
     def test_tool_awareness_defaults(self):
         cfg = ToolAwarenessConfig()
@@ -246,6 +250,15 @@ class TestEnvVarOverrides:
         cfg = load_config()
         assert cfg.analytics.project_api_key == "legacy-site-123"
 
+    def test_analytics_legacy_tunnel_host_maps_to_default_ingest(self, tmp_home):
+        config_dir = tmp_home / ".ppmlx"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.toml").write_text(
+            '[analytics]\nhost = "https://analytics.ppmlx.dev"\n'
+        )
+        cfg = load_config()
+        assert cfg.analytics.host == DEFAULT_ANALYTICS_HOST
+
 
 class TestCliOverrides:
     def test_port_cli_override(self, tmp_home):
@@ -327,3 +340,30 @@ class TestGetPpLlmDir:
         d2 = get_ppmlx_dir()
         assert d1 == d2
         assert d1.exists()
+
+
+class TestFirstRunAnalyticsOnboarding:
+    def test_save_analytics_preference_writes_default_sink(self, tmp_home, monkeypatch):
+        from ppmlx.config import _save_analytics_preference
+
+        monkeypatch.delenv("PPMLX_ANALYTICS_ENABLED", raising=False)
+        _save_analytics_preference(True)
+        cfg = load_config()
+        assert cfg.analytics.enabled is True
+        assert cfg.analytics.provider == "posthog"
+        assert cfg.analytics.host == DEFAULT_ANALYTICS_HOST
+        assert cfg.analytics.project_api_key == DEFAULT_ANALYTICS_PROJECT_API_KEY
+        assert cfg.analytics.respect_do_not_track is True
+
+    def test_check_first_run_uses_selector_choice(self, tmp_home, monkeypatch):
+        import sys
+        from ppmlx import config as config_module
+
+        monkeypatch.delenv("PPMLX_ANALYTICS_ENABLED", raising=False)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(config_module, "_ask_analytics_opt_in", lambda: True)
+
+        config_module.check_first_run()
+
+        assert (tmp_home / ".ppmlx" / ".first_run_done").exists()
+        assert load_config().analytics.enabled is True

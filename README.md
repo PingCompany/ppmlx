@@ -147,11 +147,12 @@ respect_do_not_track = true
 
 ## Anonymous Usage Analytics
 
-`ppmlx` supports privacy-preserving anonymous product analytics, disabled by default — you are asked to opt in on first run.
+`ppmlx` supports privacy-preserving anonymous product analytics, disabled by default. On first interactive run, the beta onboarding asks whether you want to help by enabling it.
 
 What is sent:
 - command and API event names such as `serve_started`, `model_pulled`, `api_chat_completions`
 - app version, Python minor version, OS family, CPU architecture
+- a random anonymous install id, used only to count returning beta installs
 - coarse booleans/counters such as `stream=true`, `tools=true`, `batch_size=4`
 
 What is never sent:
@@ -163,7 +164,7 @@ When events are sent:
 - when OpenAI-compatible API endpoints are hit
 
 Why:
-- understand which workflows matter most
+- understand which workflows matter most during beta
 - prioritize compatibility work across commands and API surfaces
 - measure adoption without collecting user content
 
@@ -180,7 +181,7 @@ or:
 enabled = false
 ```
 
-For maintainer-operated analytics, the recommended sink is self-hosted PostHog. Configure it with:
+By default, opted-in beta analytics are sent to the maintainer-operated PostHog project. To use your own PostHog sink instead, configure:
 
 ```bash
 export PPMLX_ANALYTICS_HOST="https://analytics.example.com"

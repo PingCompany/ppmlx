@@ -3,16 +3,13 @@ from __future__ import annotations
 import os
 import platform
 import threading
+import uuid
 from typing import Any
 
+import httpx
+
 from ppmlx import __version__
-
-try:
-    from posthog import Posthog as _Posthog
-except ImportError:
-    _Posthog = None  # type: ignore[assignment]
-
-Posthog = _Posthog
+from ppmlx.config import get_ppmlx_dir
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -46,8 +43,22 @@ def _sanitize_data(data: dict[str, Any] | None) -> dict[str, int | float | bool]
     return cleaned
 
 
-_CLIENT_LOCK = threading.Lock()
-_CLIENT_CACHE: tuple[str, str, Any] | None = None
+def _anonymous_distinct_id() -> str:
+    """Return a stable anonymous install id for coarse adoption counts."""
+    path = get_ppmlx_dir() / ".analytics_id"
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except Exception:
+        pass
+
+    new_id = f"ppmlx-{uuid.uuid4().hex}"
+    try:
+        path.write_text(new_id)
+    except Exception:
+        pass
+    return new_id
 
 
 def _get_settings() -> tuple[bool, str, str]:
@@ -74,40 +85,29 @@ def _get_settings() -> tuple[bool, str, str]:
 
 def _payload(data: dict[str, Any] | None) -> dict[str, Any]:
     clean: dict[str, Any] = {
+        "distinct_id": _anonymous_distinct_id(),
         "version": __version__,
         "python": ".".join(platform.python_version_tuple()[:2]),
         "platform": platform.system().lower(),
         "arch": platform.machine().lower(),
-        # Keep events personless so the SDK does not create user profiles.
+        # Keep events personless so PostHog does not create user profiles.
         "$process_person_profile": False,
     }
     clean.update(_sanitize_data(data))
     return clean
 
 
-def _get_client(host: str, project_api_key: str) -> Any:
-    if Posthog is None:
-        return None
-
-    global _CLIENT_CACHE
-    cached = _CLIENT_CACHE
-    if cached and cached[0] == host and cached[1] == project_api_key:
-        return cached[2]
-
-    with _CLIENT_LOCK:
-        cached = _CLIENT_CACHE
-        if cached and cached[0] == host and cached[1] == project_api_key:
-            return cached[2]
-
-        client = Posthog(
-            project_api_key,
-            host=host,
-            sync_mode=True,
-            timeout=1,
-            disable_geoip=True,
-        )
-        _CLIENT_CACHE = (host, project_api_key, client)
-        return client
+def _post_capture(host: str, project_api_key: str, event: str, properties: dict[str, Any]) -> bool:
+    response = httpx.post(
+        f"{host}/capture/",
+        json={
+            "api_key": project_api_key,
+            "event": event,
+            "properties": properties,
+        },
+        timeout=1.5,
+    )
+    return 200 <= response.status_code < 300
 
 
 def track(event: str, data: dict[str, Any] | None = None, *, context: str = "cli") -> bool:
@@ -116,11 +116,8 @@ def track(event: str, data: dict[str, Any] | None = None, *, context: str = "cli
         return False
 
     try:
-        capture_id = _get_client(host, project_api_key).capture(
-            event,
-            properties=_payload(data),
-        )
-        return bool(capture_id)
+        properties = _payload({**(data or {}), "context_cli": context == "cli", "context_server": context == "server"})
+        return _post_capture(host, project_api_key, event, properties)
     except Exception:
         return False
 

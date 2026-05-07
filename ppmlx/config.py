@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+DEFAULT_ANALYTICS_HOST = "https://us.i.posthog.com"
+DEFAULT_ANALYTICS_PROJECT_API_KEY = "phc_vdLX8Zhq9R3NqVvMlPmv96WAh7AZJYDCEP4iQwzFlYI"
+LEGACY_ANALYTICS_HOSTS = {"https://analytics.ppmlx.dev"}
+
 
 @dataclass
 class ServerConfig:
@@ -66,8 +70,8 @@ class ThinkingConfig:
 class AnalyticsConfig:
     enabled: bool = False
     provider: str = "posthog"
-    host: str = ""
-    project_api_key: str = ""
+    host: str = DEFAULT_ANALYTICS_HOST
+    project_api_key: str = DEFAULT_ANALYTICS_PROJECT_API_KEY
     respect_do_not_track: bool = True
 
 
@@ -108,6 +112,13 @@ def _normalize_tool_awareness_mode(value: Any) -> str:
         "no_tools_only": "no_tools_only",
     }
     return aliases.get(raw, "no_tools_only")
+
+
+def _normalize_analytics_host(value: Any) -> str:
+    host = str(value).strip().rstrip("/")
+    if host in LEGACY_ANALYTICS_HOSTS:
+        return DEFAULT_ANALYTICS_HOST
+    return host
 
 
 def _normalize_analytics_provider(value: Any) -> str:
@@ -178,7 +189,7 @@ def _apply_toml(cfg: Config, data: dict) -> None:
         an = data["analytics"]
         if "enabled" in an: cfg.analytics.enabled = bool(an["enabled"])
         if "provider" in an: cfg.analytics.provider = _normalize_analytics_provider(an["provider"])
-        if "host" in an: cfg.analytics.host = str(an["host"]).strip()
+        if "host" in an: cfg.analytics.host = _normalize_analytics_host(an["host"])
         if "project_api_key" in an:
             cfg.analytics.project_api_key = str(an["project_api_key"]).strip()
         elif "website_id" in an:
@@ -209,7 +220,7 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_EFFORT_BASE": ("thinking", "effort_base", int),
         "PPMLX_ANALYTICS_ENABLED": ("analytics", "enabled", _parse_bool),
         "PPMLX_ANALYTICS_PROVIDER": ("analytics", "provider", _normalize_analytics_provider),
-        "PPMLX_ANALYTICS_HOST": ("analytics", "host", str),
+        "PPMLX_ANALYTICS_HOST": ("analytics", "host", _normalize_analytics_host),
         "PPMLX_ANALYTICS_PROJECT_API_KEY": ("analytics", "project_api_key", str),
         "PPMLX_ANALYTICS_RESPECT_DNT": ("analytics", "respect_do_not_track", _parse_bool),
     }
@@ -221,7 +232,7 @@ def _apply_env(cfg: Config) -> None:
             except (ValueError, AttributeError):
                 pass
     legacy_website_id = os.environ.get("PPMLX_ANALYTICS_WEBSITE_ID")
-    if legacy_website_id and not cfg.analytics.project_api_key:
+    if legacy_website_id and not os.environ.get("PPMLX_ANALYTICS_PROJECT_API_KEY"):
         cfg.analytics.project_api_key = legacy_website_id.strip()
 
 
@@ -246,19 +257,47 @@ def check_first_run() -> None:
         if not sys.stdin.isatty():
             marker.touch()
             return
+
         from rich.console import Console
+
         console = Console()
         console.print(
-            "\n[bold]ppmlx[/bold] can collect anonymous usage statistics "
-            "(command names, version, OS — never prompts or model outputs).\n"
-            "This helps improve ppmlx.\n"
+            "\n[bold magenta]Welcome to the ppmlx beta[/bold magenta] ✨\n"
+            "We are tiny, early, and trying to make local LLMs on Macs genuinely great.\n\n"
+            "If you are comfortable with it, please allow [bold]anonymous usage analytics[/bold]. "
+            "It helps us see which commands work, which APIs matter, and where beta testers get stuck.\n\n"
+            "[dim]We never send prompts, responses, tool arguments, file contents, file paths, "
+            "tokens, repo IDs, or model input/output. Only event names, version, OS/arch, "
+            "an anonymous install id, and coarse booleans/counters.[/dim]\n"
         )
-        answer = input("Enable anonymous analytics? [y/N] ").strip().lower()
-        enabled = answer in ("y", "yes")
+        enabled = _ask_analytics_opt_in()
         _save_analytics_preference(enabled)
+        if enabled:
+            console.print("[green]Thank you — this genuinely helps the beta. 🫶[/green]")
+        else:
+            console.print("[dim]No worries — analytics are off. You can enable them later with `ppmlx config --analytics`.[/dim]")
         marker.touch()
     except Exception:
         pass
+
+
+def _ask_analytics_opt_in() -> bool:
+    try:
+        import questionary
+
+        answer = questionary.select(
+            "Help improve ppmlx by sending anonymous beta usage analytics?",
+            choices=[
+                questionary.Choice("Yes — help the tiny beta goblin learn 🐣", True),
+                questionary.Choice("No — not today", False),
+            ],
+            default=False,
+            use_indicator=True,
+        ).ask()
+        return bool(answer) if answer is not None else False
+    except Exception:
+        answer = input("Enable anonymous beta analytics? [y/N] ").strip().lower()
+        return answer in ("y", "yes")
 
 
 def _save_analytics_preference(enabled: bool) -> None:
@@ -271,6 +310,11 @@ def _save_analytics_preference(enabled: bool) -> None:
             data = tomllib.load(f)
     except Exception:
         pass
-    data.setdefault("analytics", {})["enabled"] = enabled
+    analytics = data.setdefault("analytics", {})
+    analytics["enabled"] = enabled
+    analytics.setdefault("provider", "posthog")
+    analytics.setdefault("host", DEFAULT_ANALYTICS_HOST)
+    analytics.setdefault("project_api_key", DEFAULT_ANALYTICS_PROJECT_API_KEY)
+    analytics.setdefault("respect_do_not_track", True)
     with open(cfg_path, "wb") as f:
         tomli_w.dump(data, f)

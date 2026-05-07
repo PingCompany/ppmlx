@@ -29,39 +29,45 @@ def test_track_respects_do_not_track(monkeypatch):
 
     called = {"value": False}
 
-    def fake_client(*args, **kwargs):
+    def fake_post(*args, **kwargs):
         called["value"] = True
-        raise AssertionError("_get_client should not be called when DNT=1")
+        raise AssertionError("_post_capture should not be called when DNT=1")
 
     monkeypatch.setattr(config_module, "load_config", lambda: _cfg())
-    monkeypatch.setattr("ppmlx.analytics._get_client", fake_client)
+    monkeypatch.setattr("ppmlx.analytics._post_capture", fake_post)
     monkeypatch.setenv("DNT", "1")
 
     assert track("serve_started") is False
     assert called["value"] is False
 
 
-def test_track_posts_minimal_posthog_event(monkeypatch):
+def test_track_posts_minimal_posthog_event(monkeypatch, tmp_home):
     from ppmlx import config as config_module
     from ppmlx.analytics import track
 
     captured = {}
 
-    class FakeClient:
-        def capture(self, event, **kwargs):
-            captured["event"] = event
-            captured["kwargs"] = kwargs
-            return "evt_123"
+    def fake_post_capture(host, project_api_key, event, properties):
+        captured["host"] = host
+        captured["project_api_key"] = project_api_key
+        captured["event"] = event
+        captured["properties"] = properties
+        return True
 
     monkeypatch.setattr(config_module, "load_config", lambda: _cfg())
-    monkeypatch.setattr("ppmlx.analytics._get_client", lambda host, project_api_key: FakeClient())
+    monkeypatch.setattr("ppmlx.analytics._post_capture", fake_post_capture)
+    monkeypatch.setattr("ppmlx.analytics._anonymous_distinct_id", lambda: "ppmlx-test-id")
 
     ok = track("serve_started", {"interactive": True, "ignored": "secret-string"}, context="server")
 
     assert ok is True
+    assert captured["host"] == "https://stats.example.com"
+    assert captured["project_api_key"] == "phc_test_123"
     assert captured["event"] == "serve_started"
-    properties = captured["kwargs"]["properties"]
+    properties = captured["properties"]
+    assert properties["distinct_id"] == "ppmlx-test-id"
     assert properties["interactive"] is True
+    assert properties["context_server"] is True
     assert properties["$process_person_profile"] is False
     assert properties["platform"]
     assert properties["arch"]
