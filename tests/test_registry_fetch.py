@@ -13,6 +13,7 @@ from ppmlx.registry_fetch import (
     _extract_modalities,
     _extract_params_b,
     _repo_id_to_alias,
+    cache_status_text,
     is_cache_stale,
     maybe_refresh,
 )
@@ -70,6 +71,20 @@ def test_staleness_weekly_old(tmp_path: Path):
 def test_staleness_no_cache_file(tmp_path: Path):
     with patch("ppmlx.registry_fetch.get_cache_path", return_value=tmp_path / "nope.json"):
         assert is_cache_stale("weekly") is True
+
+
+def test_cache_status_text_never_without_cache(tmp_path: Path):
+    with patch("ppmlx.registry_fetch.get_cache_path", return_value=tmp_path / "nope.json"):
+        assert cache_status_text() == "last refresh: never"
+
+
+def test_cache_status_text_includes_date_and_count(tmp_path: Path):
+    cache = tmp_path / "cache.json"
+    cache.write_text(json.dumps({"fetched_at": 1700000000, "models": {"a": {}, "b": {}}}))
+    with patch("ppmlx.registry_fetch.get_cache_path", return_value=cache):
+        text = cache_status_text()
+    assert "last refresh: 2023-" in text
+    assert "(2 models)" in text
 
 
 # ── maybe_refresh ────────────────────────────────────────────────────
