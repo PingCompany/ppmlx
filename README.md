@@ -118,6 +118,7 @@ print(response.choices[0].message.content)
 | `ppmlx quantize <model>` | Convert & quantize HF model to MLX | `-b bits`, `--group-size`, `-o output` |
 | `ppmlx graph` | Open a local read-only web view of the temporal memory graph | `--project`, `--session`, `--query`, `--json` |
 | `ppmlx memory status/search/list/handoff/compact-stats` | Inspect the experimental local temporal memory graph | `--json`, `--status`, `--scope`, `--session` |
+| `ppmlx memory jobs/worker/rebuild/prune` | Manage async extraction jobs and graph maintenance | `--status`, `--once`, `--max-jobs`, `--dry-run` |
 | `ppmlx memory-eval` | Run the anti-garbage memory eval suite | `--json`, `--dataset`, `--predictions` |
 | `ppmlx compact-eval` | Run long-session rolling-context compaction evals | `--json`, `--output` |
 | `ppmlx answer-quality-eval` | Score compact-answer quality across recall, wrong facts, actionability, grounding, and A/B equivalence | `--json`, `--dataset`, `--template` |
@@ -167,12 +168,13 @@ session_context_tokens = 2000
 compact_threshold_tokens = 12000
 max_context_items = 40
 
-# optional graph-memory extraction worker pool
-extractor = "llm"             # off | heuristic | llm
+# graph-memory extraction
+# default rule_based extraction runs synchronously; set extractor="gemma_json" to enqueue async jobs
+extractor = "rule_based"      # off | rule_based | gemma_json
 extraction_model = "gemma-4-e2b"
 extraction_workers = 1
-extraction_max_tokens = 512
-extraction_timeout_seconds = 60
+extraction_max_tokens = 1200
+extraction_timeout_seconds = 45
 ```
 
 Modes:
@@ -180,7 +182,7 @@ Modes:
 - `compact`: before inference, replace long histories with system context from the graph + a hot tail.
 - `inject`: reserved for compact + broader memory retrieval.
 
-Current graph-engine status: the extraction worker pool exists, while durable `extraction_jobs` and extracted `atoms` storage are being introduced and should be treated as experimental.
+Graph-engine maintenance is local and explicit: `gemma_json` extraction is asynchronous via durable jobs processed by `ppmlx memory worker`; the default `rule_based` extractor remains synchronous and `off` is available when configured.
 
 Compact observability is recorded locally in `memory.db` and, if analytics are enabled, sent as privacy-safe aggregate metrics to PostHog. It never sends prompts, responses, tool output, model repo IDs, project IDs, or session IDs.
 
@@ -194,6 +196,10 @@ ppmlx memory search "concise answers"
 ppmlx memory list --status active
 ppmlx memory handoff --project tv-shopping --session tv-session-001
 ppmlx memory compact-stats --since 24
+ppmlx memory jobs --status pending
+ppmlx memory worker --once
+ppmlx memory rebuild --dry-run
+ppmlx memory prune --dry-run
 ppmlx graph --project tv-shopping --session tv-session-001
 ppmlx trace export --project tv-shopping --session tv-session-001 --output trace.json
 ppmlx compact-replay trace.json --expect "budget = 5000 PLN"
