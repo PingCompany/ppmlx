@@ -152,6 +152,15 @@ def test_pull_command():
     assert call_args[0][0] == "mistral" or call_args[1].get("model") == "mistral" or "mistral" in str(call_args)
 
 
+def test_pull_refreshes_registry_before_interactive_picker():
+    """pull --refresh force-refreshes registry before opening the selector."""
+    with patch("ppmlx.registry.refresh_registry") as mock_refresh, patch("ppmlx.tui.pick_models", return_value=[]):
+        result = runner.invoke(app, ["pull", "--refresh"])
+    assert result.exit_code == 0
+    mock_refresh.assert_called_once()
+    assert "Registry refreshed" in result.output
+
+
 def test_pull_unknown_model():
     """pull command exits with code 1 when model is not found."""
     ModelNotFoundError = type("ModelNotFoundError", (Exception,), {})

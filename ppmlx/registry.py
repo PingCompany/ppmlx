@@ -69,6 +69,19 @@ def _load() -> dict[str, Any]:
     return _cache
 
 
+def refresh_registry() -> dict[str, Any]:
+    """Force-refresh the dynamic registry cache and reload merged entries."""
+    global _cache
+    _cache = None
+    try:
+        from ppmlx.registry_fetch import maybe_refresh
+        maybe_refresh("always")
+    except Exception:
+        logger.debug("Registry force-refresh failed", exc_info=True)
+    _cache = None
+    return _load()
+
+
 def registry_meta() -> dict[str, Any]:
     """Return registry metadata (version, updated, source)."""
     data = _load()

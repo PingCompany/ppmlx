@@ -18,7 +18,19 @@ def pick_models(*, local_only: bool = False) -> list[str]:
 
     all_rows = _build_picker_rows(local_only=local_only)
 
-    state: dict = {"cursor": 0, "search": "", "selected": set()}
+    state: dict = {"cursor": 0, "search": "", "selected": set(), "status": ""}
+
+    def _refresh_rows(force: bool = False) -> None:
+        nonlocal all_rows
+        if force and not local_only:
+            try:
+                from ppmlx.registry import refresh_registry
+                refresh_registry()
+                state["status"] = "registry refreshed"
+            except Exception as exc:
+                state["status"] = f"refresh failed: {exc}"
+        all_rows = _build_picker_rows(local_only=local_only)
+        state["cursor"] = 0
 
     def _selectable_indices(rows):
         return [i for i, r in enumerate(rows) if r.section_header is None]
@@ -39,6 +51,8 @@ def pick_models(*, local_only: bool = False) -> list[str]:
         fragments.append(("", "Search: "))
         fragments.append(("class:value", state["search"]))
         fragments.append(("class:value", "\u2588"))
+        if state["status"]:
+            fragments.append(("class:dim", f"  {state['status']}"))
         fragments.append(("", "\n"))
         return fragments
 
@@ -81,7 +95,7 @@ def pick_models(*, local_only: bool = False) -> list[str]:
         parts = []
         if n:
             parts.append(("class:checked", f"  {n} selected  "))
-        parts.append(("class:footer", "\u2191\u2193 navigate \u2022 space toggle \u2022 enter confirm \u2022 esc cancel"))
+        parts.append(("class:footer", "\u2191\u2193 navigate \u2022 space toggle \u2022 enter confirm \u2022 r refresh registry \u2022 esc cancel"))
         return parts
 
     kb = KeyBindings()
@@ -128,6 +142,10 @@ def pick_models(*, local_only: bool = False) -> list[str]:
     def _enter(event):
         event.app.exit(result=sorted(state["selected"]))
 
+    @kb.add("r")
+    def _refresh(event):
+        _refresh_rows(force=True)
+
     @kb.add("escape")
     def _escape(event):
         event.app.exit(result=[])
@@ -141,7 +159,7 @@ def pick_models(*, local_only: bool = False) -> list[str]:
     @kb.add("<any>")
     def _char(event):
         ch = event.data
-        if ch == " ":
+        if ch in {" ", "r"}:
             return
         if ch.isprintable() and len(ch) == 1:
             state["search"] += ch

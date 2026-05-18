@@ -1429,6 +1429,7 @@ def pull(
     do_quantize: bool = typer.Option(False, "--quantize", "-q", help="Quantize the model after downloading"),
     bits: int = typer.Option(4, "--bits", help="Quantization bit depth (2, 3, 4, 6, or 8)"),
     keep_original: bool = typer.Option(False, "--keep-original", help="Keep the full-precision download after quantization"),
+    refresh: bool = typer.Option(False, "--refresh", help="Force-refresh the registry before showing the interactive selector"),
 ):
     """Download a model from HuggingFace Hub (interactive multiselect when no model given)."""
     if do_quantize and bits not in _VALID_QUANTIZE_BITS:
@@ -1436,6 +1437,11 @@ def pull(
         raise typer.Exit(1)
 
     if model is None:
+        if refresh:
+            from ppmlx.registry import refresh_registry
+            refresh_registry()
+            console.print("[dim]Registry refreshed.[/dim]")
+
         from ppmlx.tui import pick_models
 
         selected = pick_models(local_only=False)
