@@ -26,9 +26,13 @@ def config_menu() -> None:
 
     hf_token = data.get("auth", {}).get("hf_token", "")
     ta_modes = ["off", "no_tools_only", "all"]
+    refresh_modes = ["always", "weekly", "monthly", "never"]
     ta_current = data.get("tool_awareness", {}).get("mode", "no_tools_only")
     if ta_current not in ta_modes:
         ta_current = "no_tools_only"
+    refresh_current = data.get("registry", {}).get("refresh", "weekly")
+    if refresh_current not in refresh_modes:
+        refresh_current = "weekly"
     analytics_enabled = data.get("analytics", {}).get("enabled", False)
     thinking_enabled = data.get("thinking", {}).get("enabled", True)
     reasoning_budget = data.get("thinking", {}).get("default_reasoning_budget", 2048)
@@ -48,6 +52,7 @@ def config_menu() -> None:
         tools_options.sort()
 
     ta_labels = {"off": "Off", "no_tools_only": "No Tools Only", "all": "All"}
+    refresh_labels = {"always": "Always", "weekly": "Weekly", "monthly": "Monthly", "never": "Never"}
     analytics_labels = {True: "Enabled", False: "Disabled"}
     thinking_labels = {True: "Enabled", False: "Disabled"}
 
@@ -55,6 +60,7 @@ def config_menu() -> None:
         "cursor": 0,
         "hf_token": hf_token,
         "ta_index": ta_modes.index(ta_current),
+        "refresh_index": refresh_modes.index(refresh_current),
         "analytics": analytics_enabled,
         "thinking": thinking_enabled,
         "budget_index": budget_options.index(reasoning_budget),
@@ -66,7 +72,7 @@ def config_menu() -> None:
         "saved_flash": False,
     }
 
-    items = ["hf_token", "tool_awareness", "thinking", "reasoning_budget", "effort_base", "max_tools_tokens", "analytics"]
+    items = ["hf_token", "tool_awareness", "thinking", "reasoning_budget", "effort_base", "max_tools_tokens", "registry_refresh", "analytics"]
 
     def _mask_token(token: str) -> str:
         if not token:
@@ -144,8 +150,17 @@ def config_menu() -> None:
         fragments.append(("class:value" if not is_cursor else style, f"\u25c0 {tt_label} \u25b6"))
         fragments.append(("", "\n"))
 
-        # Analytics row
+        # Registry auto-refresh row
         is_cursor = state["cursor"] == 6
+        prefix = "  \u25b8 " if is_cursor else "    "
+        style = "class:cursor" if is_cursor else ""
+        refresh_label = refresh_labels[refresh_modes[state["refresh_index"]]]
+        fragments.append((style, f"{prefix}Registry Refresh     "))
+        fragments.append(("class:value" if not is_cursor else style, f"\u25c0 {refresh_label} \u25b6"))
+        fragments.append(("", "\n"))
+
+        # Analytics row
+        is_cursor = state["cursor"] == 7
         prefix = "  \u25b8 " if is_cursor else "    "
         style = "class:cursor" if is_cursor else ""
         an_label = analytics_labels[state["analytics"]]
@@ -178,6 +193,7 @@ def config_menu() -> None:
         data.setdefault("thinking", {})["default_reasoning_budget"] = budget_options[state["budget_index"]]
         data.setdefault("thinking", {})["effort_base"] = effort_base_options[state["effort_base_index"]]
         data.setdefault("server", {})["max_tools_tokens"] = tools_options[state["tools_index"]]
+        data.setdefault("registry", {})["refresh"] = refresh_modes[state["refresh_index"]]
         data.setdefault("analytics", {})["enabled"] = state["analytics"]
         with open(cfg_path, "wb") as f:
             tomli_w.dump(data, f)
@@ -223,6 +239,9 @@ def config_menu() -> None:
             state["tools_index"] = (state["tools_index"] - 1) % len(tools_options)
             state["dirty"] = True
         elif state["cursor"] == 6:
+            state["refresh_index"] = (state["refresh_index"] - 1) % len(refresh_modes)
+            state["dirty"] = True
+        elif state["cursor"] == 7:
             state["analytics"] = not state["analytics"]
             state["dirty"] = True
 
@@ -247,6 +266,9 @@ def config_menu() -> None:
             state["tools_index"] = (state["tools_index"] + 1) % len(tools_options)
             state["dirty"] = True
         elif state["cursor"] == 6:
+            state["refresh_index"] = (state["refresh_index"] + 1) % len(refresh_modes)
+            state["dirty"] = True
+        elif state["cursor"] == 7:
             state["analytics"] = not state["analytics"]
             state["dirty"] = True
 

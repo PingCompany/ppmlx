@@ -58,6 +58,7 @@ class MemoryConfig:
 @dataclass
 class RegistryConfig:
     enabled: bool = True
+    refresh: str = "weekly"  # "always" | "weekly" | "monthly" | "never"
 
 
 @dataclass
@@ -126,6 +127,11 @@ def _normalize_memory_mode(value: Any) -> str:
         "inject": "inject",
     }
     return aliases.get(raw, "off")
+
+
+def _normalize_refresh(value: Any) -> str:
+    raw = str(value).strip().lower()
+    return raw if raw in {"always", "weekly", "monthly", "never"} else "weekly"
 
 
 def _normalize_tool_awareness_mode(value: Any) -> str:
@@ -218,6 +224,7 @@ def _apply_toml(cfg: Config, data: dict) -> None:
     if "registry" in data:
         r = data["registry"]
         if "enabled" in r: cfg.registry.enabled = bool(r["enabled"])
+        if "refresh" in r: cfg.registry.refresh = _normalize_refresh(r["refresh"])
     if "tool_awareness" in data:
         ta = data["tool_awareness"]
         if "mode" in ta:
@@ -268,6 +275,7 @@ def _apply_env(cfg: Config) -> None:
         "PPMLX_MEMORY_EXTRACTION_MAX_TOKENS": ("memory", "extraction_max_tokens", int),
         "PPMLX_MEMORY_EXTRACTION_TIMEOUT": ("memory", "extraction_timeout_seconds", float),
         "PPMLX_REGISTRY_ENABLED": ("registry", "enabled", _parse_bool),
+        "PPMLX_REGISTRY_REFRESH": ("registry", "refresh", _normalize_refresh),
         "PPMLX_INJECT_TOOL_AWARENESS": ("tool_awareness", "mode", _normalize_tool_awareness_mode),
         "PPMLX_THINKING_ENABLED": ("thinking", "enabled", _parse_bool),
         "PPMLX_THINKING_BUDGET": ("thinking", "default_reasoning_budget", int),

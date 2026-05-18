@@ -10,6 +10,7 @@ from ppmlx.config import (
     DefaultsConfig,
     LoggingConfig,
     MemoryConfig,
+    RegistryConfig,
     ServerConfig,
     ToolAwarenessConfig,
     get_ppmlx_dir,
@@ -70,6 +71,11 @@ class TestDefaultValues:
         cfg = ToolAwarenessConfig()
         assert cfg.mode == "no_tools_only"
 
+    def test_registry_defaults(self):
+        cfg = RegistryConfig()
+        assert cfg.enabled is True
+        assert cfg.refresh == "weekly"
+
 
 class TestLoadConfigDefaults:
     def test_no_file_returns_defaults(self, tmp_home):
@@ -124,6 +130,10 @@ extraction_timeout_seconds = 12.5
 [tool_awareness]
 mode = "all"
 
+[registry]
+enabled = true
+refresh = "monthly"
+
 [analytics]
 enabled = false
 provider = "posthog"
@@ -158,6 +168,8 @@ respect_do_not_track = true
         assert cfg.memory.extraction_max_tokens == 900
         assert cfg.memory.extraction_timeout_seconds == 12.5
         assert cfg.tool_awareness.mode == "all"
+        assert cfg.registry.enabled is True
+        assert cfg.registry.refresh == "monthly"
         assert cfg.analytics.enabled is False
         assert cfg.analytics.provider == "posthog"
         assert cfg.analytics.host == "https://stats.example.com"
@@ -296,6 +308,16 @@ class TestEnvVarOverrides:
         monkeypatch.setenv("PPMLX_INJECT_TOOL_AWARENESS", "all")
         cfg = load_config()
         assert cfg.tool_awareness.mode == "all"
+
+    def test_registry_refresh_env_var(self, tmp_home, monkeypatch):
+        monkeypatch.setenv("PPMLX_REGISTRY_REFRESH", "never")
+        cfg = load_config()
+        assert cfg.registry.refresh == "never"
+
+    def test_invalid_registry_refresh_env_var_falls_back(self, tmp_home, monkeypatch):
+        monkeypatch.setenv("PPMLX_REGISTRY_REFRESH", "hourly")
+        cfg = load_config()
+        assert cfg.registry.refresh == "weekly"
 
     def test_tool_awareness_env_var_legacy_true_maps_to_all(self, tmp_home, monkeypatch):
         monkeypatch.setenv("PPMLX_INJECT_TOOL_AWARENESS", "true")

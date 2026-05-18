@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-05-18
+
+### Added
+- Configurable HuggingFace registry auto-refresh for the pull/model picker list via `[registry].refresh` and `PPMLX_REGISTRY_REFRESH`.
+- Registry refresh setting in the interactive config TUI.
+
+### Fixed
+- Added coverage for registry cache refresh behavior and registry refresh config parsing.
+
 ## [0.5.4] - 2026-05-07
 
 ### Fixed
