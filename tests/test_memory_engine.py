@@ -18,6 +18,23 @@ def _make_engine(tmp_path: Path) -> tuple[MemoryEngine, MemoryStore]:
     return MemoryEngine(store=store), store
 
 
+class FakeSingleCandidateExtractor:
+    max_candidates = 1
+
+    def extract(self, event):
+        return [ShadowMemoryCandidate(
+            type="preference",
+            subject="user",
+            predicate="prefers",
+            object="async extraction",
+            text="User prefers async extraction.",
+            scope="global",
+            confidence=0.9,
+            source_quote="async extraction",
+            salience=0.8,
+        )]
+
+
 def test_capture_preference_creates_active_memory_and_edge(tmp_path):
     engine, store = _make_engine(tmp_path)
 
@@ -336,6 +353,82 @@ def test_memory_cli_status_and_search(tmp_home):
     assert rows[0]["object"] == "short answers"
 
 
+def test_capture_chat_with_enqueue_extraction_creates_job_without_candidates(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    engine = MemoryEngine(store=store, extractor=FakeSingleCandidateExtractor(), enqueue_extraction=True)
+
+    result = engine.capture_chat(
+        request_id="req-async",
+        endpoint="/v1/chat/completions",
+        model_alias="test-model",
+        model_repo="repo/test",
+        messages=[{"role": "user", "content": "I prefer async extraction."}],
+        response_text="ok",
+    )
+
+    assert result["queued"] == 1
+    assert result["candidates"] == 0
+    assert result["active"] == 0
+    stats = store.stats()
+    assert stats["events"] == 1
+    assert stats["candidates"] == 0
+    jobs = store.list_extraction_jobs(status="queued")
+    assert len(jobs) == 1
+    assert jobs[0]["source_event_id"] == "req-async"
+    assert jobs[0]["payload"]["event_id"] == "req-async"
+
+
+def test_process_extraction_job_consumes_job_and_stores_candidate(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    engine = MemoryEngine(store=store, extractor=FakeSingleCandidateExtractor(), enqueue_extraction=True)
+    engine.capture_chat(
+        request_id="req-process-async",
+        endpoint="/v1/chat/completions",
+        model_alias="test-model",
+        model_repo="repo/test",
+        messages=[{"role": "user", "content": "I prefer async extraction."}],
+        response_text="ok",
+    )
+
+    result = engine.process_extraction_job(worker_id="test-worker")
+
+    assert result is not None
+    assert result["candidates"] == 1
+    assert result["active"] == 1
+    assert store.list_extraction_jobs(status="queued") == []
+    completed = store.list_extraction_jobs(status="completed")
+    assert len(completed) == 1
+    assert completed[0]["result"]["active"] == 1
+    rows = store.query_candidates(status="active")
+    assert len(rows) == 1
+    assert rows[0]["object"] == "async extraction"
+    assert store.stats()["events"] == 1
+
+
+def test_memory_cli_jobs_json_lists_jobs(tmp_home):
+    reset_memory_store()
+    store = MemoryStore(tmp_home / ".ppmlx" / "memory.db")
+    store.init()
+    store.enqueue_extraction_job(
+        {"event_id": "req-cli-job", "messages": []},
+        source_event_id="req-cli-job",
+        job_id="job-cli",
+    )
+    reset_memory_store()
+
+    result = CliRunner().invoke(app, ["memory", "jobs", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert len(data) == 1
+    assert data[0]["job_id"] == "job-cli"
+    assert data[0]["status"] == "queued"
+    assert data[0]["source_event_id"] == "req-cli-job"
+    reset_memory_store()
+
+
 def test_capture_chat_records_event_when_extraction_fails(tmp_path):
     class FailingExtractor:
         max_candidates = 2
@@ -389,6 +482,7 @@ def test_get_memory_engine_uses_configured_gemma_extractor(tmp_home, monkeypatch
     assert engine.extractor.max_tokens == 321
     assert engine.extraction_workers == 2
     assert engine.parallel_extraction is True
+    assert engine.enqueue_extraction is True
 
 
 def test_parallel_gemma_extraction_merges_dedupes_and_writes_on_main_thread(tmp_path):

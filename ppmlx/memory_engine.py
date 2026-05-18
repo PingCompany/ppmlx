@@ -478,11 +478,13 @@ class MemoryEngine:
         *,
         extraction_workers: int = 1,
         parallel_extraction: bool = False,
+        enqueue_extraction: bool = False,
     ):
         self.store = store or get_memory_store()
         self.extractor = extractor or RuleBasedMemoryExtractor()
         self.extraction_workers = max(1, int(extraction_workers))
         self.parallel_extraction = parallel_extraction and self.extraction_workers > 1
+        self.enqueue_extraction = bool(enqueue_extraction)
         self.validator = MemoryValidator(self.store)
 
     def capture_chat(
@@ -514,7 +516,77 @@ class MemoryEngine:
         }
         start = time.perf_counter()
         self.store.record_event(event)
-        candidates = [candidate.with_event(request_id) for candidate in self._extract_candidates(event)]
+        if self.enqueue_extraction:
+            self.store.enqueue_extraction_job(event, source_event_id=request_id)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return {
+                "event_id": request_id,
+                "candidates": 0,
+                "active": 0,
+                "quarantined": 0,
+                "rejected": 0,
+                "disputed": 0,
+                "queued": 1,
+                "duration_ms": round(elapsed_ms, 3),
+            }
+
+        return self._extract_validate_store(event, suppress_extraction_errors=True, start=start)
+
+    def process_extraction_job(self, worker_id: str = "worker", once: bool = True) -> dict[str, Any] | None:
+        """Claim and process one asynchronous extraction job.
+
+        The payload is the already-recorded event from ``capture_chat``. This
+        worker path deliberately does not call ``record_event`` or enqueue any
+        follow-up job; it only extracts, validates, stores candidates, and then
+        marks the job completed. Exceptions mark the claimed job failed, with a
+        retry when attempts remain.
+        """
+        if not once:
+            processed: list[dict[str, Any]] = []
+            while True:
+                item = self.process_extraction_job(worker_id=worker_id, once=True)
+                if item is None:
+                    break
+                processed.append(item)
+            return {"processed": len(processed), "jobs": processed}
+
+        job = self.store.claim_extraction_job(worker_id)
+        if job is None:
+            return None
+
+        try:
+            event = dict(job.get("payload") or {})
+            event_id = str(event.get("event_id") or job.get("source_event_id") or job["job_id"])
+            event["event_id"] = event_id
+            event.setdefault("request", {"messages": event.get("messages", [])})
+            result = self._extract_validate_store(event, suppress_extraction_errors=False)
+            result["job_id"] = job["job_id"]
+            self.store.complete_extraction_job(job["job_id"], result=result)
+            return result
+        except Exception as exc:  # pragma: no cover - exact extractor failures vary
+            self.store.fail_extraction_job(job["job_id"], str(exc), retry=True)
+            failed_job = self.store.get_extraction_job(job["job_id"]) or job
+            return {
+                "job_id": job["job_id"],
+                "event_id": job.get("source_event_id"),
+                "failed": 1,
+                "status": failed_job.get("status", "failed"),
+                "error": str(exc),
+            }
+
+    def _extract_validate_store(
+        self,
+        event: dict[str, Any],
+        *,
+        suppress_extraction_errors: bool,
+        start: float | None = None,
+    ) -> dict[str, Any]:
+        start = time.perf_counter() if start is None else start
+        event_id = str(event["event_id"])
+        candidates = [
+            candidate.with_event(event_id)
+            for candidate in self._extract_candidates(event, suppress_errors=suppress_extraction_errors)
+        ]
         validations: list[dict[str, Any]] = []
         for candidate in candidates:
             validation = self.validator.validate(event, candidate)
@@ -526,7 +598,7 @@ class MemoryEngine:
             validations.append(validation)
         elapsed_ms = (time.perf_counter() - start) * 1000
         return {
-            "event_id": request_id,
+            "event_id": event_id,
             "candidates": len(candidates),
             "active": sum(1 for item in validations if item["status"] == STATUS_ACTIVE),
             "quarantined": sum(1 for item in validations if item["status"] == STATUS_QUARANTINED),
@@ -535,13 +607,15 @@ class MemoryEngine:
             "duration_ms": round(elapsed_ms, 3),
         }
 
-    def _extract_candidates(self, event: dict[str, Any]) -> list[ShadowMemoryCandidate]:
+    def _extract_candidates(self, event: dict[str, Any], *, suppress_errors: bool = True) -> list[ShadowMemoryCandidate]:
         try:
             if self.parallel_extraction:
                 return self._extract_candidates_parallel(event)
             candidates = self.extractor.extract(event)
         except Exception:
-            return []
+            if suppress_errors:
+                return []
+            raise
         return self._dedupe_candidates(candidates)[: self._max_candidates_per_event()]
 
     def _extract_candidates_parallel(self, event: dict[str, Any]) -> list[ShadowMemoryCandidate]:
@@ -600,6 +674,7 @@ def get_memory_engine(path: Path | None = None) -> MemoryEngine:
             extractor=extractor,
             extraction_workers=cfg.memory.extraction_workers,
             parallel_extraction=cfg.memory.extraction_workers > 1,
+            enqueue_extraction=True,
         )
     return MemoryEngine(store=store, extractor=RuleBasedMemoryExtractor(max_candidates=cfg.memory.max_candidates_per_event))
 

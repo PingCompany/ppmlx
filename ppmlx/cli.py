@@ -2090,6 +2090,72 @@ def memory_handoff_cmd(
     console.print(f"[dim]{len(result.items)} items | ~{result.tokens} tokens[/dim]")
 
 
+@memory_app.command(name="jobs")
+def memory_jobs_cmd(
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by job status"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum jobs"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """List asynchronous memory extraction jobs."""
+    from rich.table import Table
+    from ppmlx.memory_store import get_memory_store
+
+    rows = get_memory_store().list_extraction_jobs(status=status, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    if not rows:
+        console.print("[yellow]No extraction jobs found.[/yellow]")
+        return
+
+    table = Table(title="Memory Extraction Jobs")
+    table.add_column("ID", style="dim")
+    table.add_column("Status")
+    table.add_column("Attempts", justify="right")
+    table.add_column("Worker")
+    table.add_column("Source Event")
+    table.add_column("Error")
+    for row in rows:
+        table.add_row(
+            row["job_id"],
+            row["status"],
+            f"{row.get('attempts', 0)}/{row.get('max_attempts', 0)}",
+            str(row.get("worker_id") or ""),
+            str(row.get("source_event_id") or ""),
+            str(row.get("error") or "")[:80],
+        )
+    console.print(table)
+
+
+@memory_app.command(name="worker")
+def memory_worker_cmd(
+    once: bool = typer.Option(False, "--once", help="Process at most one job and exit"),
+    worker_id: str = typer.Option("worker", "--worker-id", help="Worker identifier recorded on claimed jobs"),
+    sleep: float = typer.Option(1.0, "--sleep", help="Seconds to sleep when no jobs are available"),
+    max_jobs: Optional[int] = typer.Option(None, "--max-jobs", help="Stop after processing this many jobs"),
+):
+    """Run an asynchronous memory extraction worker."""
+    from ppmlx.memory_engine import get_memory_engine
+
+    engine = get_memory_engine()
+    processed = 0
+    while True:
+        result = engine.process_extraction_job(worker_id=worker_id)
+        if result is None:
+            if once or max_jobs == 0:
+                break
+            time.sleep(max(0.0, sleep))
+            continue
+
+        processed += 1
+        status = result.get("status") or "completed"
+        console.print(f"[green]Processed job {result.get('job_id')} ({status})[/green]")
+        if once or (max_jobs is not None and processed >= max_jobs):
+            break
+
+    console.print(f"[dim]Processed {processed} job(s).[/dim]")
+
+
 @memory_app.command(name="forget")
 def memory_forget_cmd(
     candidate_id: str = typer.Argument(..., help="Memory candidate id"),
