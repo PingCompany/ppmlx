@@ -529,3 +529,33 @@ def test_stream_generate_strips_gemma_channel_markers():
         "some/model", [{"role": "user", "content": "hi"}], strip_thinking=True
     ))
     assert "".join(result) == "visible"
+
+
+def test_gemma4_extra_weight_fallback_is_quiet(tmp_path, monkeypatch, caplog):
+    fake = types.ModuleType("mlx_lm")
+    fake.__path__ = []
+    fake.load = MagicMock(side_effect=ValueError("Received 140 parameters not in model: x"))
+
+    fake_utils = types.ModuleType("mlx_lm.utils")
+    mock_model = MagicMock()
+    mock_tokenizer = MagicMock()
+    fake_utils.load_model = MagicMock(return_value=(mock_model, {"eos_token_id": 1}))
+    fake_utils.load_tokenizer = MagicMock(return_value=mock_tokenizer)
+
+    sys.modules["mlx_lm"] = fake
+    sys.modules["mlx_lm.utils"] = fake_utils
+
+    model_dir = tmp_path / "gemma4"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"gemma4"}')
+
+    from ppmlx.engine import TextEngine, reset_engine
+    reset_engine()
+    monkeypatch.setattr("ppmlx.engine._resolve_model_path", lambda _: str(model_dir))
+    caplog.set_level("WARNING", logger="ppmlx.engine")
+
+    lm = TextEngine(max_loaded=1).load("gemma-4-e2b")
+
+    assert lm.model is mock_model
+    fake_utils.load_model.assert_called_once_with(model_dir, strict=False)
+    assert not caplog.records

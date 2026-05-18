@@ -178,7 +178,7 @@ class TextEngine:
         except ValueError as exc:
             if not _can_retry_gemma4_non_strict(path, exc):
                 raise
-            log.warning(
+            log.debug(
                 "Gemma 4 checkpoint has extra weights not represented by this mlx-lm model class; "
                 "retrying load with strict=False for %s",
                 repo_id,
