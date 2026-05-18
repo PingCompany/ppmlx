@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from ppmlx.cli import app
-from ppmlx.memory_engine import MemoryEngine
+from ppmlx.memory_engine import MemoryEngine, ShadowMemoryCandidate, get_memory_engine
 from ppmlx.memory_store import MemoryStore, reset_memory_store
 
 
@@ -333,3 +334,139 @@ def test_memory_cli_status_and_search(tmp_home):
     rows = json.loads(search_result.output)
     assert len(rows) == 1
     assert rows[0]["object"] == "short answers"
+
+
+def test_capture_chat_records_event_when_extraction_fails(tmp_path):
+    class FailingExtractor:
+        max_candidates = 2
+
+        def extract(self, event):
+            raise RuntimeError("boom")
+
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    engine = MemoryEngine(store=store, extractor=FailingExtractor())
+
+    result = engine.capture_chat(
+        request_id="req-extract-fails",
+        endpoint="/v1/chat/completions",
+        model_alias="test-model",
+        model_repo="repo/test",
+        messages=[{"role": "user", "content": "I prefer concise answers."}],
+        response_text="ok",
+    )
+
+    assert result["candidates"] == 0
+    stats = store.stats()
+    assert stats["events"] == 1
+    assert stats["candidates"] == 0
+
+
+def test_get_memory_engine_uses_configured_gemma_extractor(tmp_home, monkeypatch):
+    import ppmlx.memory_extractors as memory_extractors
+
+    class FakeGemmaExtractor:
+        def __init__(self, *, model_name, max_candidates, max_tokens):
+            self.model_name = model_name
+            self.max_candidates = max_candidates
+            self.max_tokens = max_tokens
+
+        def extract(self, event):
+            return []
+
+    monkeypatch.setenv("PPMLX_MEMORY_EXTRACTOR", "gemma_json")
+    monkeypatch.setenv("PPMLX_MEMORY_EXTRACTION_MODEL", "fake-gemma")
+    monkeypatch.setenv("PPMLX_MEMORY_MAX_CANDIDATES", "3")
+    monkeypatch.setenv("PPMLX_MEMORY_EXTRACTION_MAX_TOKENS", "321")
+    monkeypatch.setenv("PPMLX_MEMORY_EXTRACTION_WORKERS", "2")
+    monkeypatch.setattr(memory_extractors, "GemmaJsonMemoryExtractor", FakeGemmaExtractor)
+
+    engine = get_memory_engine(tmp_home / "memory.db")
+
+    assert isinstance(engine.extractor, FakeGemmaExtractor)
+    assert engine.extractor.model_name == "fake-gemma"
+    assert engine.extractor.max_candidates == 3
+    assert engine.extractor.max_tokens == 321
+    assert engine.extraction_workers == 2
+    assert engine.parallel_extraction is True
+
+
+def test_parallel_gemma_extraction_merges_dedupes_and_writes_on_main_thread(tmp_path):
+    main_thread_id = threading.get_ident()
+    calls: list[list[dict]] = []
+    lock = threading.Lock()
+
+    class FakeGemmaExtractor:
+        max_candidates = 2
+
+        def extract(self, event):
+            with lock:
+                calls.append(event["messages"])
+            content = event["messages"][0]["content"]
+            if "tea" in content or "coffee" in content:
+                drink = "coffee" if "coffee" in content else "tea"
+                return [ShadowMemoryCandidate(
+                    type="fact",
+                    subject="user",
+                    predicate="likes",
+                    object=drink,
+                    text=f"User likes {drink}.",
+                    scope="global",
+                    confidence=0.9,
+                    source_quote=drink,
+                    salience=0.8,
+                )]
+            return [ShadowMemoryCandidate(
+                type="preference",
+                subject="user",
+                predicate="prefers",
+                object="concise answers",
+                text="User prefers concise answers.",
+                scope="global",
+                confidence=0.9,
+                source_quote="concise answers",
+                salience=0.8,
+            )]
+
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    original_store_candidate = store.store_candidate
+    original_upsert_memory_edge = store.upsert_memory_edge
+
+    def store_candidate_on_main_thread(*args, **kwargs):
+        assert threading.get_ident() == main_thread_id
+        return original_store_candidate(*args, **kwargs)
+
+    def upsert_memory_edge_on_main_thread(*args, **kwargs):
+        assert threading.get_ident() == main_thread_id
+        return original_upsert_memory_edge(*args, **kwargs)
+
+    store.store_candidate = store_candidate_on_main_thread
+    store.upsert_memory_edge = upsert_memory_edge_on_main_thread
+    engine = MemoryEngine(
+        store=store,
+        extractor=FakeGemmaExtractor(),
+        extraction_workers=3,
+        parallel_extraction=True,
+    )
+
+    result = engine.capture_chat(
+        request_id="req-parallel",
+        endpoint="/v1/chat/completions",
+        model_alias="test-model",
+        model_repo="repo/test",
+        messages=[
+            {"role": "user", "content": "I prefer concise answers."},
+            {"role": "user", "content": "Please remember concise answers."},
+            {"role": "user", "content": "Remember tea."},
+            {"role": "user", "content": "Remember coffee."},
+        ],
+        response_text="ok",
+    )
+
+    assert len(calls) == 4
+    assert all(len(messages) == 1 for messages in calls)
+    assert result["candidates"] == 2
+    assert result["active"] == 2
+    rows = store.query_candidates(status="active")
+    assert {row["object"] for row in rows} == {"concise answers", "tea"}

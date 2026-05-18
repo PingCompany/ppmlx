@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
+
+from ppmlx.config import load_config
 
 from ppmlx.memory_store import MemoryStore, get_memory_store
 from ppmlx.tool_distillers import CodingToolDistiller, DistilledMemoryCandidate, GenericJsonToolDistiller, ToolDistiller
@@ -471,10 +474,15 @@ class MemoryEngine:
     def __init__(
         self,
         store: MemoryStore | None = None,
-        extractor: RuleBasedMemoryExtractor | None = None,
+        extractor: Any | None = None,
+        *,
+        extraction_workers: int = 1,
+        parallel_extraction: bool = False,
     ):
         self.store = store or get_memory_store()
         self.extractor = extractor or RuleBasedMemoryExtractor()
+        self.extraction_workers = max(1, int(extraction_workers))
+        self.parallel_extraction = parallel_extraction and self.extraction_workers > 1
         self.validator = MemoryValidator(self.store)
 
     def capture_chat(
@@ -506,7 +514,7 @@ class MemoryEngine:
         }
         start = time.perf_counter()
         self.store.record_event(event)
-        candidates = [candidate.with_event(request_id) for candidate in self.extractor.extract(event)]
+        candidates = [candidate.with_event(request_id) for candidate in self._extract_candidates(event)]
         validations: list[dict[str, Any]] = []
         for candidate in candidates:
             validation = self.validator.validate(event, candidate)
@@ -527,10 +535,73 @@ class MemoryEngine:
             "duration_ms": round(elapsed_ms, 3),
         }
 
+    def _extract_candidates(self, event: dict[str, Any]) -> list[ShadowMemoryCandidate]:
+        try:
+            if self.parallel_extraction:
+                return self._extract_candidates_parallel(event)
+            candidates = self.extractor.extract(event)
+        except Exception:
+            return []
+        return self._dedupe_candidates(candidates)[: self._max_candidates_per_event()]
+
+    def _extract_candidates_parallel(self, event: dict[str, Any]) -> list[ShadowMemoryCandidate]:
+        chunks = _event_message_chunks(event)
+        if len(chunks) <= 1:
+            candidates = self.extractor.extract(event)
+            return self._dedupe_candidates(candidates)[: self._max_candidates_per_event()]
+
+        chunk_results: list[list[ShadowMemoryCandidate]] = [[] for _ in chunks]
+        with ThreadPoolExecutor(max_workers=self.extraction_workers) as executor:
+            futures = {executor.submit(self.extractor.extract, chunk): idx for idx, chunk in enumerate(chunks)}
+            for future, idx in futures.items():
+                try:
+                    chunk_results[idx] = future.result()
+                except Exception:
+                    chunk_results[idx] = []
+
+        merged: list[ShadowMemoryCandidate] = []
+        for result in chunk_results:
+            merged.extend(result)
+        return self._dedupe_candidates(merged)[: self._max_candidates_per_event()]
+
+    def _max_candidates_per_event(self) -> int:
+        return max(0, int(getattr(self.extractor, "max_candidates", 12)))
+
+    @staticmethod
+    def _dedupe_candidates(candidates: list[ShadowMemoryCandidate]) -> list[ShadowMemoryCandidate]:
+        unique: dict[tuple[str, str, str, str, str], ShadowMemoryCandidate] = {}
+        for candidate in candidates:
+            key = (
+                _norm(candidate.type),
+                _norm(candidate.subject),
+                _norm(candidate.predicate),
+                _norm(candidate.object),
+                _norm(candidate.scope),
+            )
+            if key not in unique:
+                unique[key] = candidate
+        return list(unique.values())
+
 
 def get_memory_engine(path: Path | None = None) -> MemoryEngine:
     store = get_memory_store(path) if path else get_memory_store()
-    return MemoryEngine(store=store)
+    cfg = load_config()
+    extractor_name = cfg.memory.extractor.strip().lower()
+    if extractor_name in {"gemma_json", "llm"}:
+        from ppmlx.memory_extractors import GemmaJsonMemoryExtractor
+
+        extractor = GemmaJsonMemoryExtractor(
+            model_name=cfg.memory.extraction_model,
+            max_candidates=cfg.memory.max_candidates_per_event,
+            max_tokens=cfg.memory.extraction_max_tokens,
+        )
+        return MemoryEngine(
+            store=store,
+            extractor=extractor,
+            extraction_workers=cfg.memory.extraction_workers,
+            parallel_extraction=cfg.memory.extraction_workers > 1,
+        )
+    return MemoryEngine(store=store, extractor=RuleBasedMemoryExtractor(max_candidates=cfg.memory.max_candidates_per_event))
 
 
 def event_source_text(event: dict[str, Any]) -> str:
@@ -538,6 +609,17 @@ def event_source_text(event: dict[str, Any]) -> str:
     if event.get("response_text"):
         parts.append(f"assistant: {event['response_text']}")
     return "\n".join(part for part in parts if part)
+
+
+def _event_message_chunks(event: dict[str, Any]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for message in event.get("messages", []):
+        chunk = dict(event)
+        chunk["messages"] = [message]
+        chunk["request"] = {"messages": [message]}
+        chunk["response_text"] = ""
+        chunks.append(chunk)
+    return chunks or [event]
 
 
 def _candidate_sources(messages_text: str) -> list[str]:

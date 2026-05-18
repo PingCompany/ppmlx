@@ -110,7 +110,10 @@ label { color:var(--muted); font-size:12px; display:flex; flex-direction:column;
 input, select, button { background:#0f1720; color:var(--text); border:1px solid #263244; border-radius:8px; padding:8px; }
 button { cursor:pointer; background:#132033; }
 main { display:grid; grid-template-columns:minmax(420px, 1fr) 420px; min-height:calc(100vh - 116px); }
-#graph { width:100%; height:calc(100vh - 116px); background:radial-gradient(circle at center, #101923 0, #0b0f14 70%); }
+#graph-wrap { position:relative; width:100%; height:calc(100vh - 116px); background:radial-gradient(circle at center, #101923 0, #0b0f14 70%); }
+#graph { width:100%; height:100%; }
+.graph-message { position:absolute; inset:16px auto auto 16px; max-width:min(520px, calc(100% - 32px)); background:#0d141ee6; border:1px solid #334155; border-radius:10px; color:var(--muted); padding:12px 14px; z-index:1; }
+.graph-message.error { color:#fecaca; border-color:#ef4444; background:#190d12e6; }
 aside { border-left:1px solid #1f2937; background:var(--panel); overflow:auto; height:calc(100vh - 116px); }
 section { padding:14px 16px; border-bottom:1px solid #223044; }
 h2 { font-size:13px; margin:0 0 8px; color:var(--accent); text-transform:uppercase; letter-spacing:.08em; }
@@ -121,13 +124,7 @@ h2 { font-size:13px; margin:0 0 8px; color:var(--accent); text-transform:upperca
 .item:hover { border-color:#3b82f6; }
 .muted { color:var(--muted); }
 pre { white-space:pre-wrap; word-break:break-word; background:#0b1119; border:1px solid #223044; border-radius:10px; padding:10px; max-height:360px; overflow:auto; }
-.node { cursor:pointer; }
-.node circle { fill:#1d4ed8; stroke:#93c5fd; stroke-width:1.5; }
-.node.hot circle { fill:#92400e; stroke:#fbbf24; }
-.node text { fill:#dbeafe; font-size:11px; paint-order:stroke; stroke:#0b0f14; stroke-width:3px; stroke-linejoin:round; }
-.edge { stroke:var(--edge); stroke-width:1.2; opacity:.85; }
-.edge-label { fill:#93a4b8; font-size:10px; paint-order:stroke; stroke:#0b0f14; stroke-width:3px; }
-@media (max-width: 960px) { .controls { grid-template-columns:1fr 1fr; } main { grid-template-columns:1fr; } aside { height:auto; border-left:0; border-top:1px solid #1f2937; } #graph { height:60vh; } }
+@media (max-width: 960px) { .controls { grid-template-columns:1fr 1fr; } main { grid-template-columns:1fr; } aside { height:auto; border-left:0; border-top:1px solid #1f2937; } #graph-wrap { height:60vh; } }
 </style>
 </head>
 <body>
@@ -142,7 +139,7 @@ pre { white-space:pre-wrap; word-break:break-word; background:#0b1119; border:1p
 <button id="refresh">Refresh</button>
 </div>
 <main>
-<svg id="graph" role="img" aria-label="temporal memory graph"></svg>
+<div id="graph-wrap" role="img" aria-label="temporal memory graph"><div id="graph-message" class="graph-message" hidden></div><div id="graph"></div></div>
 <aside>
 <section><h2>Stats</h2><div class="statgrid" id="stats"></div></section>
 <section><h2>Selected</h2><pre id="details">Click a node, edge, or fact.</pre></section>
@@ -150,9 +147,11 @@ pre { white-space:pre-wrap; word-break:break-word; background:#0b1119; border:1p
 <section><h2>Timeline</h2><div id="events"></div></section>
 </aside>
 </main>
+<script src="https://cdn.jsdelivr.net/npm/@antv/g6@4.8.24/dist/g6.min.js" crossorigin="anonymous" onerror="window.__ppmlxG6LoadError = true"></script>
 <script>
 const defaults = __DEFAULTS_JSON__;
 const $ = id => document.getElementById(id);
+let graph = null;
 for (const [k,v] of Object.entries(defaults)) if ($(k) && v) $(k).value = v;
 $('refresh').onclick = load;
 for (const id of ['query','project_id','session_id','app_id','status','limit']) $(id).addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
@@ -176,30 +175,59 @@ function render(data) {
   $('events').innerHTML = data.events.map(e => `<div class="item"><b>${esc(e.timestamp)}</b><div>${esc(e.endpoint || '')}</div><div class="muted">${esc(e.event_id)} · ${esc(e.project_id || '')}/${esc(e.session_id || '')}</div></div>`).join('') || '<p class="muted">No events.</p>';
 }
 function renderGraph(data) {
-  const svg = $('graph'); svg.innerHTML = '';
-  const w = svg.clientWidth || 800, h = svg.clientHeight || 600, cx = w/2, cy = h/2;
-  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-  const nodes = data.nodes, edges = data.edges;
-  if (!nodes.length) { svg.innerHTML = '<text x="24" y="40" fill="#8493a7">No graph data for current filters.</text>'; return; }
-  const degree = Object.fromEntries(nodes.map(n => [n.id, 0]));
-  for (const e of edges) { degree[e.from_entity_id] = (degree[e.from_entity_id] || 0) + 1; degree[e.to_entity_id] = (degree[e.to_entity_id] || 0) + 1; }
-  const r = Math.max(120, Math.min(w,h) * 0.36);
-  const pos = {};
-  nodes.forEach((n,i) => { const a = (Math.PI*2*i/nodes.length) - Math.PI/2; pos[n.id] = {x:cx + r*Math.cos(a), y:cy + r*Math.sin(a)}; });
-  for (const e of edges) {
-    const a = pos[e.from_entity_id], b = pos[e.to_entity_id]; if (!a || !b) continue;
-    line(a.x,a.y,b.x,b.y,'edge', () => show(e));
-    text((a.x+b.x)/2, (a.y+b.y)/2, e.relation || '', 'edge-label');
+  const container = $('graph');
+  const message = $('graph-message');
+  container.innerHTML = '';
+  message.hidden = true;
+  message.className = 'graph-message';
+  if (graph) { graph.destroy(); graph = null; }
+  const nodes = data.nodes || [], edges = data.edges || [];
+  if (window.__ppmlxG6LoadError || typeof G6 === 'undefined') {
+    message.textContent = 'Unable to load AntV G6 from the CDN. Check your network connection or content-blocking settings, then refresh.';
+    message.className = 'graph-message error';
+    message.hidden = false;
+    return;
   }
-  for (const n of nodes) {
-    const p = pos[n.id], g = document.createElementNS('http://www.w3.org/2000/svg','g');
-    g.setAttribute('class', 'node ' + ((degree[n.id] || 0) > 1 ? 'hot' : ''));
-    g.onclick = () => show(n); svg.appendChild(g);
-    const c = document.createElementNS('http://www.w3.org/2000/svg','circle'); c.setAttribute('cx',p.x); c.setAttribute('cy',p.y); c.setAttribute('r', String(8 + Math.min(10, degree[n.id] || n.candidate_count || 1))); g.appendChild(c);
-    const t = document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('x',p.x+12); t.setAttribute('y',p.y+4); t.textContent = n.name.length > 34 ? n.name.slice(0,34)+'…' : n.name; g.appendChild(t);
+  if (!nodes.length) {
+    message.textContent = 'No graph data for current filters.';
+    message.hidden = false;
+    return;
   }
-  function line(x1,y1,x2,y2,cls,click) { const el = document.createElementNS('http://www.w3.org/2000/svg','line'); Object.entries({x1,y1,x2,y2}).forEach(([k,v]) => el.setAttribute(k,v)); el.setAttribute('class',cls); el.onclick = click; svg.appendChild(el); }
-  function text(x,y,s,cls) { if (!s) return; const el = document.createElementNS('http://www.w3.org/2000/svg','text'); el.setAttribute('x',x); el.setAttribute('y',y); el.setAttribute('class',cls); el.textContent = s; svg.appendChild(el); }
+  const width = container.clientWidth || 800;
+  const height = container.clientHeight || 600;
+  const graphData = {
+    nodes: nodes.map(n => ({
+      ...n,
+      label: n.label || n.name || n.id,
+      size: n.size || Math.min(48, Math.max(18, 20 + Number(n.degree || n.candidate_count || 0) * 4)),
+      style: { fill: Number(n.degree || 0) > 1 ? '#92400e' : '#1d4ed8', stroke: Number(n.degree || 0) > 1 ? '#fbbf24' : '#93c5fd', lineWidth: 1.5 },
+      labelCfg: { style: { fill: '#dbeafe', fontSize: 11, stroke: '#0b0f14', lineWidth: 3 } },
+    })),
+    edges: edges.map(e => ({
+      ...e,
+      id: e.id || e.edge_id || `${e.source || e.from_entity_id}-${e.target || e.to_entity_id}-${e.relation || ''}`,
+      source: e.source || e.from_entity_id,
+      target: e.target || e.to_entity_id,
+      label: e.label || e.relation || '',
+      style: { stroke: '#334155', lineWidth: 1.2, opacity: 0.85 },
+      labelCfg: { autoRotate: true, style: { fill: '#93a4b8', fontSize: 10, stroke: '#0b0f14', lineWidth: 3 } },
+    })),
+  };
+  graph = new G6.Graph({
+    container: 'graph',
+    width,
+    height,
+    fitView: true,
+    fitViewPadding: 36,
+    modes: { default: ['drag-canvas', 'zoom-canvas', 'drag-node'] },
+    layout: { type: 'force', preventOverlap: true, linkDistance: 150, nodeStrength: -70, edgeStrength: 0.2 },
+    defaultNode: { type: 'circle' },
+    defaultEdge: { type: 'line' },
+  });
+  graph.data(graphData);
+  graph.render();
+  graph.on('node:click', ev => show(ev.item.getModel()));
+  graph.on('edge:click', ev => show(ev.item.getModel()));
 }
 function show(obj) { $('details').textContent = JSON.stringify(obj || null, null, 2); }
 load();
