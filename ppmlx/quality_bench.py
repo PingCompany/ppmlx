@@ -362,7 +362,7 @@ def run_quality_probe(
     responder: Responder | None = None,
     prepared: QualityBenchPreparedProbe | None = None,
 ) -> QualityBenchProbeResult:
-    messages = [*probe.prefix_messages, probe.user_message]
+    messages = [_quality_probe_system_message(), *probe.prefix_messages, probe.user_message]
     metadata = {"app_id": "quality-bench", "project_id": f"quality-bench-{source}", "session_id": probe.probe_id}
     started = time.time()
     try:
@@ -466,6 +466,18 @@ def run_quality_probe(
         )
 
 
+def _quality_probe_system_message() -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "You are answering a memory quality benchmark probe. Use only facts visible in the prior "
+            "conversation or recovered memory context. Be concise and concrete. Preserve exact identifiers, "
+            "commands, filenames, model names, numbers, and decisions when relevant. Do not speculate, add "
+            "generic caveats, or claim you cannot access earlier context."
+        ),
+    }
+
+
 def _failure_bucket(
     *,
     passed: bool,
@@ -496,6 +508,10 @@ def classify_probe(user_text: str, expected_answer: str) -> tuple[str, str]:
         return "ambiguous_skip", "expected answer is too short"
     if expected_norm.startswith("tool call ") or expected_norm.startswith("tool use "):
         return "tool_action_required", "recorded answer is primarily a tool call/action"
+    if _looks_like_delegated_action_request(user_norm):
+        return "code_edit_required", "user asks assistant to execute prior instructions rather than answer from context"
+    if _looks_like_feedback_turn(user_norm):
+        return "ambiguous_skip", "user turn is feedback/acknowledgement rather than a standalone answer request"
     if _looks_like_code_or_repo_action(user_norm, expected_norm):
         return "code_edit_required", "user request likely required repository/tool actions"
     if _looks_like_tool_call(expected_answer):
@@ -582,6 +598,34 @@ def _message_text(message: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _looks_like_delegated_action_request(user_norm: str) -> bool:
+    delegated_markers = (
+        "do it for me",
+        "do this for me",
+        "fix it for me",
+        "run it for me",
+        "zrob to za mnie",
+        "zrób to za mnie",
+        "zrob to dla mnie",
+        "zrób to dla mnie",
+        "zrob to",
+        "zrób to",
+        "napraw to",
+        "odpal to",
+    )
+    return any(marker in user_norm for marker in delegated_markers)
+
+
+def _looks_like_feedback_turn(user_norm: str) -> bool:
+    if len(user_norm) > 180:
+        return False
+    feedback_markers = (
+        "works", "worked", "dziala", "działa", "lepiej", "plynniej", "płynniej",
+        "ok", "super", "great", "thanks", "dzieki", "dzięki", "swietnie", "świetnie",
+    )
+    return any(marker in user_norm for marker in feedback_markers) and not user_norm.endswith("?")
 
 
 def _looks_like_tool_call(text: str) -> bool:

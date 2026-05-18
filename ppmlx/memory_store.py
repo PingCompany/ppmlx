@@ -357,6 +357,54 @@ class MemoryStore:
             conn.commit()
         return self._row_to_extraction_job(updated) if updated else None
 
+    def requeue_stale_claimed_extraction_jobs(self, *, stale_after_seconds: float) -> dict[str, int]:
+        """Recover extraction jobs left claimed by crashed or interrupted workers."""
+        self.init()
+        try:
+            seconds = max(0.0, float(stale_after_seconds))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds <= 0:
+            return {"requeued": 0, "failed": 0}
+
+        modifier = f"-{seconds:.3f} seconds"
+        stale_condition = """status = 'claimed'
+            AND claimed_at IS NOT NULL
+            AND julianday(claimed_at) <= julianday('now', ?)"""
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            requeued = conn.execute(
+                f"""UPDATE memory_extraction_jobs
+                    SET status = 'queued', worker_id = NULL, claimed_at = NULL,
+                        error = ?
+                    WHERE {stale_condition}
+                      AND attempts < max_attempts""",
+                (f"stale claim requeued after {seconds:g}s", modifier),
+            ).rowcount
+            failed = conn.execute(
+                f"""UPDATE memory_extraction_jobs
+                    SET status = 'failed', error = ?, failed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+                        invalid_at = COALESCE(invalid_at, strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+                    WHERE {stale_condition}
+                      AND attempts >= max_attempts""",
+                (f"stale claim exceeded max attempts after {seconds:g}s", modifier),
+            ).rowcount
+            conn.commit()
+        return {"requeued": int(requeued), "failed": int(failed)}
+
+    def renew_extraction_job_claim(self, job_id: str, worker_id: str) -> bool:
+        """Refresh a claimed extraction job lease while its worker is alive."""
+        self.init()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE memory_extraction_jobs
+                   SET claimed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now')
+                   WHERE job_id = ? AND worker_id = ? AND status = 'claimed'""",
+                (job_id, worker_id),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
     def complete_extraction_job(self, job_id: str, *, result: dict[str, Any] | None = None) -> bool:
         self.init()
         with self._lock, self._connect() as conn:
@@ -1410,15 +1458,23 @@ class MemoryStore:
             ).fetchall()
             edges = conn.execute("SELECT COUNT(*) FROM memory_edges").fetchone()[0]
             entities = conn.execute("SELECT COUNT(*) FROM memory_entities").fetchone()[0]
+            atoms = conn.execute("SELECT COUNT(*) FROM memory_atoms").fetchone()[0]
             compactions = conn.execute("SELECT COUNT(*) FROM memory_compactions").fetchone()[0]
+            extraction_jobs = conn.execute("SELECT COUNT(*) FROM memory_extraction_jobs").fetchone()[0]
+            jobs_by_status = conn.execute(
+                "SELECT status, COUNT(*) FROM memory_extraction_jobs GROUP BY status ORDER BY status"
+            ).fetchall()
         return {
             "path": str(self.path),
             "events": events,
             "candidates": candidates,
             "entities": entities,
             "edges": edges,
+            "atoms": atoms,
             "compactions": compactions,
+            "extraction_jobs": extraction_jobs,
             "by_status": {row[0]: row[1] for row in by_status},
+            "jobs_by_status": {row[0]: row[1] for row in jobs_by_status},
         }
 
     def _connect(self) -> sqlite3.Connection:

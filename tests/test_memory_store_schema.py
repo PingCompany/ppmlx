@@ -73,6 +73,55 @@ def test_enqueue_list_claim_complete_and_fail_extraction_jobs(tmp_path):
     assert failed["invalid_at"] is not None
 
 
+def test_renew_extraction_job_claim_refreshes_claimed_at(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    store.enqueue_extraction_job({"messages": ["slow"]}, job_id="job-renew")
+    claimed = store.claim_extraction_job("worker-a")
+    assert claimed is not None
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE memory_extraction_jobs SET claimed_at = '2000-01-01T00:00:00.000' WHERE job_id = ?",
+            ("job-renew",),
+        )
+        conn.commit()
+
+    assert store.renew_extraction_job_claim("job-renew", "worker-a") is True
+
+    renewed = store.get_extraction_job("job-renew")
+    assert renewed is not None
+    assert renewed["status"] == "claimed"
+    assert renewed["claimed_at"] != "2000-01-01T00:00:00.000"
+    assert store.renew_extraction_job_claim("job-renew", "worker-b") is False
+
+
+def test_requeue_stale_claimed_extraction_jobs(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    store.enqueue_extraction_job({"messages": ["slow"]}, job_id="job-stale")
+    claimed = store.claim_extraction_job("worker-a")
+    assert claimed is not None
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE memory_extraction_jobs SET claimed_at = '2000-01-01T00:00:00.000' WHERE job_id = ?",
+            ("job-stale",),
+        )
+        conn.commit()
+
+    recovered = store.requeue_stale_claimed_extraction_jobs(stale_after_seconds=1)
+
+    assert recovered == {"requeued": 1, "failed": 0}
+    requeued = store.get_extraction_job("job-stale")
+    assert requeued is not None
+    assert requeued["status"] == "queued"
+    assert requeued["worker_id"] is None
+    assert requeued["attempts"] == 1
+    assert "stale claim requeued" in requeued["error"]
+    reclaimed = store.claim_extraction_job("worker-b")
+    assert reclaimed is not None
+    assert reclaimed["attempts"] == 2
+
+
 def test_atom_same_slot_without_supersession_does_not_invalidate_prior_atom(tmp_path):
     store = MemoryStore(tmp_path / "memory.db")
     store.init()

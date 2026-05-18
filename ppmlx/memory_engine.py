@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -483,6 +484,7 @@ class MemoryEngine:
         extraction_input_tokens: int = 6000,
         extraction_overlap_tokens: int = 600,
         extraction_max_chunks_per_event: int = 32,
+        extraction_timeout_seconds: float = 0.0,
     ):
         self.store = store or get_memory_store()
         self.extractor = extractor or RuleBasedMemoryExtractor()
@@ -492,6 +494,7 @@ class MemoryEngine:
         self.extraction_input_tokens = max(32, int(extraction_input_tokens))
         self.extraction_overlap_tokens = max(0, min(int(extraction_overlap_tokens), self.extraction_input_tokens // 2))
         self.extraction_max_chunks_per_event = max(1, int(extraction_max_chunks_per_event))
+        self.extraction_timeout_seconds = max(0.0, float(extraction_timeout_seconds))
         self.validator = MemoryValidator(self.store)
 
     def capture_chat(
@@ -557,10 +560,14 @@ class MemoryEngine:
                 processed.append(item)
             return {"processed": len(processed), "jobs": processed}
 
+        if self.extraction_timeout_seconds > 0:
+            self.store.requeue_stale_claimed_extraction_jobs(stale_after_seconds=self.extraction_timeout_seconds)
+
         job = self.store.claim_extraction_job(worker_id)
         if job is None:
             return None
 
+        stop_heartbeat, heartbeat_thread = self._start_extraction_job_heartbeat(job)
         try:
             event = dict(job.get("payload") or {})
             event_id = str(event.get("event_id") or job.get("source_event_id") or job["job_id"])
@@ -580,6 +587,32 @@ class MemoryEngine:
                 "status": failed_job.get("status", "failed"),
                 "error": str(exc),
             }
+        finally:
+            if stop_heartbeat is not None:
+                stop_heartbeat.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1.0)
+
+    def _start_extraction_job_heartbeat(
+        self,
+        job: dict[str, Any],
+    ) -> tuple[threading.Event | None, threading.Thread | None]:
+        if self.extraction_timeout_seconds <= 0:
+            return None, None
+        job_id = str(job.get("job_id") or "")
+        worker_id = str(job.get("worker_id") or "")
+        if not job_id or not worker_id:
+            return None, None
+        interval = max(0.05, min(10.0, self.extraction_timeout_seconds / 3.0))
+        stop = threading.Event()
+
+        def _heartbeat() -> None:
+            while not stop.wait(interval):
+                self.store.renew_extraction_job_claim(job_id, worker_id)
+
+        thread = threading.Thread(target=_heartbeat, name=f"memory-extraction-heartbeat-{worker_id}", daemon=True)
+        thread.start()
+        return stop, thread
 
     def _extract_validate_store(
         self,
@@ -698,6 +731,7 @@ def get_memory_engine(path: Path | None = None) -> MemoryEngine:
         "extraction_input_tokens": cfg.memory.extraction_input_tokens,
         "extraction_overlap_tokens": cfg.memory.extraction_overlap_tokens,
         "extraction_max_chunks_per_event": cfg.memory.extraction_max_chunks_per_event,
+        "extraction_timeout_seconds": cfg.memory.extraction_timeout_seconds,
     }
     if extractor_name in {"model_memory_json", "memory_model_json", "model_json_memory", "strict_json_memory", "llm_json", "json_llm", "llm", "gemma_json"}:
         from ppmlx.memory_extractors import ModelMemoryJsonExtractor

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from ppmlx.memory_engine import ALLOWED_TYPES, ShadowMemoryCandidate, event_source_text
@@ -23,6 +25,7 @@ GEMMA_STRICT_JSON_EXTRACTOR = MODEL_MEMORY_JSON_EXTRACTOR  # backward-compatible
 _ALLOWED_SCOPES = {"global", "project", "session"}
 
 GenerationFn = Callable[[str, list[dict[str, str]], int, float], str]
+_LOCAL_GENERATION_LOCK = threading.Lock()
 
 
 class ModelMemoryJsonExtractor:
@@ -246,14 +249,48 @@ def _candidate_items(payload: Any) -> list[Any]:
 def _generate_with_local_engine(model_name: str, messages: list[dict[str, str]], max_tokens: int, temperature: float) -> str:
     from ppmlx.engine import get_engine
 
-    result = get_engine().generate(
-        model_name,
-        messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        enable_thinking=False,
-    )
+    with _exclusive_local_generation():
+        result = get_engine().generate(
+            model_name,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            enable_thinking=False,
+        )
     return result.text if hasattr(result, "text") else str(result[0])
+
+
+@contextmanager
+def _exclusive_local_generation():
+    """Serialize local model-backed extraction across threads/processes.
+
+    MLX local generation is not safe to fan out aggressively from multiple
+    memory workers on one machine. The thread lock serializes chunk extraction
+    within one worker process; the file lock serializes separate CLI workers.
+    """
+    with _LOCAL_GENERATION_LOCK:
+        lock_handle = None
+        fcntl_module = None
+        try:
+            import fcntl as imported_fcntl
+            from ppmlx.config import get_ppmlx_dir
+
+            fcntl_module = imported_fcntl
+            lock_handle = (get_ppmlx_dir() / "memory-extractor.lock").open("w")
+            fcntl_module.flock(lock_handle.fileno(), fcntl_module.LOCK_EX)
+        except Exception:
+            lock_handle = None
+            fcntl_module = None
+        try:
+            yield
+        finally:
+            if lock_handle is not None and fcntl_module is not None:
+                try:
+                    fcntl_module.flock(lock_handle.fileno(), fcntl_module.LOCK_UN)
+                except Exception:
+                    pass
+            if lock_handle is not None:
+                lock_handle.close()
 
 
 def _clean_string(value: Any) -> str:

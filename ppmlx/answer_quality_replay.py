@@ -201,6 +201,7 @@ def _post_chat(
     max_tokens: int,
     metadata: dict[str, Any],
     timeout_sec: float,
+    think: bool | None = False,
 ) -> tuple[dict[str, Any], float]:
     url = base_url.rstrip("/") + "/chat/completions"
     body = {
@@ -210,6 +211,8 @@ def _post_chat(
         "max_tokens": max_tokens,
         "metadata": metadata,
     }
+    if think is not None:
+        body["think"] = think
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),

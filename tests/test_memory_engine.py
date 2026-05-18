@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -504,7 +505,11 @@ def test_memory_cli_status_and_search(tmp_home):
     assert status_result.exit_code == 0
     status = json.loads(status_result.output)
     assert status["events"] == 1
+    assert status["candidates"] == 1
+    assert status["atoms"] == 0
+    assert status["extraction_jobs"] == 0
     assert status["by_status"]["active"] == 1
+    assert status["jobs_by_status"] == {}
 
     search_result = runner.invoke(app, ["memory", "search", "short", "--json"])
     assert search_result.exit_code == 0
@@ -565,6 +570,93 @@ def test_process_extraction_job_consumes_job_and_stores_candidate(tmp_path):
     assert len(rows) == 1
     assert rows[0]["object"] == "async extraction"
     assert store.stats()["events"] == 1
+
+
+def test_process_extraction_job_recovers_stale_claimed_job(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    queue_engine = MemoryEngine(store=store, extractor=FakeSingleCandidateExtractor(), enqueue_extraction=True)
+    queue_engine.capture_chat(
+        request_id="req-stale-claimed",
+        endpoint="/v1/chat/completions",
+        model_alias="test-model",
+        model_repo="repo/test",
+        messages=[{"role": "user", "content": "I prefer async extraction."}],
+        response_text="ok",
+    )
+
+    claimed = store.claim_extraction_job("crashed-worker")
+    assert claimed is not None
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE memory_extraction_jobs SET claimed_at = '2000-01-01T00:00:00.000' WHERE job_id = ?",
+            (claimed["job_id"],),
+        )
+        conn.commit()
+
+    worker_engine = MemoryEngine(
+        store=store,
+        extractor=FakeSingleCandidateExtractor(),
+        extraction_timeout_seconds=1,
+    )
+    result = worker_engine.process_extraction_job(worker_id="recovery-worker")
+
+    assert result is not None
+    assert result["active"] == 1
+    completed = store.get_extraction_job(claimed["job_id"])
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert completed["worker_id"] == "recovery-worker"
+    assert completed["attempts"] == 2
+    assert store.list_extraction_jobs(status="claimed") == []
+
+
+def test_process_extraction_job_renews_claim_while_running(tmp_path):
+    class SlowExtractor:
+        max_candidates = 1
+
+        def extract(self, event):
+            time.sleep(0.3)
+            return [ShadowMemoryCandidate(
+                type="preference",
+                subject="user",
+                predicate="prefers",
+                object="slow extraction",
+                text="User prefers slow extraction.",
+                scope="global",
+                confidence=0.9,
+                source_quote="slow extraction",
+                salience=0.8,
+            )]
+
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    queue_engine = MemoryEngine(store=store, extractor=SlowExtractor(), enqueue_extraction=True)
+    queue_engine.capture_chat(
+        request_id="req-heartbeat",
+        endpoint="/v1/chat/completions",
+        model_alias="test-model",
+        model_repo="repo/test",
+        messages=[{"role": "user", "content": "I prefer slow extraction."}],
+        response_text="ok",
+    )
+    worker_a = MemoryEngine(store=store, extractor=SlowExtractor(), extraction_timeout_seconds=0.15)
+    worker_b = MemoryEngine(store=store, extractor=SlowExtractor(), extraction_timeout_seconds=0.15)
+
+    results: list[dict | None] = []
+    thread = threading.Thread(target=lambda: results.append(worker_a.process_extraction_job(worker_id="worker-a")))
+    thread.start()
+    time.sleep(0.22)
+
+    assert worker_b.process_extraction_job(worker_id="worker-b") is None
+    thread.join(timeout=2)
+
+    assert results and results[0] is not None
+    completed = store.list_extraction_jobs(status="completed")
+    assert len(completed) == 1
+    assert completed[0]["worker_id"] == "worker-a"
+    assert completed[0]["attempts"] == 1
+    assert store.list_extraction_jobs(status="claimed") == []
 
 
 def test_memory_cli_jobs_json_lists_jobs(tmp_home):

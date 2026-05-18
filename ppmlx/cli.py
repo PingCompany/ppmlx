@@ -2137,10 +2137,14 @@ def memory_status_cmd(
     table.add_row("DB", stats["path"])
     table.add_row("Events", str(stats["events"]))
     table.add_row("Candidates", str(stats["candidates"]))
+    table.add_row("Atoms", str(stats.get("atoms", 0)))
     table.add_row("Entities", str(stats["entities"]))
     table.add_row("Edges", str(stats["edges"]))
+    table.add_row("Extraction jobs", str(stats.get("extraction_jobs", 0)))
     for status, count in stats.get("by_status", {}).items():
-        table.add_row(f"Status: {status}", str(count))
+        table.add_row(f"Candidate status: {status}", str(count))
+    for status, count in stats.get("jobs_by_status", {}).items():
+        table.add_row(f"Job status: {status}", str(count))
     console.print(table)
 
 

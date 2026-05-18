@@ -103,6 +103,14 @@ def test_probe_classifier_skips_tool_and_code_action_turns():
         "Fix the failing pytest in the repo",
         "I'll inspect the failing test and patch the file.",
     )
+    delegated_type, _ = classify_probe(
+        "zrób to za mnie",
+        "I will run uv sync and reinstall the tool.",
+    )
+    feedback_type, _ = classify_probe(
+        "z HF_HUB_DISABLE_XET=1 działa płynniej",
+        "Great, that confirms Xet progress callbacks are the likely cause.",
+    )
     answer_type, _ = classify_probe(
         "What changed?",
         "The config file changed and tests passed. Next run validation.",
@@ -110,4 +118,6 @@ def test_probe_classifier_skips_tool_and_code_action_turns():
 
     assert tool_type == "tool_action_required"
     assert code_type == "code_edit_required"
+    assert delegated_type == "code_edit_required"
+    assert feedback_type == "ambiguous_skip"
     assert answer_type == "answerable_text"
