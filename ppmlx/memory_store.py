@@ -763,6 +763,132 @@ class MemoryStore:
             )
             conn.commit()
 
+    def rebuild_graph_projection(
+        self,
+        *,
+        status: str | None = "active",
+        app_id: str | None = None,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Rebuild graph edges for candidates matching exact namespace filters.
+
+        Dry runs are non-destructive and return counts. Confirmed rebuilds delete
+        only edges whose source candidates match the supplied filters, then route
+        each candidate through ``upsert_memory_edge`` so canonical graph safety
+        checks continue to apply.
+        """
+        self.init()
+        status_filter = None if status in {None, "", "all"} else status
+        candidates = self._projection_candidates(
+            status=status_filter,
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+        )
+        candidate_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+        existing_edges = self._count_edges_for_candidate_ids(candidate_ids)
+        projectable = sum(
+            1
+            for candidate in candidates
+            if canonicalize_graph_entity(str(candidate.get("subject") or "")) is not None
+            and canonicalize_graph_entity(str(candidate.get("object") or "")) is not None
+        )
+        result: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "status": status_filter or "all",
+            "app_id": app_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "candidates": len(candidates),
+            "existing_edges": existing_edges,
+            "projectable_candidates": projectable,
+            "deleted_edges": 0,
+            "rebuilt_edges": 0,
+        }
+        if dry_run or not candidate_ids:
+            return result
+
+        with self._lock, self._connect() as conn:
+            deleted_edges = self._delete_edges_for_candidate_ids_conn(conn, candidate_ids)
+            conn.commit()
+        for candidate in candidates:
+            self.upsert_memory_edge(candidate)
+        result["deleted_edges"] = deleted_edges
+        result["rebuilt_edges"] = self._count_edges_for_candidate_ids(candidate_ids)
+        return result
+
+    def enqueue_extraction_jobs_from_events(
+        self,
+        *,
+        app_id: str | None = None,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        limit: int | None = None,
+        priority: int = 0,
+        max_attempts: int = 3,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Queue extraction jobs for already-recorded memory events without deleting data."""
+        self.init()
+        events = self._events_for_extraction_jobs(
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+            limit=limit,
+        )
+        result: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "app_id": app_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "limit": limit,
+            "events": len(events),
+            "queued": 0,
+            "job_ids": [],
+        }
+        if dry_run:
+            return result
+        for event in events:
+            job = self.enqueue_extraction_job(
+                event,
+                source_event_id=str(event.get("event_id") or ""),
+                priority=priority,
+                max_attempts=max_attempts,
+            )
+            result["queued"] += 1
+            result["job_ids"].append(job["job_id"])
+        return result
+
+    def prune_noisy_namespaces(
+        self,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Safely forget active memories from known eval/test namespaces."""
+        self.init()
+        candidates = self._noisy_namespace_candidates(project_id=project_id, session_id=session_id)
+        candidate_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+        edges = self._count_edges_for_candidate_ids(candidate_ids, status="active")
+        result: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "project_id": project_id,
+            "session_id": session_id,
+            "candidates": len(candidates),
+            "edges": edges,
+            "forgotten_candidates": 0,
+            "candidate_ids": candidate_ids,
+        }
+        if dry_run:
+            return result
+        for candidate_id in candidate_ids:
+            if self.forget_candidate(candidate_id):
+                result["forgotten_candidates"] += 1
+        return result
+
     def query_candidates(
         self,
         *,
@@ -1151,6 +1277,128 @@ class MemoryStore:
                 params,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def _projection_candidates(
+        self,
+        *,
+        status: str | None,
+        app_id: str | None,
+        project_id: str | None,
+        session_id: str | None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if status:
+            conditions.append("c.status = ?")
+            params.append(status)
+        if app_id:
+            conditions.append("e.app_id = ?")
+            params.append(app_id)
+        if project_id:
+            conditions.append("e.project_id = ?")
+            params.append(project_id)
+        if session_id:
+            conditions.append("e.session_id = ?")
+            params.append(session_id)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""SELECT c.*, e.app_id, e.project_id, e.session_id, e.endpoint, e.model_alias, e.model_repo
+                    FROM memory_candidates c
+                    LEFT JOIN memory_events e ON e.event_id = c.event_id
+                    {where}
+                    ORDER BY c.created_at ASC, c.id ASC""",
+                params,
+            ).fetchall()
+        return [self._row_to_candidate(row) for row in rows]
+
+    def _events_for_extraction_jobs(
+        self,
+        *,
+        app_id: str | None,
+        project_id: str | None,
+        session_id: str | None,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if app_id:
+            conditions.append("app_id = ?")
+            params.append(app_id)
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if session_id:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(0, int(limit)))
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT * FROM memory_events{where} ORDER BY timestamp ASC, id ASC{limit_sql}",
+                params,
+            ).fetchall()
+        return [self._row_to_event(row) for row in rows]
+
+    def _noisy_namespace_candidates(
+        self,
+        *,
+        project_id: str | None,
+        session_id: str | None,
+    ) -> list[dict[str, Any]]:
+        from ppmlx.context_reducer import is_noisy_context_namespace
+
+        conditions = ["c.status = 'active'"]
+        params: list[Any] = []
+        if project_id:
+            conditions.append("e.project_id = ?")
+            params.append(project_id)
+        if session_id:
+            conditions.append("e.session_id = ?")
+            params.append(session_id)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""SELECT c.*, e.app_id, e.project_id, e.session_id, e.endpoint, e.model_alias, e.model_repo
+                    FROM memory_candidates c
+                    LEFT JOIN memory_events e ON e.event_id = c.event_id
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY c.created_at ASC, c.id ASC""",
+                params,
+            ).fetchall()
+        candidates = [self._row_to_candidate(row) for row in rows]
+        return [candidate for candidate in candidates if is_noisy_context_namespace(candidate)]
+
+    def _count_edges_for_candidate_ids(self, candidate_ids: list[str], *, status: str | None = None) -> int:
+        if not candidate_ids:
+            return 0
+        placeholders = ",".join("?" for _ in candidate_ids)
+        conditions = [f"source_candidate_id IN ({placeholders})"]
+        params: list[Any] = list(candidate_ids)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        with self._connect() as conn:
+            return int(conn.execute(
+                f"SELECT COUNT(*) FROM memory_edges WHERE {' AND '.join(conditions)}",
+                params,
+            ).fetchone()[0])
+
+    @staticmethod
+    def _delete_edges_for_candidate_ids_conn(conn: sqlite3.Connection, candidate_ids: list[str]) -> int:
+        if not candidate_ids:
+            return 0
+        placeholders = ",".join("?" for _ in candidate_ids)
+        cur = conn.execute(
+            f"DELETE FROM memory_edges WHERE source_candidate_id IN ({placeholders})",
+            candidate_ids,
+        )
+        return int(cur.rowcount or 0)
 
     def stats(self) -> dict[str, Any]:
         self.init()

@@ -2156,6 +2156,87 @@ def memory_worker_cmd(
     console.print(f"[dim]Processed {processed} job(s).[/dim]")
 
 
+@memory_app.command(name="rebuild")
+def memory_rebuild_cmd(
+    project_id: Optional[str] = typer.Option(None, "--project", help="Filter by project namespace"),
+    session_id: Optional[str] = typer.Option(None, "--session", help="Filter by session namespace"),
+    app_id: Optional[str] = typer.Option(None, "--app", help="Filter by app namespace"),
+    from_events: bool = typer.Option(False, "--from-events", help="Enqueue extraction jobs from matching recorded events instead of rebuilding edges"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Maximum events to queue with --from-events"),
+    dry_run: bool = typer.Option(True, "--dry-run/--confirm", help="Preview by default; use --confirm to write changes"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """Rebuild memory graph projection or queue extraction jobs from recorded events."""
+    from rich.table import Table
+    from ppmlx.memory_store import get_memory_store
+
+    store = get_memory_store()
+    if from_events:
+        result = store.enqueue_extraction_jobs_from_events(
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+            limit=limit,
+            dry_run=dry_run,
+        )
+        title = "Memory Extraction Queue Preview" if dry_run else "Memory Extraction Queue"
+    else:
+        result = store.rebuild_graph_projection(
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+            dry_run=dry_run,
+        )
+        title = "Memory Graph Rebuild Preview" if dry_run else "Memory Graph Rebuild"
+
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    table = Table(title=title)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    for key, value in result.items():
+        if key == "job_ids":
+            value = len(value)
+        table.add_row(key, str(value))
+    console.print(table)
+    if dry_run:
+        console.print("[yellow]Dry run only. Re-run with --confirm to apply changes.[/yellow]")
+
+
+@memory_app.command(name="prune")
+def memory_prune_cmd(
+    project_id: Optional[str] = typer.Option(None, "--project", help="Limit cleanup to this exact project namespace"),
+    session_id: Optional[str] = typer.Option(None, "--session", help="Limit cleanup to this exact session namespace"),
+    dry_run: bool = typer.Option(True, "--dry-run/--confirm", help="Preview by default; use --confirm to mark memories forgotten"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """Safely mark active eval/test/dogfood namespace memories as forgotten."""
+    from rich.table import Table
+    from ppmlx.memory_store import get_memory_store
+
+    result = get_memory_store().prune_noisy_namespaces(
+        project_id=project_id,
+        session_id=session_id,
+        dry_run=dry_run,
+    )
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    table = Table(title="Memory Noisy Namespace Prune Preview" if dry_run else "Memory Noisy Namespace Prune")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    for key, value in result.items():
+        if key == "candidate_ids":
+            value = len(value)
+        table.add_row(key, str(value))
+    console.print(table)
+    if dry_run:
+        console.print("[yellow]Dry run only. Re-run with --confirm to mark matching memories forgotten.[/yellow]")
+
+
 @memory_app.command(name="forget")
 def memory_forget_cmd(
     candidate_id: str = typer.Argument(..., help="Memory candidate id"),

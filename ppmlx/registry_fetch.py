@@ -1,4 +1,4 @@
-"""Fetch trending MLX models from HuggingFace and cache locally."""
+"""Fetch top-downloaded MLX models from HuggingFace and cache locally."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 _CACHE_FILE = "registry_cache.json"
 _HF_AUTHOR = "mlx-community"
-_FETCH_LIMIT = 24
+_FETCH_LIMIT = 50
 _FETCH_TIMEOUT = 8  # seconds
 
 _STALENESS_SECONDS: dict[str, float] = {
@@ -95,9 +95,9 @@ def _fetch_from_hf() -> dict[str, Any] | None:
         api = HfApi()
         models = list(api.list_models(
             author=_HF_AUTHOR,
-            sort="trendingScore",
+            sort="downloads",
             limit=_FETCH_LIMIT,
-            expand=["safetensors", "downloads", "trendingScore"],
+            expand=["safetensors", "downloads"],
             token=False,
         ))
         entries: dict[str, dict[str, Any]] = {}
@@ -120,7 +120,7 @@ def _fetch_from_hf() -> dict[str, Any] | None:
             "version": 1,
             "fetched_at": time.time(),
             "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "source": "huggingface-api",
+            "source": "huggingface-api-downloads",
             "models": entries,
         }
     except Exception as e:

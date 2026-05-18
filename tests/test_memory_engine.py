@@ -35,6 +35,34 @@ class FakeSingleCandidateExtractor:
         )]
 
 
+def _seed_project_memory(store: MemoryStore, *, event_id: str, candidate_id: str, project_id: str) -> dict:
+    store.record_event({
+        "event_id": event_id,
+        "endpoint": "/v1/chat/completions",
+        "project_id": project_id,
+        "request": {"messages": [{"role": "user", "content": "We decided to rebuild graph projection."}]},
+        "response_text": "ok",
+        "metadata": {},
+    })
+    candidate = {
+        "candidate_id": candidate_id,
+        "event_id": event_id,
+        "type": "decision",
+        "subject": project_id,
+        "predicate": "decided",
+        "object": "graph projection rebuild",
+        "text": f"{project_id} decided graph projection rebuild.",
+        "scope": "project",
+        "confidence": 0.9,
+        "source_quote": "decided graph projection rebuild",
+        "salience": 0.8,
+        "metadata": {},
+    }
+    store.store_candidate(candidate, {"status": "active", "reasons": [], "invalidates": []})
+    store.upsert_memory_edge(candidate)
+    return candidate
+
+
 def test_capture_preference_creates_active_memory_and_edge(tmp_path):
     engine, store = _make_engine(tmp_path)
 
@@ -266,6 +294,88 @@ def test_canonicalized_entity_alias_is_stored_for_raw_label(tmp_path):
     aliases = store.query_entity_aliases(alias="Project PPMLX", scope="project")
     assert len(aliases) == 1
     assert aliases[0]["entity_id"] == next(node["id"] for node in snapshot["nodes"] if node["label"] == "ppmlx")
+
+
+def test_memory_store_rebuild_graph_projection_dry_run_is_non_destructive(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    _seed_project_memory(store, event_id="rebuild-dry-event", candidate_id="rebuild-dry-candidate", project_id="ppmlx")
+
+    result = store.rebuild_graph_projection(project_id="ppmlx", dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["candidates"] == 1
+    assert result["existing_edges"] == 1
+    assert result["projectable_candidates"] == 1
+    assert result["deleted_edges"] == 0
+    assert store.stats()["edges"] == 1
+
+
+def test_memory_store_confirmed_rebuild_recreates_only_matching_projection(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    _seed_project_memory(store, event_id="rebuild-p-event", candidate_id="rebuild-p-candidate", project_id="ppmlx")
+    _seed_project_memory(store, event_id="rebuild-q-event", candidate_id="rebuild-q-candidate", project_id="other-project")
+    with store._connect() as conn:
+        conn.execute("DELETE FROM memory_edges WHERE source_candidate_id = ?", ("rebuild-p-candidate",))
+        conn.commit()
+
+    result = store.rebuild_graph_projection(project_id="ppmlx", dry_run=False)
+
+    assert result["dry_run"] is False
+    assert result["candidates"] == 1
+    assert result["rebuilt_edges"] == 1
+    assert store.stats()["edges"] == 2
+    assert store.inspect_candidate("rebuild-p-candidate")["edges"][0]["relation"] == "decided"
+    assert store.inspect_candidate("rebuild-q-candidate")["edges"]
+
+
+def test_memory_store_enqueue_extraction_jobs_from_events(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    store.record_event({
+        "event_id": "event-queue-a",
+        "endpoint": "/v1/chat/completions",
+        "project_id": "ppmlx",
+        "request": {"messages": [{"role": "user", "content": "Remember queueing."}]},
+        "response_text": "ok",
+        "metadata": {},
+    })
+    store.record_event({
+        "event_id": "event-queue-b",
+        "endpoint": "/v1/chat/completions",
+        "project_id": "other-project",
+        "request": {"messages": [{"role": "user", "content": "Ignore."}]},
+        "response_text": "ok",
+        "metadata": {},
+    })
+
+    result = store.enqueue_extraction_jobs_from_events(project_id="ppmlx", limit=10, dry_run=False)
+
+    assert result["events"] == 1
+    assert result["queued"] == 1
+    jobs = store.list_extraction_jobs(status="queued")
+    assert len(jobs) == 1
+    assert jobs[0]["source_event_id"] == "event-queue-a"
+    assert jobs[0]["payload"]["event_id"] == "event-queue-a"
+    assert jobs[0]["payload"]["messages"][0]["content"] == "Remember queueing."
+    assert store.stats()["candidates"] == 0
+
+
+def test_memory_store_prune_noisy_namespaces_dry_run(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+    _seed_project_memory(store, event_id="prune-normal-event", candidate_id="prune-normal-candidate", project_id="ppmlx")
+    _seed_project_memory(store, event_id="prune-noisy-event", candidate_id="prune-noisy-candidate", project_id="answer-quality-real-dogfood")
+
+    result = store.prune_noisy_namespaces(dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["candidates"] == 1
+    assert result["edges"] == 1
+    assert result["candidate_ids"] == ["prune-noisy-candidate"]
+    assert store.inspect_candidate("prune-noisy-candidate")["status"] == "active"
+    assert store.stats()["edges"] == 2
 
 
 def test_graph_cli_json_outputs_snapshot(tmp_home):
