@@ -55,6 +55,7 @@ class ReplayResult:
     forbidden_terms: list[str] = field(default_factory=list)
     wrong_terms: list[str] = field(default_factory=list)
     session_context: str = ""
+    reduced_context: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +76,7 @@ class ReplayResult:
             "forbidden_terms": self.forbidden_terms,
             "wrong_terms": self.wrong_terms,
             "session_context": self.session_context,
+            "reduced_context": self.reduced_context,
         }
 
 
@@ -190,6 +192,7 @@ def compact_replay(
         latency_ms = (time.perf_counter() - start) * 1000
 
     session_context = _extract_session_context(reduction.messages)
+    reduced_context = _render_reduced_context(reduction.messages)
     haystack = _normalize("\n".join(_message_text(message) for message in reduction.messages))
     found = [term for term in expected_terms if _normalize(term) in haystack]
     missed = [term for term in expected_terms if term not in found]
@@ -214,6 +217,7 @@ def compact_replay(
         forbidden_terms=forbidden_terms,
         wrong_terms=wrong,
         session_context=session_context,
+        reduced_context=reduced_context,
     )
 
 
@@ -238,6 +242,19 @@ def _extract_session_context(messages: list[dict[str, Any]]) -> str:
         if message.get("role") == "system" and "Compacted local session context" in str(message.get("content", "")):
             return str(message.get("content", ""))
     return ""
+
+
+def _render_reduced_context(messages: list[dict[str, Any]], *, max_chars: int = 20000) -> str:
+    parts: list[str] = []
+    for message in messages:
+        role = str(message.get("role") or "message")
+        text = _message_text(message)
+        if text.strip():
+            parts.append(f"[{role}]\n{text}")
+    rendered = "\n\n".join(parts)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars // 2] + "\n\n...[reduced context truncated]...\n\n" + rendered[-max_chars // 2:]
 
 
 def _message_text(message: dict[str, Any]) -> str:

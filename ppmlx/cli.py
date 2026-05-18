@@ -2137,6 +2137,224 @@ def compact_replay_cmd(
         raise typer.Exit(1)
 
 
+@app.command(name="quality-bench")
+def quality_bench_cmd(
+    path: str = typer.Argument(..., help="Real Pi/Claude session JSONL path"),
+    source: str = typer.Option("auto", "--source", help="Session source: auto, pi, or claude"),
+    base_url: str = typer.Option("http://127.0.0.1:6767/v1", "--base-url", help="OpenAI-compatible ppmlx base URL"),
+    model: str = typer.Option(..., "--model", "-m", help="Model alias/repo served by ppmlx"),
+    split: float = typer.Option(0.8, "--split", help="Episode/token split ratio for prefix vs holdout"),
+    max_probes: int = typer.Option(5, "--max-probes", help="Maximum held-out user turns to probe"),
+    max_tokens: int = typer.Option(260, "--max-tokens", help="Max completion tokens per probe"),
+    probe_type: Optional[list[str]] = typer.Option(None, "--probe-type", help="Probe types to include; repeatable. Default: answerable_text"),
+    timeout_sec: float = typer.Option(600.0, "--timeout", help="HTTP timeout per inference request"),
+    include_content: bool = typer.Option(False, "--include-content", help="Include generated/expected answers in JSON output/report"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Save JSON report to this path"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Print JSON report"),
+    fail_on_threshold: bool = typer.Option(True, "--fail-on-threshold/--no-fail-on-threshold", help="Exit 1 when quality bench fails"),
+):
+    """Benchmark compact context on real transcripts using held-out suffix probes."""
+    from rich.table import Table
+    from ppmlx.quality_bench import run_quality_bench
+
+    try:
+        report = run_quality_bench(
+            path=Path(path),
+            source=source,
+            base_url=base_url,
+            model=model,
+            split=split,
+            max_probes=max_probes,
+            max_tokens=max_tokens,
+            include_probe_types=tuple(probe_type or ["answerable_text"]),
+            timeout_sec=timeout_sec,
+            include_content=include_content,
+        )
+    except Exception as exc:
+        console.print(f"[red]Quality bench failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    data = report.to_dict(include_content=include_content)
+    if output:
+        out = Path(output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        console.print(f"[green]Quality bench report saved to {out}[/green]")
+
+    if json_output:
+        typer.echo(json.dumps(data, indent=2, ensure_ascii=False))
+        if fail_on_threshold and not data["passed"]:
+            raise typer.Exit(1)
+        return
+
+    summary = data["summary"]
+    status = "[green]PASS[/green]" if data["passed"] else "[red]FAIL[/red]"
+    table = Table(title=f"Quality Bench: {status}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Probes", f"{summary['passed']}/{summary['probes']}")
+    table.add_row("Skipped", str(summary.get("skipped", 0)))
+    table.add_row("Avg recall", f"{summary['avg_recall'] * 100:.1f}%")
+    table.add_row("Wrong facts", str(summary["wrong_facts_total"]))
+    table.add_row("Avg actionability", f"{summary['avg_actionability']:.2f}/5")
+    table.add_row("Avg grounding", f"{summary['avg_grounding'] * 100:.1f}%")
+    table.add_row("Avg A/B equivalence", f"{summary['avg_equivalence'] * 100:.1f}%")
+    table.add_row("Avg context fact coverage", f"{summary.get('avg_context_fact_coverage', 0.0) * 100:.1f}%")
+    table.add_row("Avg prompt compression", f"{summary['avg_prompt_compression']:.2f}x")
+    table.add_row("Prompt tokens total", str(summary["prompt_tokens_total"]))
+    table.add_row("Failure buckets", json.dumps(summary.get("failure_buckets", {}), ensure_ascii=False))
+    console.print(table)
+    for probe in report.probes:
+        probe_status = "[green]PASS[/green]" if probe.passed else "[red]FAIL[/red]"
+        console.print(
+            f"{probe_status} {probe.probe_id}: recall={probe.recall:.2f}, wrong={probe.wrong_facts}, "
+            f"grounding={probe.grounding:.2f}, equivalence={probe.equivalence:.2f}, "
+            f"ctx_facts={probe.context_fact_coverage:.2f}, bucket={probe.failure_bucket}, "
+            f"compression={probe.prompt_compression:.2f}x"
+        )
+    if fail_on_threshold and not data["passed"]:
+        raise typer.Exit(1)
+
+
+@app.command(name="answer-quality-replay")
+def answer_quality_replay_cmd(
+    path: str = typer.Argument(..., help="Real Pi/Claude session JSONL path"),
+    source: str = typer.Option("auto", "--source", help="Session source: auto, pi, or claude"),
+    base_url: str = typer.Option("http://127.0.0.1:6767/v1", "--base-url", help="OpenAI-compatible ppmlx base URL"),
+    model: str = typer.Option(..., "--model", "-m", help="Model alias/repo served by ppmlx"),
+    question: str = typer.Option(
+        "Give a concise factual handoff of the current work relevant to this session/project only: current goal, important decisions, validation status, and next action. Ignore embedded examples, synthetic fixtures, or unrelated test scenarios. Do not include secrets.",
+        "--question",
+        "-q",
+        help="Question to ask for compact and reference answers",
+    ),
+    project_id: str = typer.Option("answer-quality-real", "--project", help="Memory project id for this replay"),
+    session_id: str = typer.Option("s1", "--session", help="Memory session id for this replay"),
+    max_tokens: int = typer.Option(260, "--max-tokens", help="Max completion tokens for compact/reference answers"),
+    timeout_sec: float = typer.Option(600.0, "--timeout", help="HTTP timeout per inference request"),
+    include_answers: bool = typer.Option(False, "--include-answers", help="Include generated answers and required facts in JSON output/report"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Save JSON report to this path"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Print JSON report"),
+    fail_on_threshold: bool = typer.Option(True, "--fail-on-threshold/--no-fail-on-threshold", help="Exit 1 when quality thresholds fail"),
+):
+    """Run real-session answer-quality eval through a running ppmlx server."""
+    from rich.table import Table
+    from ppmlx.answer_quality_replay import run_real_answer_quality
+
+    try:
+        report = run_real_answer_quality(
+            path=Path(path),
+            source=source,
+            base_url=base_url,
+            model=model,
+            question=question,
+            project_id=project_id,
+            session_id=session_id,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            include_answers=include_answers,
+        )
+    except Exception as exc:
+        console.print(f"[red]Answer-quality replay failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    data = report.to_dict(include_answers=include_answers)
+    if output:
+        out = Path(output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        console.print(f"[green]Answer-quality replay report saved to {out}[/green]")
+
+    if json_output:
+        typer.echo(json.dumps(data, indent=2, ensure_ascii=False))
+        if fail_on_threshold and not data["answer_quality"].get("passed"):
+            raise typer.Exit(1)
+        return
+
+    quality = data["answer_quality"]
+    summary = quality["summary"]
+    status = "[green]PASS[/green]" if quality["passed"] else "[red]FAIL[/red]"
+    table = Table(title=f"Real Answer Quality Replay: {status}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Source", data["source"])
+    table.add_row("Original est. tokens", str(data["original_est_tokens"]))
+    table.add_row("Compact prompt tokens", str(data["compact_usage"].get("prompt_tokens", "-")))
+    table.add_row("Reference prompt tokens", str(data["reference_usage"].get("prompt_tokens", "-")))
+    table.add_row("Replay compression", f"{data['replay_tokens'].get('compression_ratio', 0):.2f}x")
+    table.add_row("Required facts", str(data["required_facts_count"]))
+    table.add_row("Recall", f"{summary['avg_recall'] * 100:.1f}%")
+    table.add_row("Wrong facts", str(summary["total_wrong_facts"]))
+    table.add_row("Actionability", f"{summary['avg_actionability']:.2f}/5")
+    table.add_row("Grounding", f"{summary['avg_grounding'] * 100:.1f}%")
+    table.add_row("A/B equivalence", f"{summary['avg_equivalence_to_full'] * 100:.1f}%")
+    console.print(table)
+    if fail_on_threshold and not quality["passed"]:
+        raise typer.Exit(1)
+
+
+@app.command(name="answer-quality-eval")
+def answer_quality_eval_cmd(
+    dataset: Optional[str] = typer.Option(None, "--dataset", "-d", help="Answer-quality dataset JSON path; defaults to built-in cases"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Save full JSON report to this path"),
+    template: Optional[str] = typer.Option(None, "--template", help="Write a dataset template to this path and exit"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Print full JSON report"),
+    fail_on_threshold: bool = typer.Option(True, "--fail-on-threshold/--no-fail-on-threshold", help="Exit 1 when answer-quality thresholds fail"),
+):
+    """Run the five-layer answer-quality eval for compact-memory responses."""
+    from rich.table import Table
+    from ppmlx.answer_quality import AnswerQualityEvaluator, builtin_cases, load_cases, save_case_template
+
+    if template:
+        out_path = save_case_template(Path(template))
+        console.print(f"[green]Answer-quality template saved to {out_path}[/green]")
+        return
+
+    try:
+        cases = load_cases(Path(dataset)) if dataset else builtin_cases()
+        report = AnswerQualityEvaluator().evaluate(cases)
+    except Exception as exc:
+        console.print(f"[red]Answer quality eval failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    if output:
+        out = Path(output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        console.print(f"[green]Answer quality report saved to {out}[/green]")
+
+    if json_output:
+        typer.echo(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        if fail_on_threshold and not report.passed:
+            raise typer.Exit(1)
+        return
+
+    status = "[green]PASS[/green]" if report.passed else "[red]FAIL[/red]"
+    data = report.to_dict()["summary"]
+    table = Table(title=f"Answer Quality Eval: {status}")
+    table.add_column("Layer", style="cyan")
+    table.add_column("Metric", justify="right")
+    table.add_row("Task-state recall", f"{data['avg_recall'] * 100:.1f}%")
+    table.add_row("Wrong-fact rate", str(data["total_wrong_facts"]))
+    table.add_row("Actionability", f"{data['avg_actionability']:.2f}/5")
+    table.add_row("Grounding", f"{data['avg_grounding'] * 100:.1f}%")
+    table.add_row("A/B equivalence", f"{data['avg_equivalence_to_full'] * 100:.1f}%")
+    table.add_row("Cases", f"{data['passed_cases']}/{data['cases']}")
+    console.print(table)
+    for result in report.results:
+        case_status = "[green]PASS[/green]" if result.passed else "[red]FAIL[/red]"
+        console.print(
+            f"{case_status} {result.case_id}: "
+            f"recall={result.recall:.2f}, wrong={result.wrong_fact_count}, "
+            f"actionability={result.actionability}/5, grounding={result.grounding:.2f}, "
+            f"equivalence={result.equivalence_to_full:.2f}"
+        )
+        if result.required_missed or result.wrong_facts:
+            console.print(f"[red]Missed:[/red] {result.required_missed} [red]Wrong:[/red] {result.wrong_facts}")
+    if fail_on_threshold and not report.passed:
+        raise typer.Exit(1)
+
+
 @app.command(name="compact-eval")
 def compact_eval_cmd(
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Save full JSON report to this path"),

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ppmlx.memory_store import MemoryStore, get_memory_store
-from ppmlx.tool_distillers import DistilledMemoryCandidate, GenericJsonToolDistiller, ToolDistiller
+from ppmlx.tool_distillers import CodingToolDistiller, DistilledMemoryCandidate, GenericJsonToolDistiller, ToolDistiller
 
 
 STATUS_ACTIVE = "active"
@@ -103,7 +103,7 @@ class RuleBasedMemoryExtractor:
 
     def __init__(self, max_candidates: int = 12, tool_distillers: list[ToolDistiller] | None = None):
         self.max_candidates = max_candidates
-        self.tool_distillers = tool_distillers or [GenericJsonToolDistiller()]
+        self.tool_distillers = tool_distillers or [GenericJsonToolDistiller(), CodingToolDistiller()]
 
     def extract(self, event: dict[str, Any]) -> list[ShadowMemoryCandidate]:
         source_text = event_source_text(event)
@@ -127,12 +127,10 @@ class RuleBasedMemoryExtractor:
                 for distilled in distiller.distill(message, event):
                     candidates.append(self._from_distilled(distilled))
 
-        # Preserve source evidence and anti-memory signals in metadata.
-        reject_requested = any(signal in source_text.lower() for signal in REJECT_SIGNALS)
         unique: dict[tuple[str, str, str, str, str], ShadowMemoryCandidate] = {}
         for candidate in candidates:
             candidate.metadata.setdefault("extractor", "rule_based_v1")
-            candidate.metadata["reject_requested"] = reject_requested
+            candidate.metadata["reject_requested"] = _candidate_reject_requested(candidate, source_text)
             key = (
                 _norm(candidate.type),
                 _norm(candidate.subject),
@@ -142,7 +140,7 @@ class RuleBasedMemoryExtractor:
             )
             if key not in unique:
                 unique[key] = candidate
-        return list(unique.values())[: self.max_candidates]
+        return sorted(unique.values(), key=lambda item: item.salience, reverse=True)[: self.max_candidates]
 
     @staticmethod
     def _from_distilled(candidate: DistilledMemoryCandidate) -> ShadowMemoryCandidate:
@@ -563,6 +561,28 @@ def _message_to_text(message: dict[str, Any]) -> str:
 
 def _contains_sensitive(text: str) -> bool:
     return any(pattern.search(text) for pattern in SENSITIVE_PATTERNS)
+
+
+def _candidate_reject_requested(candidate: ShadowMemoryCandidate, source_text: str) -> bool:
+    """Return True only when an anti-memory request appears to target this candidate.
+
+    A broad event-level flag is too destructive: users often say "do not
+    remember token X" while other non-sensitive facts in the same turn are safe
+    and useful. Keep fail-closed behavior for the referenced candidate text.
+    """
+    lower_source = source_text.lower()
+    if not any(signal in lower_source for signal in REJECT_SIGNALS):
+        return False
+    candidate_bits = [candidate.object, candidate.subject, candidate.source_quote]
+    for bit in candidate_bits:
+        bit_norm = _norm(str(bit))
+        if bit_norm and len(bit_norm) >= 4 and bit_norm in _norm(source_text):
+            for signal in REJECT_SIGNALS:
+                signal_idx = lower_source.find(signal)
+                bit_idx = lower_source.find(str(bit).lower())
+                if signal_idx >= 0 and bit_idx >= 0 and signal_idx <= bit_idx < signal_idx + 240:
+                    return True
+    return False
 
 
 def _candidate_id(event_id: str, type_: str, subject: str, predicate: str, object_: str, scope: str) -> str:

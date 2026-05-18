@@ -33,6 +33,105 @@ class ToolDistiller(Protocol):
         """Return candidate records extracted from a tool/MCP message."""
 
 
+class CodingToolDistiller:
+    """Generic coding-agent tool output distiller.
+
+    Extracts durable, evidence-backed atoms from repo/tool logs without knowing
+    a specific agent schema: changed files, command/test outcomes, and compact
+    error signatures.
+    """
+
+    name = "coding_tool_v1"
+
+    _FILE_RE = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|md|json|toml|ya?ml|swift|go|rs|sh|sql|css|html))")
+    _COMMAND_RE = re.compile(r"(?:^|\n)\s*(?:\$\s*)?((?:uv run |npm |pnpm |yarn |pytest|ruff |python |git |make |cargo |go test|swift test)[^\n]{0,180})", re.IGNORECASE)
+    _TEST_RE = re.compile(r"\b(\d+\s+passed|\d+\s+failed|all checks passed|tests? passed|tests? failed)\b", re.IGNORECASE)
+    _ERROR_RE = re.compile(r"\b(AssertionError(?:: [^\n]{1,160})?|Traceback \(most recent call last\)|[A-Za-z0-9_.]+Error: [^\n]{1,160})")
+
+    def __init__(self, max_items: int = 8):
+        self.max_items = max_items
+
+    def distill(self, message: dict[str, Any], event: dict[str, Any]) -> list[DistilledMemoryCandidate]:
+        role = str(message.get("role", ""))
+        if role not in {"tool", "function"} and not _looks_like_tool_message(message):
+            return []
+        raw_text = _content_to_text(message.get("content", ""))
+        if not raw_text.strip():
+            return []
+        project_id = event.get("project_id")
+        scope = "project" if project_id else "session"
+        target = str(project_id or event.get("session_id") or "session")
+        tool_name = str(message.get("name") or message.get("tool_name") or "tool")[:80]
+        out: list[DistilledMemoryCandidate] = []
+
+        for path in _unique(self._FILE_RE.findall(raw_text))[: self.max_items]:
+            quote = _evidence(path, raw_text)
+            if quote and _near_any(raw_text, path, ("changed", "modified", "edited", "write", "updated", "created", "patched")):
+                out.append(DistilledMemoryCandidate(
+                    type="entity_note",
+                    subject=target,
+                    predicate="file_changed",
+                    object=path,
+                    text=f"File changed: {path}.",
+                    scope=scope,
+                    confidence=0.78,
+                    source_quote=quote,
+                    salience=0.86,
+                    metadata={"distiller": self.name, "tool": tool_name, "field": "file_changed"},
+                ))
+
+        for command in _unique(match.strip() for match in self._COMMAND_RE.findall(raw_text))[: self.max_items]:
+            quote = _evidence(command, raw_text)
+            if quote:
+                status = _command_status(raw_text, command)
+                text = f"Command {status}: {command}." if status else f"Command run: {command}."
+                out.append(DistilledMemoryCandidate(
+                    type="entity_note",
+                    subject=target,
+                    predicate="command_result" if status else "command_run",
+                    object=f"{status}: {command}" if status else command,
+                    text=text,
+                    scope=scope,
+                    confidence=0.78 if status else 0.72,
+                    source_quote=quote,
+                    salience=0.88 if status else 0.72,
+                    metadata={"distiller": self.name, "tool": tool_name, "field": "command"},
+                ))
+
+        for result in _unique(match.strip() for match in self._TEST_RE.findall(raw_text))[: self.max_items]:
+            quote = _evidence(result, raw_text)
+            if quote:
+                out.append(DistilledMemoryCandidate(
+                    type="fact",
+                    subject=target,
+                    predicate="validation",
+                    object=_clean(result),
+                    text=f"Validation result: {_clean(result)}.",
+                    scope=scope,
+                    confidence=0.82,
+                    source_quote=quote,
+                    salience=0.9,
+                    metadata={"distiller": self.name, "tool": tool_name, "field": "test_result"},
+                ))
+
+        for error in _unique(match.strip() for match in self._ERROR_RE.findall(raw_text))[:3]:
+            quote = _evidence(error, raw_text)
+            if quote:
+                out.append(DistilledMemoryCandidate(
+                    type="fact",
+                    subject=target,
+                    predicate="error_signature",
+                    object=_clean(error),
+                    text=f"Error observed: {_clean(error)}.",
+                    scope=scope,
+                    confidence=0.76,
+                    source_quote=quote,
+                    salience=0.82,
+                    metadata={"distiller": self.name, "tool": tool_name, "field": "error"},
+                ))
+        return out[: self.max_items]
+
+
 class GenericJsonToolDistiller:
     """High-precision generic JSON distiller for tool/MCP payloads.
 
@@ -43,8 +142,12 @@ class GenericJsonToolDistiller:
 
     name = "generic_json_v1"
 
-    _LIST_KEYS = ("results", "items", "products", "offers", "options", "incidents", "files", "data", "matches")
-    _NAME_KEYS = ("name", "title", "product", "model", "label", "sku")
+    _LIST_KEYS = (
+        "results", "items", "products", "offers", "options", "incidents", "files",
+        "jobs", "findings", "slots", "quotes", "opportunities", "candidates",
+        "providers", "appointments", "vendors", "data", "matches",
+    )
+    _NAME_KEYS = ("name", "title", "product", "model", "label", "sku", "vendor", "account")
     _PRICE_KEYS = ("price", "current_price", "amount", "value")
     _URL_KEYS = ("url", "link", "source_url", "product_url")
     _AVAILABILITY_KEYS = ("availability", "stock", "in_stock", "status")
@@ -53,7 +156,8 @@ class GenericJsonToolDistiller:
     _REASON_KEYS = ("reason", "rejection_reason", "rejected_reason")
     _PROPERTY_KEYS = (
         "severity", "root_cause", "mitigation", "status", "service",
-        "started_at", "changed", "reason",
+        "started_at", "changed", "reason", "date", "time", "amount",
+        "stage", "score", "skills", "license", "close_date",
     )
 
     def __init__(self, max_records: int = 8, max_specs_per_record: int = 8):
@@ -200,7 +304,8 @@ class GenericJsonToolDistiller:
                     ))
 
             for prop_key in self._PROPERTY_KEYS:
-                if prop_key in record and prop_key not in (*self._NAME_KEYS, *self._PRICE_KEYS):
+                skipped_property_keys = (*self._NAME_KEYS, "price", "current_price", "value")
+                if prop_key in record and prop_key not in skipped_property_keys:
                     prop_value = record.get(prop_key)
                     if isinstance(prop_value, (dict, list)) or prop_value is None:
                         continue
@@ -304,6 +409,38 @@ def _spec_salience(key: str, value: Any) -> float:
 
 def _looks_like_tool_message(message: dict[str, Any]) -> bool:
     return bool(message.get("tool_call_id") or message.get("name") or message.get("tool_name"))
+
+
+def _unique(values) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def _near_any(text: str, needle: str, words: tuple[str, ...], window: int = 120) -> bool:
+    lower = text.lower()
+    idx = lower.find(needle.lower())
+    if idx < 0:
+        return False
+    snippet = lower[max(0, idx - window): idx + len(needle) + window]
+    return any(word in snippet for word in words)
+
+
+def _command_status(text: str, command: str) -> str | None:
+    lower = text.lower()
+    idx = lower.find(command.lower())
+    snippet = lower[idx: idx + 1000] if idx >= 0 else lower[:1000]
+    if any(marker in snippet for marker in ("all checks passed", " passed", "exit code 0", "success")):
+        return "passed"
+    if any(marker in snippet for marker in (" failed", "error", "exit code 1", "traceback", "assertionerror")):
+        return "failed"
+    return None
 
 
 def _parse_json(content: Any) -> Any | None:

@@ -89,6 +89,75 @@ def test_context_reducer_compacts_cold_messages_and_keeps_hot_tail(tmp_path: Pat
     assert any(row["object"] == "concise comparison tables" for row in rows)
 
 
+def test_context_reducer_splits_single_oversized_latest_episode(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.db")
+    engine = MemoryEngine(store=store)
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Goal: keep latest tool result but compact old tool chain."},
+    ]
+    for idx in range(12):
+        messages.append({"role": "assistant", "content": _long_message(f"Tool call {idx}", repeat=20)})
+        messages.append({"role": "tool", "content": _long_message(f"Tool result {idx}", repeat=20)})
+
+    reducer = ContextReducer(ContextBudget(
+        mode="compact",
+        compact_threshold_tokens=200,
+        hot_tail_tokens=180,
+        session_context_tokens=600,
+        max_context_items=20,
+    ), store=store, engine=engine)
+
+    result = reducer.reduce(
+        request_id="req-huge-episode",
+        model_alias="test",
+        model_repo="repo/test",
+        messages=messages,
+        memory_context={"project_id": "huge-episode", "session_id": "s1", "metadata": {}},
+    )
+
+    assert result.compacted is True
+    assert result.cold_messages > 0
+    assert result.reduced_tokens < result.original_tokens
+    assert len(result.messages) < len(messages)
+    assert "Tool result 11" in result.messages[-1]["content"]
+
+
+def test_context_reducer_keeps_tail_of_previous_oversized_episode_before_new_question(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.db")
+    engine = MemoryEngine(store=store)
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Goal: preserve recent work tail."},
+    ]
+    for idx in range(10):
+        messages.append({"role": "assistant", "content": _long_message(f"Long tool result {idx}", repeat=18)})
+    messages.append({"role": "user", "content": "Please summarize current state."})
+
+    reducer = ContextReducer(ContextBudget(
+        mode="compact",
+        compact_threshold_tokens=200,
+        hot_tail_tokens=260,
+        session_context_tokens=500,
+        max_context_items=20,
+    ), store=store, engine=engine)
+
+    result = reducer.reduce(
+        request_id="req-prev-huge",
+        model_alias="test",
+        model_repo="repo/test",
+        messages=messages,
+        memory_context={"project_id": "prev-huge", "session_id": "s1", "metadata": {}},
+    )
+
+    rendered = "\n".join(str(message.get("content", "")) for message in result.messages)
+    assert result.compacted is True
+    assert "Please summarize current state" in rendered
+    assert "Long tool result 9" in rendered
+    assert "Long tool result 0" not in rendered
+    assert result.reduced_tokens < result.original_tokens
+
+
 def test_context_reducer_does_nothing_when_below_threshold(tmp_path: Path):
     messages = [
         {"role": "system", "content": "You are helpful."},

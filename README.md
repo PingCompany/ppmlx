@@ -119,6 +119,9 @@ print(response.choices[0].message.content)
 | `ppmlx memory status/search/list/handoff/compact-stats` | Inspect the experimental local temporal memory graph | `--json`, `--status`, `--scope`, `--session` |
 | `ppmlx memory-eval` | Run the anti-garbage memory eval suite | `--json`, `--dataset`, `--predictions` |
 | `ppmlx compact-eval` | Run long-session rolling-context compaction evals | `--json`, `--output` |
+| `ppmlx answer-quality-eval` | Score compact-answer quality across recall, wrong facts, actionability, grounding, and A/B equivalence | `--json`, `--dataset`, `--template` |
+| `ppmlx answer-quality-replay` | Run real Pi/Claude session quality eval through a live local ppmlx server | `--model`, `--source`, `--base-url` |
+| `ppmlx quality-bench` | Split a real long session into 80% prefix / 20% holdout probes and compare local answers to recorded answers | `--split`, `--max-probes`, `--model` |
 | `ppmlx trace export` / `ppmlx compact-replay` | Export and replay local traces through compact mode | `--project`, `--session`, `--expect` |
 | `ppmlx config` | View/set configuration | `--hf-token` |
 
@@ -185,7 +188,18 @@ ppmlx trace export --project tv-shopping --session tv-session-001 --output trace
 ppmlx compact-replay trace.json --expect "budget = 5000 PLN"
 ppmlx memory-eval
 ppmlx compact-eval
+ppmlx answer-quality-eval
+ppmlx answer-quality-replay ~/.pi/agent/sessions/.../session.jsonl \
+  --model mlx-community/Qwopus3.5-4B-v3-4bit \
+  --base-url http://127.0.0.1:6767/v1
+ppmlx quality-bench ~/.pi/agent/sessions/.../session.jsonl \
+  --split 0.8 --max-probes 5 \
+  --model mlx-community/Qwopus3.5-4B-v3-4bit
 ```
+
+`answer-quality-replay` requires a running local ppmlx server. It generates a compact answer and a local reference answer, selects question-relevant required facts, filters embedded examples/fixtures, and reports recall, wrong facts, actionability, grounding, and A/B equivalence.
+
+`quality-bench` is the stronger quality benchmark: it splits a real transcript by episodes into prefix and held-out suffix, feeds only the compacted prefix plus held-out user turn to the local model, and scores the response against the recorded next assistant answer.
 
 `trace export` is local-only and may include prompts, responses, and tool outputs. Keep exported traces private unless you intentionally want to share them.
 

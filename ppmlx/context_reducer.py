@@ -8,6 +8,7 @@ to be sent wholesale to local models.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from hashlib import sha1
 from typing import Any
@@ -191,9 +192,24 @@ class ContextReducer:
         episodes = group_messages_into_episodes(non_system)
         selected_reversed: list[Episode] = []
         total = 0
-        # Always keep the latest complete episode, even if it exceeds budget.
         for idx, episode in enumerate(reversed(episodes)):
+            if idx == 0 and episode.tokens > self.budget.hot_tail_tokens:
+                # Real agent traces can contain a single huge user→assistant→tool
+                # episode with dozens of tool calls. Keeping it whole defeats
+                # compaction, so split only the oversized newest episode by
+                # message tail while preserving the most recent local chain.
+                hot, cold = _split_oversized_episode_tail(episode.messages, self.budget.hot_tail_tokens)
+                cold_episodes = episodes[: len(episodes) - 1]
+                cold_messages = [*_flatten_messages(cold_episodes), *cold]
+                return hot, cold_messages
             if idx > 0 and total + episode.tokens > self.budget.hot_tail_tokens:
+                remaining_budget = max(0, self.budget.hot_tail_tokens - total)
+                if episode.tokens > self.budget.hot_tail_tokens * 2 and remaining_budget >= 120:
+                    split_hot, split_cold = _split_oversized_episode_tail(episode.messages, remaining_budget)
+                    cold_episodes = episodes[: len(episodes) - idx - 1]
+                    hot_messages = [*split_hot, *_flatten_messages(list(reversed(selected_reversed)))]
+                    cold_messages = [*_flatten_messages(cold_episodes), *split_cold]
+                    return hot_messages, cold_messages
                 break
             selected_reversed.append(episode)
             total += episode.tokens
@@ -240,6 +256,7 @@ class ContextReducer:
     def _retrieve_context_items(self, hot_tail: list[dict[str, Any]], memory_context: dict) -> list[dict[str, Any]]:
         store = self.store or get_memory_store()
         query = build_retrieval_query(hot_tail)
+        intent_query = build_current_intent_query(hot_tail)
         scoped = dict(
             app_id=memory_context.get("app_id"),
             project_id=memory_context.get("project_id"),
@@ -248,12 +265,16 @@ class ContextReducer:
         rows: list[dict[str, Any]] = []
         if query:
             rows.extend(store.search(query, status="active", limit=self.budget.max_context_items, **scoped))
+            rows = _filter_relevant_context_rows(rows, intent_query)
         if len(rows) < self.budget.max_context_items:
-            rows.extend(store.query_candidates(
+            fallback = store.query_candidates(
                 status="active",
                 limit=self.budget.max_context_items,
                 **scoped,
-            ))
+            )
+            if query:
+                fallback = _filter_relevant_context_rows(fallback, intent_query)
+            rows.extend(fallback)
         return _dedupe_rows(rows)[: self.budget.max_context_items]
 
 
@@ -342,6 +363,13 @@ def render_session_context(items: list[dict[str, Any]], *, max_tokens: int) -> s
     return "\n".join(lines) if len(lines) > 4 else ""
 
 
+def build_current_intent_query(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") in {"user", "developer", "system"}:
+            return _content_to_text(message.get("content", ""))[:1200]
+    return ""
+
+
 def build_retrieval_query(messages: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for message in reversed(messages[-8:]):
@@ -410,6 +438,67 @@ def _flatten_messages(episodes: list[Episode]) -> list[dict[str, Any]]:
     for episode in episodes:
         out.extend(episode.messages)
     return out
+
+
+def _split_oversized_episode_tail(messages: list[dict[str, Any]], token_budget: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not messages:
+        return [], []
+    selected_reversed: list[dict[str, Any]] = []
+    total = 0
+    for message in reversed(messages):
+        tokens = estimate_message_tokens(message)
+        if selected_reversed and total + tokens > token_budget:
+            break
+        selected_reversed.append(message)
+        total += tokens
+    hot = list(reversed(selected_reversed))
+    cold = messages[: len(messages) - len(hot)]
+    return hot, cold
+
+
+def _filter_relevant_context_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    query_terms = set(_relevance_terms(query))
+    if not query_terms or not _should_filter_fallback(query_terms):
+        return rows
+    relevant: list[dict[str, Any]] = []
+    for row in rows:
+        haystack = " ".join(str(row.get(key) or "") for key in ("text", "subject", "predicate", "object", "type"))
+        row_terms = set(_relevance_terms(haystack))
+        overlap = query_terms & row_terms
+        if overlap or _is_high_signal_context_row(row, query_terms):
+            relevant.append(row)
+    return relevant
+
+
+def _should_filter_fallback(query_terms: set[str]) -> bool:
+    # Keep normal product/planning eval recall broad. Use stricter fallback only
+    # when the user asks about a specific project/runtime identity, which is
+    # where embedded fixture facts most often pollute real session handoffs.
+    return bool(query_terms & {"ppmlx", "mempalace", "devryn"})
+
+
+def _is_high_signal_context_row(row: dict[str, Any], query_terms: set[str]) -> bool:
+    if not query_terms:
+        return True
+    row_type = str(row.get("type") or "").lower()
+    if row_type not in {"decision", "todo", "constraint", "fact", "preference"}:
+        return False
+    # Keep high-signal project state only when it shares at least one non-generic
+    # topical term with the query. This prevents unrelated embedded fixtures from
+    # filling handoff context during real-session quality checks.
+    haystack = " ".join(str(row.get(key) or "") for key in ("text", "subject", "object"))
+    row_terms = set(_relevance_terms(haystack))
+    return bool(query_terms & row_terms)
+
+
+def _relevance_terms(text: str) -> list[str]:
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "into", "current",
+        "session", "context", "handoff", "answer", "brief", "concise", "factual",
+        "state", "status", "important", "decision", "decisions", "next", "action",
+        "task", "user", "assistant", "goal", "goals", "todo", "validation",
+    }
+    return [term for term in re.findall(r"[a-z0-9_]+", text.lower()) if len(term) >= 3 and term not in stop]
 
 
 def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

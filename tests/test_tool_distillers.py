@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from ppmlx.tool_distillers import GenericJsonToolDistiller
+from ppmlx.tool_distillers import CodingToolDistiller, GenericJsonToolDistiller
 
 
 def test_generic_json_distiller_extracts_product_atoms():
@@ -80,6 +80,28 @@ def test_generic_json_distiller_fails_closed_on_large_low_salience_result_sets()
     texts = "\n".join(candidate.text for candidate in candidates)
     assert "LG OLED C4" in texts
     assert "Generic LED" not in texts
+
+
+def test_coding_tool_distiller_extracts_files_commands_tests_and_errors():
+    content = """
+    Modified ppmlx/context_reducer.py and tests/test_context_reducer.py.
+    $ uv run pytest tests/test_context_reducer.py -q
+    12 passed in 0.42s
+    AssertionError: expected hot tail to include latest tool result
+    """
+
+    candidates = CodingToolDistiller().distill(
+        {"role": "tool", "name": "bash", "content": content},
+        {"project_id": "ppmlx"},
+    )
+
+    texts = "\n".join(candidate.text for candidate in candidates)
+    assert "File changed: ppmlx/context_reducer.py." in texts
+    assert "File changed: tests/test_context_reducer.py." in texts
+    assert "Command passed: uv run pytest tests/test_context_reducer.py -q." in texts
+    assert "Validation result: 12 passed." in texts
+    assert "Error observed: AssertionError: expected hot tail to include latest tool result." in texts
+    assert all(candidate.source_quote for candidate in candidates)
 
 
 def test_generic_json_distiller_ignores_non_tool_json_messages():
