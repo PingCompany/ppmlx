@@ -51,7 +51,8 @@ def pick_model(
         fragments.append(("class:value", state["search"]))
         fragments.append(("class:value", "\u2588"))
         if not local_only:
-            fragments.append(("class:dim", f"  Registry {registry_status}"))
+            total = sum(1 for r in all_rows if r.section_header is None)
+            fragments.append(("class:dim", f"  Registry {registry_status}; {total} total"))
         fragments.append(("", "\n"))
         return fragments
 

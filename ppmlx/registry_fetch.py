@@ -72,16 +72,16 @@ def cache_status_text() -> str:
     """Return a compact human-readable summary of the dynamic registry cache."""
     data = _load_cache()
     if not data:
-        return "last refresh: never"
+        return "dynamic refresh: never"
     fetched_at = data.get("fetched_at")
     if not fetched_at:
-        return "last refresh: unknown"
+        return "dynamic refresh: unknown"
     try:
         dt = datetime.fromtimestamp(float(fetched_at)).astimezone()
         count = len(data.get("models", {}))
-        return f"last refresh: {dt.strftime('%Y-%m-%d %H:%M')} ({count} models)"
+        return f"dynamic refresh: {dt.strftime('%Y-%m-%d %H:%M')} ({count} fetched)"
     except Exception:
-        return "last refresh: unknown"
+        return "dynamic refresh: unknown"
 
 
 def _save_cache(data: dict[str, Any]) -> None:
