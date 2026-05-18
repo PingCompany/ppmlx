@@ -23,7 +23,7 @@ def test_answer_quality_builtin_cases_pass():
     report = AnswerQualityEvaluator().evaluate(builtin_cases())
 
     assert report.passed is True
-    assert report.cases == 2
+    assert report.cases == 3
     assert report.avg_recall == 1.0
     assert report.total_wrong_facts == 0
     assert report.avg_actionability >= 3
@@ -61,12 +61,48 @@ def test_fact_matching_requires_exact_identifiers():
     assert missed == ["changed file app_3.py"]
 
 
+def test_answer_quality_detects_real_session_style_missed_context():
+    case = AnswerQualityCase(
+        case_id="real-style-missed-context",
+        question="Give the current ppmlx memory benchmark handoff and next action.",
+        source_context=(
+            "Goal: improve ppmlx synthetic memory evals so they reflect real-session quality. "
+            "Decision: real-session quality-bench failures should drive synthetic benchmark design. "
+            "Todo: rerun answerable real-session batch with include-content. "
+            "Todo: add context coverage metrics to compact-eval."
+        ),
+        compact_answer="The benchmark work is ongoing. Next, continue improving evals.",
+        full_context_answer=(
+            "Improve ppmlx synthetic memory evals for real-session quality. Real-session quality-bench failures "
+            "should drive benchmark design. Next rerun the answerable real-session batch with include-content and "
+            "add context coverage metrics to compact-eval."
+        ),
+        required_facts=[
+            "improve ppmlx synthetic memory evals",
+            "real-session quality-bench failures should drive synthetic benchmark design",
+            "rerun answerable real-session batch with include-content",
+            "add context coverage metrics to compact-eval",
+        ],
+        expected_actions=[
+            "rerun answerable real-session batch with include-content",
+            "add context coverage metrics to compact-eval",
+        ],
+    )
+
+    result = AnswerQualityEvaluator().evaluate_case(case)
+
+    assert result.passed is False
+    assert result.recall < 0.5
+    assert result.required_missed
+    assert result.equivalence_to_full < 0.75
+
+
 def test_answer_quality_template_roundtrip(tmp_path):
     path = save_case_template(tmp_path / "answer-quality.json")
 
     cases = load_cases(path)
 
-    assert len(cases) == 2
+    assert len(cases) == 3
     assert cases[0].required_facts
 
 
@@ -76,7 +112,7 @@ def test_answer_quality_cli_json():
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["passed"] is True
-    assert data["summary"]["cases"] == 2
+    assert data["summary"]["cases"] == 3
 
 
 def test_select_required_facts_filters_unrelated_fixture_facts():

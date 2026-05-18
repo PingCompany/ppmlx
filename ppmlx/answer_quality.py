@@ -256,6 +256,46 @@ def builtin_cases() -> list[AnswerQualityCase]:
             forbidden_facts=["database outage is root cause", "severity = P3"],
             expected_actions=["add Redis pool saturation alert"],
         ),
+        AnswerQualityCase(
+            case_id="ppmlx_bench_handoff_good",
+            question="Give the current ppmlx memory benchmark handoff and next action.",
+            source_context=(
+                "Goal: improve ppmlx synthetic memory evals so they reflect real-session quality. "
+                "Need exact benchmark identifiers in reports. "
+                "Decision: real-session quality-bench failures should drive synthetic benchmark design. "
+                "Rejected synthetic-only PASS as sufficient because real sessions showed low recall. "
+                "Todo: rerun answerable real-session batch with include-content. "
+                "Todo: add context coverage metrics to compact-eval."
+            ),
+            compact_answer=(
+                "Current ppmlx goal: improve synthetic memory evals so they reflect real-session quality. "
+                "Reports must keep exact benchmark identifiers. The key decision is that real-session quality-bench "
+                "failures should drive synthetic benchmark design; synthetic-only PASS was rejected because real sessions "
+                "showed low recall. Next: rerun the answerable real-session batch with include-content and add context "
+                "coverage metrics to compact-eval."
+            ),
+            full_context_answer=(
+                "Improve ppmlx synthetic memory evals to mirror real-session quality. Keep exact benchmark IDs in reports. "
+                "Use real-session quality-bench failures to design synthetic cases, because synthetic-only PASS was rejected "
+                "after low real-session recall. Next rerun answerable real-session batch with include-content and add compact-eval "
+                "context coverage metrics."
+            ),
+            required_facts=[
+                "improve ppmlx synthetic memory evals",
+                "real-session quality",
+                "exact benchmark identifiers",
+                "real-session quality-bench failures should drive synthetic benchmark design",
+                "synthetic-only PASS was rejected",
+                "real sessions showed low recall",
+                "rerun answerable real-session batch with include-content",
+                "add context coverage metrics to compact-eval",
+            ],
+            forbidden_facts=["synthetic-only PASS is sufficient", "real-session failures can be ignored"],
+            expected_actions=[
+                "rerun answerable real-session batch with include-content",
+                "add context coverage metrics to compact-eval",
+            ],
+        ),
     ]
 
 

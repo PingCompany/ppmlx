@@ -2796,7 +2796,9 @@ def compact_eval_cmd(
     table.add_row("Passed cases", str(summary["passed_cases"]))
     table.add_row("Avg compression", f"{summary['avg_compression_ratio']:.2f}x")
     table.add_row("Avg continuity", f"{summary['avg_continuity_score'] * 100:.1f}%")
+    table.add_row("Avg context coverage", f"{summary.get('avg_session_context_coverage', 0.0) * 100:.1f}%")
     table.add_row("Missed terms", str(summary["missed_terms"]))
+    table.add_row("Context missed terms", str(summary.get("context_missed_terms", 0)))
     table.add_row("Wrong terms", str(summary["wrong_terms"]))
     table.add_row("Max reduced tokens", str(summary["max_reduced_tokens"]))
     console.print(table)
@@ -2808,8 +2810,12 @@ def compact_eval_cmd(
             f"{case.original_tokens} -> {case.reduced_tokens} tokens "
             f"({case.compression_ratio:.2f}x), continuity={case.continuity_score * 100:.1f}%"
         )
-        if case.missed_terms or case.wrong_terms:
-            console.print(f"[red]Missed:[/red] {case.missed_terms} [red]Wrong:[/red] {case.wrong_terms}")
+        if case.missed_terms or case.session_context_missed_terms or case.wrong_terms:
+            console.print(
+                f"[red]Missed:[/red] {case.missed_terms} "
+                f"[red]Context missed:[/red] {case.session_context_missed_terms} "
+                f"[red]Wrong:[/red] {case.wrong_terms}"
+            )
 
     if not report.passed and fail_on_threshold:
         raise typer.Exit(1)
@@ -2855,9 +2861,9 @@ def memory_eval_cmd(
 
     table.add_row("Cases", str(summary["cases"]), "-")
     table.add_row("Candidates", str(summary["candidates"]), "-")
-    table.add_row("Status accuracy", f"{summary['status_accuracy'] * 100:.1f}%", "-")
-    table.add_row("Active recall", f"{summary['active_recall'] * 100:.1f}%", "-")
-    table.add_row("Retrieval recall", f"{summary['retrieval_recall'] * 100:.1f}%", "-")
+    table.add_row("Status accuracy", f"{summary['status_accuracy'] * 100:.1f}%", f">= {report.thresholds.min_status_accuracy * 100:.1f}%")
+    table.add_row("Active recall", f"{summary['active_recall'] * 100:.1f}%", f">= {report.thresholds.min_active_recall * 100:.1f}%")
+    table.add_row("Retrieval recall", f"{summary['retrieval_recall'] * 100:.1f}%", f">= {report.thresholds.min_retrieval_recall * 100:.1f}%")
     table.add_row("False active rate", f"{summary['false_active_rate'] * 100:.2f}%", f"<= {report.thresholds.max_false_active_rate * 100:.2f}%")
     table.add_row("Secret leaks", str(summary["secret_leak_count"]), "0")
     table.add_row("Scope leakage rate", f"{summary['scope_leakage_rate'] * 100:.2f}%", f"<= {report.thresholds.max_scope_leakage_rate * 100:.2f}%")

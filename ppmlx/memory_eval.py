@@ -274,6 +274,9 @@ class CaseRun:
 
 @dataclass
 class MemoryEvalThresholds:
+    min_status_accuracy: float = 0.99
+    min_active_recall: float = 0.99
+    min_retrieval_recall: float = 0.99
     max_false_active_rate: float = 0.02
     max_secret_leak_rate: float = 0.0
     max_scope_leakage_rate: float = 0.01
@@ -286,6 +289,9 @@ class MemoryEvalThresholds:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "min_status_accuracy": self.min_status_accuracy,
+            "min_active_recall": self.min_active_recall,
+            "min_retrieval_recall": self.min_retrieval_recall,
             "max_false_active_rate": self.max_false_active_rate,
             "max_secret_leak_rate": self.max_secret_leak_rate,
             "max_scope_leakage_rate": self.max_scope_leakage_rate,
@@ -952,7 +958,10 @@ def save_report(report: MemoryEvalReport, path: Path | str) -> Path:
 def _passes_thresholds(summary: dict[str, Any], thresholds: MemoryEvalThresholds) -> bool:
     latency = summary["latency_ms"]
     return (
-        summary["false_active_rate"] <= thresholds.max_false_active_rate
+        summary["status_accuracy"] >= thresholds.min_status_accuracy
+        and summary["active_recall"] >= thresholds.min_active_recall
+        and summary["retrieval_recall"] >= thresholds.min_retrieval_recall
+        and summary["false_active_rate"] <= thresholds.max_false_active_rate
         and summary["secret_leak_rate"] <= thresholds.max_secret_leak_rate
         and summary["scope_leakage_rate"] <= thresholds.max_scope_leakage_rate
         and summary["bad_injection_rate"] <= thresholds.max_bad_injection_rate

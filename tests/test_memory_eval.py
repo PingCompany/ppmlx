@@ -21,6 +21,9 @@ def test_builtin_memory_eval_passes_reference_gate():
     report = MemoryEvalRunner().run()
 
     assert report.passed is True
+    assert report.summary["status_accuracy"] == 1.0
+    assert report.summary["active_recall"] == 1.0
+    assert report.summary["retrieval_recall"] == 1.0
     assert report.summary["false_active_count"] == 0
     assert report.summary["secret_leak_count"] == 0
     assert report.summary["scope_leakage_count"] == 0
@@ -50,6 +53,23 @@ def test_omitted_bad_candidate_counts_as_rejected():
     assert report.passed is True
     assert report.summary["secret_leak_count"] == 0
     assert report.summary["false_active_count"] == 0
+
+
+def test_missing_active_prediction_fails_suite():
+    cases = load_builtin_cases()
+    missing_active_run = CaseRun(
+        case_id="global_preference_valid",
+        validated=[],
+        retrieved_ids=[],
+        timings_ms={"validation": 1.0, "retrieval": 1.0, "total": 2.0},
+    )
+
+    report = MemoryEvalRunner().run(cases=cases, case_runs={"global_preference_valid": missing_active_run})
+
+    assert report.passed is False
+    assert report.summary["active_recall"] < 1.0
+    assert report.summary["retrieval_recall"] < 1.0
+    assert "c-pref-short" in report.summary["ids"]["retrieval_misses"]
 
 
 def test_secret_active_prediction_fails_suite():
@@ -97,6 +117,8 @@ def test_save_report_writes_json(tmp_path):
     assert data["summary"]["cases"] >= 1
     assert data["summary"]["graph_quality"]["passed"] is True
     assert "thresholds" in data
+    assert "min_active_recall" in data["thresholds"]
+    assert "min_retrieval_recall" in data["thresholds"]
     assert "max_graph_quality_failures" in data["thresholds"]
 
 

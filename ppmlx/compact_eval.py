@@ -26,9 +26,11 @@ class CompactEvalCase:
     messages: list[dict[str, Any]]
     expected_terms: list[str]
     forbidden_terms: list[str] = field(default_factory=list)
+    expected_session_context_terms: list[str] = field(default_factory=list)
     max_reduced_tokens: int = 10_000
     min_compression_ratio: float = 5.0
     min_continuity_score: float = 0.9
+    min_session_context_coverage: float = 0.85
 
 
 @dataclass
@@ -46,6 +48,9 @@ class CompactCaseResult:
     forbidden_terms: list[str]
     wrong_terms: list[str]
     continuity_score: float
+    session_context_coverage: float
+    session_context_found_terms: list[str]
+    session_context_missed_terms: list[str]
     session_context: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,6 +68,9 @@ class CompactCaseResult:
             "forbidden_terms": self.forbidden_terms,
             "wrong_terms": self.wrong_terms,
             "continuity_score": self.continuity_score,
+            "session_context_coverage": self.session_context_coverage,
+            "session_context_found_terms": self.session_context_found_terms,
+            "session_context_missed_terms": self.session_context_missed_terms,
             "session_context": self.session_context,
         }
 
@@ -109,7 +117,11 @@ class CompactEvalRunner:
                 sum(result.continuity_score for result in results) / max(len(results), 1), 4
             ),
             "missed_terms": sum(len(result.missed_terms) for result in results),
+            "context_missed_terms": sum(len(result.session_context_missed_terms) for result in results),
             "wrong_terms": sum(len(result.wrong_terms) for result in results),
+            "avg_session_context_coverage": round(
+                sum(result.session_context_coverage for result in results) / max(len(results), 1), 4
+            ),
             "max_reduced_tokens": max((result.reduced_tokens for result in results), default=0),
         }
         return CompactEvalReport(
@@ -142,12 +154,18 @@ class CompactEvalRunner:
         found = [term for term in case.expected_terms if _normalize(term) in haystack]
         missed = [term for term in case.expected_terms if term not in found]
         wrong = [term for term in case.forbidden_terms if _normalize(term) in haystack]
+        context_terms = case.expected_session_context_terms or case.expected_terms
+        normalized_session_context = _normalize(session_context)
+        context_found = [term for term in context_terms if _normalize(term) in normalized_session_context]
+        context_missed = [term for term in context_terms if term not in context_found]
         continuity_score = round(len(found) / max(len(case.expected_terms), 1), 4)
+        session_context_coverage = round(len(context_found) / max(len(context_terms), 1), 4)
         compression_ratio = round(result.original_tokens / max(result.reduced_tokens, 1), 2)
         passed = (
             result.reduced_tokens <= case.max_reduced_tokens
             and compression_ratio >= case.min_compression_ratio
             and continuity_score >= case.min_continuity_score
+            and session_context_coverage >= case.min_session_context_coverage
             and not wrong
         )
         return CompactCaseResult(
@@ -164,12 +182,15 @@ class CompactEvalRunner:
             forbidden_terms=case.forbidden_terms,
             wrong_terms=wrong,
             continuity_score=continuity_score,
+            session_context_coverage=session_context_coverage,
+            session_context_found_terms=context_found,
+            session_context_missed_terms=context_missed,
             session_context=session_context,
         )
 
 
 def builtin_cases() -> list[CompactEvalCase]:
-    return [tv_buying_case(), tv_buying_json_tool_trace_case()]
+    return [tv_buying_case(), tv_buying_json_tool_trace_case(), real_project_handoff_case()]
 
 
 def tv_buying_case() -> CompactEvalCase:
@@ -272,6 +293,80 @@ def tv_buying_json_tool_trace_case() -> CompactEvalCase:
     )
 
 
+def real_project_handoff_case() -> CompactEvalCase:
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "You are a coding assistant. Preserve project state across long sessions."},
+        {
+            "role": "user",
+            "content": (
+                "Goal: improve ppmlx synthetic memory evals so they reflect real-session quality. "
+                "Need exact benchmark identifiers in reports."
+            ),
+        },
+        {"role": "assistant", "content": "I will track the eval work and avoid hiding quality gaps."},
+        {
+            "role": "user",
+            "content": (
+                "Decision: real-session quality-bench failures should drive synthetic benchmark design. "
+                "Rejected synthetic-only PASS as sufficient because real sessions showed low recall."
+            ),
+        },
+        {"role": "assistant", "content": "Recorded the decision and rejection rationale."},
+    ]
+
+    # Real sessions contain lots of unrelated tool output and old tasks. The
+    # eval should prove that project handoff facts survive graph compaction while
+    # unrelated fixture facts do not dominate the rendered context.
+    for batch in range(16):
+        messages.extend([
+            {"role": "user", "content": f"Investigate benchmark batch {batch}."},
+            {
+                "role": "tool",
+                "name": "bash",
+                "content": "\n".join(
+                    f"noise_{batch}_{idx}: unrelated fixture output with travel budget 800 PLN and app_{idx}.py"
+                    for idx in range(45)
+                ),
+            },
+            {"role": "assistant", "content": _project_handoff_note(batch)},
+        ])
+
+    messages.append({"role": "user", "content": "Give the current ppmlx memory benchmark handoff and next action."})
+
+    return CompactEvalCase(
+        id="ppmlx_real_project_handoff",
+        description="Project handoff facts should survive realistic noisy session compaction.",
+        project_id="ppmlx",
+        session_id="ppmlx-bench-session-001",
+        messages=messages,
+        expected_terms=[
+            "Goal: improve ppmlx synthetic memory evals so they reflect real-session quality",
+            "Need exact benchmark identifiers in reports",
+            "Decision: real-session quality-bench failures should drive synthetic benchmark design",
+            "Rejected synthetic-only PASS as sufficient because real sessions showed low recall",
+            "ppmlx todo: rerun answerable real-session batch with include-content",
+            "ppmlx todo: add context coverage metrics to compact-eval",
+        ],
+        expected_session_context_terms=[
+            "Goal: improve ppmlx synthetic memory evals so they reflect real-session quality",
+            "Need exact benchmark identifiers in reports",
+            "Decision: real-session quality-bench failures should drive synthetic benchmark design",
+            "Rejected synthetic-only PASS as sufficient because real sessions showed low recall",
+            "ppmlx todo: rerun answerable real-session batch with include-content",
+            "ppmlx todo: add context coverage metrics to compact-eval",
+        ],
+        forbidden_terms=[
+            "budget = 800 PLN",
+            "travel budget 800 PLN",
+            "synthetic-only PASS is sufficient",
+        ],
+        max_reduced_tokens=10_000,
+        min_compression_ratio=4.0,
+        min_continuity_score=0.85,
+        min_session_context_coverage=0.85,
+    )
+
+
 def save_report(report: CompactEvalReport, path: Path | str) -> Path:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -341,6 +436,22 @@ def _episode_note(batch: int) -> str:
     if batch == 20:
         return "Todo: ask room brightness and viewing distance."
     return "No durable decision from this batch. Continue search."
+
+
+def _project_handoff_note(batch: int) -> str:
+    if batch == 1:
+        return "Goal: improve ppmlx synthetic memory evals so they reflect real-session quality."
+    if batch == 3:
+        return "Remember that ppmlx reports need exact benchmark identifiers."
+    if batch == 5:
+        return "Decision: real-session quality-bench failures should drive synthetic benchmark design."
+    if batch == 7:
+        return "Rejected synthetic-only PASS because real sessions showed low recall."
+    if batch == 10:
+        return "Todo: rerun answerable real-session batch with include-content."
+    if batch == 12:
+        return "Todo: add context coverage metrics to compact-eval."
+    return "No durable ppmlx benchmark decision from this batch."
 
 
 def _extract_session_context(messages: list[dict[str, Any]]) -> str:
