@@ -14,6 +14,45 @@ from ppmlx.memory_engine import MemoryEngine
 from ppmlx.memory_store import MemoryStore
 
 
+def _store_memory(
+    store: MemoryStore,
+    *,
+    candidate_id: str,
+    event_id: str,
+    text: str,
+    project_id: str | None = None,
+    session_id: str | None = None,
+    salience: float = 1.0,
+    confidence: float = 0.8,
+) -> None:
+    store.record_event({
+        "event_id": event_id,
+        "endpoint": "/v1/chat/completions",
+        "project_id": project_id,
+        "session_id": session_id,
+        "request": {"messages": [{"role": "user", "content": text}]},
+        "response_text": "ok",
+        "metadata": {},
+    })
+    store.store_candidate(
+        {
+            "candidate_id": candidate_id,
+            "event_id": event_id,
+            "type": "fact",
+            "subject": project_id or "global",
+            "predicate": "notes",
+            "object": text,
+            "text": text,
+            "scope": "project" if project_id else "global",
+            "confidence": confidence,
+            "salience": salience,
+            "source_quote": text,
+            "metadata": {},
+        },
+        {"status": "active", "reasons": ["test"]},
+    )
+
+
 def _long_message(text: str, repeat: int = 80) -> str:
     return (text + " ") * repeat
 
@@ -249,3 +288,85 @@ def test_context_reducer_respects_project_namespace(tmp_path: Path):
     context = result.messages[0]["content"]
     assert "OLED TV" in context
     assert "projector" not in context
+
+
+def test_general_handoff_hides_noisy_eval_namespaces_by_default(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.db")
+    _store_memory(
+        store,
+        candidate_id="normal-ppmlx-status",
+        event_id="normal-event",
+        project_id="ppmlx",
+        text="ppmlx status: context reducer should keep production handoff concise.",
+        salience=2.0,
+    )
+    _store_memory(
+        store,
+        candidate_id="quality-bench-noise",
+        event_id="quality-event",
+        project_id="quality-bench",
+        text="ppmlx fake eval fixture: answer-quality-real dogfood failure should never leak into normal handoff.",
+        salience=100.0,
+    )
+
+    result = build_handoff_context(query="ppmlx handoff status", max_items=10, max_tokens=500, store=store)
+
+    assert "production handoff concise" in result.context
+    assert "fake eval fixture" not in result.context
+    assert all(item["project_id"] != "quality-bench" for item in result.items)
+
+
+def test_explicit_noisy_project_filter_can_retrieve_eval_memory(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.db")
+    _store_memory(
+        store,
+        candidate_id="quality-bench-explicit",
+        event_id="quality-event",
+        project_id="quality-bench",
+        text="quality-bench result: answer-quality-real dogfood failure is expected fixture data.",
+        salience=100.0,
+    )
+
+    result = build_handoff_context(
+        query="answer-quality-real dogfood failure",
+        project_id="quality-bench",
+        max_items=10,
+        max_tokens=500,
+        store=store,
+    )
+
+    assert "expected fixture data" in result.context
+    assert any(item["project_id"] == "quality-bench" for item in result.items)
+
+
+def test_general_context_reducer_retrieval_hides_noisy_eval_namespaces(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.db")
+    _store_memory(
+        store,
+        candidate_id="normal-reducer-memory",
+        event_id="normal-event",
+        project_id="ppmlx",
+        text="ppmlx reducer fact: active scoped production memory is safe for handoff.",
+        salience=2.0,
+    )
+    _store_memory(
+        store,
+        candidate_id="eval-reducer-noise",
+        event_id="eval-event",
+        project_id="answer-quality-real",
+        text="ppmlx reducer fake eval memory from dogfood test trace should be hidden.",
+        salience=100.0,
+    )
+
+    reducer = ContextReducer(ContextBudget(mode="inject", session_context_tokens=500, max_context_items=10), store=store)
+    result = reducer.reduce(
+        request_id="req-general-retrieval",
+        model_alias="test",
+        model_repo="repo/test",
+        messages=[{"role": "user", "content": "What is the ppmlx reducer handoff status?"}],
+        memory_context={},
+    )
+
+    context = result.messages[0]["content"]
+    assert "production memory is safe" in context
+    assert "fake eval memory" not in context

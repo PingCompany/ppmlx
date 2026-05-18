@@ -275,7 +275,7 @@ class ContextReducer:
             if query:
                 fallback = _filter_relevant_context_rows(fallback, intent_query)
             rows.extend(fallback)
-        return _dedupe_rows(rows)[: self.budget.max_context_items]
+        return _curate_context_rows(rows, query=intent_query or query, scoped=scoped)[: self.budget.max_context_items]
 
 
 def reduce_chat_context(
@@ -322,7 +322,7 @@ def build_handoff_context(
         rows.extend(memory_store.search(query, status="active", limit=max_items, **scoped))
     if len(rows) < max_items:
         rows.extend(memory_store.query_candidates(status="active", limit=max_items, **scoped))
-    items = _dedupe_rows(rows)[:max_items]
+    items = _curate_context_rows(rows, query=query or "", scoped=scoped)[:max_items]
     context = render_session_context(items, max_tokens=max_tokens)
     return HandoffResult(
         context=context,
@@ -499,6 +499,78 @@ def _relevance_terms(text: str) -> list[str]:
         "task", "user", "assistant", "goal", "goals", "todo", "validation",
     }
     return [term for term in re.findall(r"[a-z0-9_]+", text.lower()) if len(term) >= 3 and term not in stop]
+
+
+def _curate_context_rows(rows: list[dict[str, Any]], *, query: str, scoped: dict[str, Any]) -> list[dict[str, Any]]:
+    """Filter unsafe default retrieval and apply deterministic context ranking."""
+    visible_rows = [
+        row for row in _dedupe_rows(rows)
+        if not is_noisy_context_namespace(row) or _has_explicit_matching_namespace(row, scoped)
+    ]
+    return sorted(
+        visible_rows,
+        key=lambda row: _context_row_rank(row, query),
+        reverse=True,
+    )
+
+
+def is_noisy_context_namespace(row: dict[str, Any]) -> bool:
+    """Return True for eval/test/internal namespaces hidden from general recall.
+
+    The reducer may retrieve globally when no app/project/session filter is supplied.
+    In that mode, local quality benches, answer-quality dogfood, eval runs, and
+    test traces are too easy to leak into unrelated compact/handoff context.  Keep
+    detection limited to namespace fields so synthetic eval content in ordinary
+    project fixtures remains retrievable.
+    """
+    namespace = " ".join(str(row.get(key) or "") for key in ("app_id", "project_id", "session_id")).lower()
+    if not namespace:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "-", namespace).strip("-")
+    noisy_phrases = (
+        "quality-bench",
+        "answer-quality-real",
+        "answer-quality-eval",
+        "dogfood",
+        "eval",
+        "test",
+    )
+    parts = set(normalized.split("-"))
+    return any(phrase in normalized for phrase in noisy_phrases[:4]) or bool(parts & {"eval", "test"})
+
+
+def _has_explicit_matching_namespace(row: dict[str, Any], scoped: dict[str, Any]) -> bool:
+    for key in ("app_id", "project_id", "session_id"):
+        requested = scoped.get(key)
+        if requested and str(row.get(key) or "") == str(requested):
+            return True
+    return False
+
+
+def _context_row_rank(row: dict[str, Any], query: str) -> tuple[float, float, str, int, str]:
+    return (
+        _safe_float(row.get("salience")),
+        _safe_float(row.get("confidence")),
+        str(row.get("created_at") or ""),
+        _context_relevance_score(row, query),
+        str(row.get("candidate_id") or ""),
+    )
+
+
+def _context_relevance_score(row: dict[str, Any], query: str) -> int:
+    query_terms = set(_relevance_terms(query))
+    if not query_terms:
+        return 0
+    haystack = " ".join(str(row.get(key) or "") for key in ("text", "subject", "predicate", "object", "type"))
+    row_terms = set(_relevance_terms(haystack))
+    return len(query_terms & row_terms)
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

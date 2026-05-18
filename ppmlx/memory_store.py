@@ -390,6 +390,8 @@ class MemoryStore:
         self.init()
         atom_id = str(atom.get("atom_id") or self._atom_id(atom))
         with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """INSERT OR REPLACE INTO memory_atoms (
                     atom_id, source_event_id, source_job_id, type, subject, predicate, object,
@@ -412,6 +414,8 @@ class MemoryStore:
                     json.dumps(atom.get("metadata", {}), ensure_ascii=False),
                 ),
             )
+            if self._atom_has_supersession_signal(atom):
+                self._close_superseded_atom_slots_conn(conn, atom_id=atom_id, atom=atom)
             conn.commit()
         stored = self.get_atom(atom_id)
         if stored is None:
@@ -454,6 +458,61 @@ class MemoryStore:
                 params,
             ).fetchall()
         return [self._row_to_atom(row) for row in rows]
+
+    def _close_superseded_atom_slots_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        atom_id: str,
+        atom: dict[str, Any],
+    ) -> None:
+        """Close older conflicting active atoms in the same semantic slot.
+
+        Supersession is intentionally opt-in: callers must include an explicit
+        correction signal before same-slot atoms with a different object are
+        closed. Slot matching uses a canonicalized subject so punctuation/case
+        changes do not prevent correction, while preserving exact storage.
+        """
+        scope = str(atom.get("scope") or "global")
+        rows = conn.execute(
+            """SELECT atom_id, subject, object FROM memory_atoms
+               WHERE type = ? AND predicate = ? AND scope = ?
+                 AND atom_id != ? AND invalid_at IS NULL
+                 AND (expired_at IS NULL OR expired_at > strftime('%Y-%m-%dT%H:%M:%f', 'now'))""",
+            (atom["type"], atom["predicate"], scope, atom_id),
+        ).fetchall()
+        if not rows:
+            return
+
+        canonical_subject = _canonical_atom_subject(atom["subject"])
+        object_norm = _norm(str(atom["object"]))
+        superseded_ids = [
+            row["atom_id"]
+            for row in rows
+            if _canonical_atom_subject(row["subject"]) == canonical_subject and _norm(str(row["object"])) != object_norm
+        ]
+        if not superseded_ids:
+            return
+
+        cutoff = atom.get("valid_at")
+        if cutoff is None:
+            cutoff = conn.execute("SELECT strftime('%Y-%m-%dT%H:%M:%f', 'now')").fetchone()[0]
+        conn.executemany(
+            """UPDATE memory_atoms
+               SET invalid_at = COALESCE(invalid_at, ?), expired_at = COALESCE(expired_at, ?)
+               WHERE atom_id = ?""",
+            [(cutoff, cutoff, superseded_id) for superseded_id in superseded_ids],
+        )
+
+    @staticmethod
+    def _atom_has_supersession_signal(atom: dict[str, Any]) -> bool:
+        metadata = atom.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        for container in (atom, metadata):
+            for key in ("supersedes_prior", "from_now_on", "actually", "supersedes", "supersedes_atom_ids"):
+                if _truthy_supersession_value(container.get(key)):
+                    return True
+        return False
 
     def store_alias(self, alias: dict[str, Any]) -> dict[str, Any]:
         return self.store_entity_alias(alias)
@@ -1456,6 +1515,18 @@ def canonicalize_graph_entity(value: str) -> str | None:
 def _clean_entity_label(value: str) -> str:
     cleaned = " ".join(str(value or "").strip().strip("'\"").split())
     return cleaned.strip(" .;:-")
+
+
+def _canonical_atom_subject(value: str) -> str:
+    return canonicalize_entity_name(value) or _norm(value)
+
+
+def _truthy_supersession_value(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "none", "null"}
+    return bool(value)
 
 
 def _looks_like_long_text_entity(value: str) -> bool:

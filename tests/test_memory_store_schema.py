@@ -73,6 +73,79 @@ def test_enqueue_list_claim_complete_and_fail_extraction_jobs(tmp_path):
     assert failed["invalid_at"] is not None
 
 
+def test_atom_same_slot_without_supersession_does_not_invalidate_prior_atom(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+
+    store.store_atom(
+        {
+            "atom_id": "atom-tv-budget-old",
+            "type": "constraint",
+            "subject": "TV Purchase",
+            "predicate": "budget",
+            "object": "5000 PLN",
+            "scope": "project",
+            "valid_at": "2026-01-01T00:00:00.000",
+        }
+    )
+    store.store_atom(
+        {
+            "atom_id": "atom-tv-budget-new",
+            "type": "constraint",
+            "subject": "tv purchase",
+            "predicate": "budget",
+            "object": "6000 PLN",
+            "scope": "project",
+            "valid_at": "2026-01-02T00:00:00.000",
+        }
+    )
+
+    atoms = store.query_atoms(type="constraint", predicate="budget", scope="project", active_only=True)
+    assert {atom["atom_id"] for atom in atoms} == {"atom-tv-budget-old", "atom-tv-budget-new"}
+    assert all(atom["invalid_at"] is None for atom in atoms)
+    assert all(atom["expired_at"] is None for atom in atoms)
+
+
+def test_superseding_atom_closes_prior_conflicting_slot(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    store.init()
+
+    store.store_atom(
+        {
+            "atom_id": "atom-tv-budget-old",
+            "type": "constraint",
+            "subject": "Project TV Purchase",
+            "predicate": "budget",
+            "object": "5000 PLN",
+            "scope": "project",
+            "valid_at": "2026-01-01T00:00:00.000",
+        }
+    )
+    current = store.store_atom(
+        {
+            "atom_id": "atom-tv-budget-new",
+            "type": "constraint",
+            "subject": "tv purchase",
+            "predicate": "budget",
+            "object": "6000 PLN",
+            "scope": "project",
+            "valid_at": "2026-01-02T00:00:00.000",
+            "metadata": {"from_now_on": True},
+        }
+    )
+
+    old = store.get_atom("atom-tv-budget-old")
+    assert old is not None
+    assert old["invalid_at"] == "2026-01-02T00:00:00.000"
+    assert old["expired_at"] == "2026-01-02T00:00:00.000"
+    assert current["invalid_at"] is None
+    assert current["expired_at"] is None
+
+    active_atoms = store.query_atoms(type="constraint", predicate="budget", scope="project", active_only=True)
+    assert [atom["atom_id"] for atom in active_atoms] == ["atom-tv-budget-new"]
+    assert active_atoms[0]["object"] == "6000 PLN"
+
+
 def test_atoms_and_aliases_can_be_stored_and_read(tmp_path):
     store = MemoryStore(tmp_path / "memory.db")
     store.init()
