@@ -75,7 +75,7 @@ def test_staleness_no_cache_file(tmp_path: Path):
 
 def test_cache_status_text_never_without_cache(tmp_path: Path):
     with patch("ppmlx.registry_fetch.get_cache_path", return_value=tmp_path / "nope.json"):
-        assert cache_status_text() == "dynamic refresh: never"
+        assert cache_status_text() == "top downloads refreshed: never"
 
 
 def test_cache_status_text_includes_date_and_count(tmp_path: Path):
@@ -83,8 +83,40 @@ def test_cache_status_text_includes_date_and_count(tmp_path: Path):
     cache.write_text(json.dumps({"fetched_at": 1700000000, "models": {"a": {}, "b": {}}}))
     with patch("ppmlx.registry_fetch.get_cache_path", return_value=cache):
         text = cache_status_text()
-    assert "dynamic refresh: 2023-" in text
+    assert "top downloads refreshed: 2023-" in text
     assert "(2 fetched)" in text
+
+
+def test_fetch_from_hf_uses_top_downloaded_limit():
+    from ppmlx.registry_fetch import _fetch_from_hf
+
+    calls = []
+
+    class FakeApi:
+        def list_models(self, **kwargs):
+            calls.append(kwargs)
+            models = []
+            for i in range(60):
+                m = MagicMock()
+                m.id = f"mlx-community/Test-{i + 1}B-4bit"
+                m.tags = []
+                m.safetensors = {"total": 1024**3}
+                m.downloads = 1000 - i
+                m.created_at = None
+                models.append(m)
+            return models
+
+    with patch("huggingface_hub.HfApi", return_value=FakeApi()):
+        data = _fetch_from_hf()
+
+    assert calls[0]["author"] == "mlx-community"
+    assert calls[0]["sort"] == "downloads"
+    assert calls[0]["limit"] >= 50
+    assert data is not None
+    assert data["source"] == "huggingface-api-downloads"
+    assert len(data["models"]) == 50
+    assert list(data["models"])[0] == "test:1b"
+    assert list(data["models"])[-1] == "test:50b"
 
 
 # ── maybe_refresh ────────────────────────────────────────────────────
@@ -157,35 +189,30 @@ def test_extract_params_b():
     assert _extract_params_b(_make_model("mlx-community/Kimi-K2.5")) is None
 
 
-# ── Registry merge (integration) ─────────────────────────────────────
+# ── Registry load semantics ──────────────────────────────────────────
 
 
-def test_registry_merge_logic():
-    """Test the merge semantics: new aliases added, existing get updated downloads.
+def test_registry_uses_fetched_cache_without_bundled_merge(monkeypatch):
+    import importlib
+    import sys
+    import types
 
-    Tests the merge logic directly to avoid test ordering issues with
-    sys.modules patches in test_cli.py.
-    """
-    bundled_models = {
-        "existing:9b": {"repo_id": "mlx-community/Existing-9B", "downloads": 100, "lab": "TestLab"},
+    if not isinstance(sys.modules.get("ppmlx.registry"), types.ModuleType):
+        sys.modules.pop("ppmlx.registry", None)
+    registry = importlib.import_module("ppmlx.registry")
+
+    fetched = {
+        "version": 1,
+        "updated": "2026-05-18",
+        "source": "huggingface-api-downloads",
+        "models": {
+            "top:1b": {"repo_id": "mlx-community/Top-1B-4bit", "downloads": 999},
+        },
     }
-    fetched_models = {
-        "new-model:4b": {"repo_id": "mlx-community/New-Model-4B", "downloads": 500},
-        "existing:9b": {"repo_id": "mlx-community/Existing-9B", "downloads": 999},
-    }
 
-    # Replicate the merge logic from registry._load()
-    merged = dict(bundled_models)
-    for alias, entry in fetched_models.items():
-        if alias in merged:
-            merged[alias]["downloads"] = entry.get("downloads", merged[alias].get("downloads", 0))
-        else:
-            merged[alias] = entry
+    monkeypatch.setattr(registry, "_cache", None)
+    monkeypatch.setattr("ppmlx.registry_fetch.maybe_refresh", lambda mode: fetched)
 
-    # New model added
-    assert "new-model:4b" in merged
-    assert merged["new-model:4b"]["repo_id"] == "mlx-community/New-Model-4B"
-    # Existing model: downloads updated, other metadata preserved
-    assert merged["existing:9b"]["downloads"] == 999
-    assert merged["existing:9b"]["lab"] == "TestLab"
-    assert merged["existing:9b"]["repo_id"] == "mlx-community/Existing-9B"
+    assert registry.registry_aliases() == {"top:1b": "mlx-community/Top-1B-4bit"}
+    assert registry.registry_meta()["count"] == 1
+    monkeypatch.setattr(registry, "_cache", None)

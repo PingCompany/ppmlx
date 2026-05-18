@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 _CACHE_FILE = "registry_cache.json"
 _HF_AUTHOR = "mlx-community"
-_FETCH_LIMIT = 50
+_DISPLAY_LIMIT = 50
+_FETCH_LIMIT = 75  # over-fetch slightly to survive alias collisions
 _FETCH_TIMEOUT = 8  # seconds
 
 _STALENESS_SECONDS: dict[str, float] = {
@@ -72,16 +73,16 @@ def cache_status_text() -> str:
     """Return a compact human-readable summary of the dynamic registry cache."""
     data = _load_cache()
     if not data:
-        return "dynamic refresh: never"
+        return "top downloads refreshed: never"
     fetched_at = data.get("fetched_at")
     if not fetched_at:
-        return "dynamic refresh: unknown"
+        return "top downloads refreshed: unknown"
     try:
         dt = datetime.fromtimestamp(float(fetched_at)).astimezone()
         count = len(data.get("models", {}))
-        return f"dynamic refresh: {dt.strftime('%Y-%m-%d %H:%M')} ({count} fetched)"
+        return f"top downloads refreshed: {dt.strftime('%Y-%m-%d %H:%M')} ({count} fetched)"
     except Exception:
-        return "dynamic refresh: unknown"
+        return "top downloads refreshed: unknown"
 
 
 def _save_cache(data: dict[str, Any]) -> None:
@@ -116,6 +117,8 @@ def _fetch_from_hf() -> dict[str, Any] | None:
                 "downloads": m.downloads or 0,
                 "created": m.created_at.strftime("%Y-%m-%d") if m.created_at else None,
             }
+            if len(entries) >= _DISPLAY_LIMIT:
+                break
         return {
             "version": 1,
             "fetched_at": time.time(),

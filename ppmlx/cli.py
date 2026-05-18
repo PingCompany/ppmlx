@@ -179,7 +179,7 @@ def _build_model_records(
 ) -> list[ModelRecord]:
     """Build a unified list of model records from all sources."""
     from ppmlx.models import (
-        all_aliases, DEFAULT_ALIASES, load_user_aliases,
+        DEFAULT_ALIASES, load_user_aliases,
         list_local_models, load_favorites,
     )
 
@@ -189,7 +189,7 @@ def _build_model_records(
     except Exception:
         reg = {}
 
-    aliases = all_aliases()
+    aliases = {alias: entry["repo_id"] for alias, entry in reg.items() if "repo_id" in entry}
     user_aliases = load_user_aliases()
     local_models = list_local_models()
     favorites_list = load_favorites()
@@ -199,8 +199,13 @@ def _build_model_records(
     for m in local_models:
         local_by_repo[m["repo_id"]] = m
 
-    # Source priority: custom > built-in > registry
-    _SOURCE_PRIO = {"custom": 0, "built-in": 1, "registry": 2, "local-only": 3}
+    for alias, repo_id in DEFAULT_ALIASES.items():
+        if repo_id in local_by_repo:
+            aliases.setdefault(alias, repo_id)
+    aliases.update(user_aliases)
+
+    # Source priority: custom > registry > built-in
+    _SOURCE_PRIO = {"custom": 0, "registry": 1, "built-in": 2, "local-only": 3}
 
     # Group by repo_id, keeping only the best alias per repo.
     by_repo: dict[str, ModelRecord] = {}
@@ -211,7 +216,7 @@ def _build_model_records(
         source = "registry"
         if alias in user_aliases:
             source = "custom"
-        elif alias in DEFAULT_ALIASES:
+        elif alias in DEFAULT_ALIASES and alias not in reg:
             source = "built-in"
 
         candidate = ModelRecord(
@@ -2660,6 +2665,14 @@ def memory_eval_cmd(
     table.add_row("Scope leakage rate", f"{summary['scope_leakage_rate'] * 100:.2f}%", f"<= {report.thresholds.max_scope_leakage_rate * 100:.2f}%")
     table.add_row("Bad injection rate", f"{summary['bad_injection_rate'] * 100:.2f}%", f"<= {report.thresholds.max_bad_injection_rate * 100:.2f}%")
     table.add_row("Manual review burden", f"{summary['manual_review_burden'] * 100:.2f}%", f"<= {report.thresholds.max_manual_review_burden * 100:.2f}%")
+    graph_quality = summary.get("graph_quality", {})
+    table.add_row(
+        "Graph quality failures",
+        str(graph_quality.get("failure_count", "?")),
+        f"<= {report.thresholds.max_graph_quality_failures}",
+    )
+    graph_metrics = graph_quality.get("metrics", {}) if isinstance(graph_quality, dict) else {}
+    table.add_row("Graph worker jobs/sec", f"{float(graph_metrics.get('jobs_per_second') or 0):.3f}", "> 0")
     table.add_row("Validation p95", f"{latency['validation_p95']:.3f} ms", f"<= {report.thresholds.max_validation_p95_ms:.0f} ms")
     table.add_row("Retrieval p95", f"{latency['retrieval_p95']:.3f} ms", f"<= {report.thresholds.max_retrieval_p95_ms:.0f} ms")
     console.print(table)

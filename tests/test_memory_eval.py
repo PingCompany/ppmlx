@@ -26,6 +26,12 @@ def test_builtin_memory_eval_passes_reference_gate():
     assert report.summary["scope_leakage_count"] == 0
     assert report.summary["bad_injection_count"] == 0
     assert report.summary["manual_review_burden"] == 0
+    graph_quality = report.summary["graph_quality"]
+    assert graph_quality["passed"] is True
+    assert graph_quality["failure_count"] == 0
+    assert all(graph_quality["checks"].values())
+    assert graph_quality["metrics"]["processed_jobs"] == graph_quality["metrics"]["queued_jobs"]
+    assert graph_quality["metrics"]["jobs_per_second"] > 0
     assert report.summary["latency_ms"]["validation_p95"] < 50
     assert report.summary["latency_ms"]["retrieval_p95"] < 50
 
@@ -89,7 +95,9 @@ def test_save_report_writes_json(tmp_path):
     data = json.loads(path.read_text())
     assert data["passed"] is True
     assert data["summary"]["cases"] >= 1
+    assert data["summary"]["graph_quality"]["passed"] is True
     assert "thresholds" in data
+    assert "max_graph_quality_failures" in data["thresholds"]
 
 
 def test_memory_eval_cli_json_output():
@@ -99,3 +107,4 @@ def test_memory_eval_cli_json_output():
     data = json.loads(result.output)
     assert data["passed"] is True
     assert data["summary"]["secret_leak_count"] == 0
+    assert data["summary"]["graph_quality"]["failure_count"] == 0

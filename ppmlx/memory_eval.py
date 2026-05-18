@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -279,6 +280,7 @@ class MemoryEvalThresholds:
     max_bad_injection_rate: float = 0.0
     max_manual_review_burden: float = 0.05
     max_contradiction_misses: int = 0
+    max_graph_quality_failures: int = 0
     max_validation_p95_ms: float = 50.0
     max_retrieval_p95_ms: float = 50.0
 
@@ -290,6 +292,7 @@ class MemoryEvalThresholds:
             "max_bad_injection_rate": self.max_bad_injection_rate,
             "max_manual_review_burden": self.max_manual_review_burden,
             "max_contradiction_misses": self.max_contradiction_misses,
+            "max_graph_quality_failures": self.max_graph_quality_failures,
             "max_validation_p95_ms": self.max_validation_p95_ms,
             "max_retrieval_p95_ms": self.max_retrieval_p95_ms,
         }
@@ -667,6 +670,7 @@ def summarize(case_evals: list[CaseEval], cases: list[EvalCase], runs: dict[str,
             "total_p50": round(_percentile(total_ms, 50), 3),
             "total_p95": round(_percentile(total_ms, 95), 3),
         },
+        "graph_quality": run_graph_quality_checks(),
         "ids": {
             "false_active": false_active,
             "missed_active": missed_active,
@@ -676,6 +680,243 @@ def summarize(case_evals: list[CaseEval], cases: list[EvalCase], runs: dict[str,
             "bad_injections": bad_injections,
             "retrieval_misses": retrieval_misses,
         },
+    }
+
+
+def run_graph_quality_checks() -> dict[str, Any]:
+    """Run fast deterministic graph-engine invariants on an isolated store.
+
+    These checks intentionally use temporary MemoryStore/MemoryEngine instances
+    and fake extractors only. If any setup or invariant raises, the graph-quality
+    section fails closed and contributes to the suite threshold result.
+    """
+    started = time.perf_counter()
+    checks = {
+        "graph_cleanliness": False,
+        "entity_canonicalization_aliasing": False,
+        "atom_temporal_supersession": False,
+        "curated_retrieval_hides_noisy_eval_namespaces": False,
+        "async_worker_throughput": False,
+    }
+    metrics: dict[str, Any] = {
+        "long_sentence_object_nodes": 0,
+        "canonical_aliases": 0,
+        "active_atoms_after_supersession": 0,
+        "superseded_atoms": 0,
+        "curated_items": 0,
+        "queued_jobs": 0,
+        "processed_jobs": 0,
+        "jobs_per_second": 0.0,
+    }
+    errors: list[str] = []
+
+    try:
+        from ppmlx.context_reducer import build_handoff_context
+        from ppmlx.memory_engine import MemoryEngine, ShadowMemoryCandidate
+        from ppmlx.memory_store import MemoryStore
+
+        class StaticExtractor:
+            max_candidates = 12
+
+            def __init__(self, by_event_id: dict[str, list[dict[str, Any]]] | None = None):
+                self.by_event_id = by_event_id or {}
+
+            def extract(self, event: dict[str, Any]) -> list[ShadowMemoryCandidate]:
+                candidates = self.by_event_id.get(str(event.get("event_id") or ""), [])
+                return [ShadowMemoryCandidate(**candidate) for candidate in candidates]
+
+        def capture(
+            engine: MemoryEngine,
+            *,
+            request_id: str,
+            content: str,
+            project_id: str = "ppmlx",
+            app_id: str | None = None,
+        ) -> dict[str, Any]:
+            return engine.capture_chat(
+                request_id=request_id,
+                endpoint="/v1/chat/completions",
+                model_alias="graph-quality-fake",
+                model_repo="local/fake",
+                messages=[{"role": "user", "content": content}],
+                response_text="ok",
+                app_id=app_id,
+                project_id=project_id,
+            )
+
+        long_object = (
+            "ppmlx should keep canonical graph nodes short because arbitrary extracted sentences "
+            "make unusable node labels and noisy JSON-like graph entities"
+        )
+        with tempfile.TemporaryDirectory(prefix="ppmlx-memory-eval-") as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db")
+            extractor = StaticExtractor({
+                "long-sentence": [{
+                    "type": "fact",
+                    "subject": "ppmlx",
+                    "predicate": "should_keep",
+                    "object": long_object,
+                    "text": f"ppmlx should keep graph nodes short: {long_object}.",
+                    "scope": "project",
+                    "confidence": 0.96,
+                    "source_quote": long_object,
+                    "salience": 0.95,
+                }],
+                "alias": [{
+                    "type": "fact",
+                    "subject": "Project PPMLX",
+                    "predicate": "supports",
+                    "object": "canonical aliases",
+                    "text": "Project PPMLX supports canonical aliases.",
+                    "scope": "project",
+                    "confidence": 0.96,
+                    "source_quote": "Project PPMLX supports canonical aliases",
+                    "salience": 0.95,
+                }],
+                "curated-good": [{
+                    "type": "fact",
+                    "subject": "ppmlx",
+                    "predicate": "status",
+                    "object": "current production memory",
+                    "text": "ppmlx current memory is production context.",
+                    "scope": "project",
+                    "confidence": 0.96,
+                    "source_quote": "ppmlx current memory is production context",
+                    "salience": 0.95,
+                }],
+                "curated-noisy": [{
+                    "type": "fact",
+                    "subject": "ppmlx",
+                    "predicate": "status",
+                    "object": "noisy eval fixture",
+                    "text": "ppmlx current memory is noisy eval fixture.",
+                    "scope": "project",
+                    "confidence": 0.96,
+                    "source_quote": "ppmlx current memory is noisy eval fixture",
+                    "salience": 0.95,
+                }],
+            })
+            engine = MemoryEngine(store=store, extractor=extractor)
+
+            capture(engine, request_id="long-sentence", content=f"Remember: {long_object}.")
+            snapshot = store.graph_snapshot(project_id="ppmlx", query="unusable node labels")
+            node_labels = {str(node.get("label") or "") for node in snapshot["nodes"]}
+            polluted_nodes = [label for label in node_labels if "unusable node labels" in label]
+            metrics["long_sentence_object_nodes"] = len(polluted_nodes)
+            checks["graph_cleanliness"] = bool(snapshot["candidates"]) and not snapshot["edges"] and not polluted_nodes
+
+            capture(
+                engine,
+                request_id="alias",
+                content="Project PPMLX supports canonical aliases.",
+                project_id="Project PPMLX",
+            )
+            alias_snapshot = store.graph_snapshot(project_id="Project PPMLX", query="canonical aliases")
+            aliases = store.query_entity_aliases(alias="Project PPMLX", scope="project")
+            metrics["canonical_aliases"] = len(aliases)
+            checks["entity_canonicalization_aliasing"] = (
+                any(node.get("label") == "ppmlx" for node in alias_snapshot["nodes"])
+                and len(aliases) == 1
+            )
+
+            store.store_atom({
+                "atom_id": "atom-verbose",
+                "type": "preference",
+                "subject": "User",
+                "predicate": "prefers",
+                "object": "verbose explanations",
+                "scope": "global",
+                "confidence": 0.9,
+            })
+            store.store_atom({
+                "atom_id": "atom-concise",
+                "type": "preference",
+                "subject": "user",
+                "predicate": "prefers",
+                "object": "concise answers",
+                "scope": "global",
+                "confidence": 0.95,
+                "metadata": {"from_now_on": True},
+            })
+            active_atoms = store.query_atoms(type="preference", subject="user", predicate="prefers", scope="global")
+            all_atoms = store.query_atoms(
+                type="preference",
+                predicate="prefers",
+                scope="global",
+                active_only=False,
+            )
+            superseded_atoms = [atom for atom in all_atoms if atom.get("invalid_at")]
+            metrics["active_atoms_after_supersession"] = len(active_atoms)
+            metrics["superseded_atoms"] = len(superseded_atoms)
+            checks["atom_temporal_supersession"] = (
+                len(active_atoms) == 1
+                and active_atoms[0]["atom_id"] == "atom-concise"
+                and len(superseded_atoms) == 1
+            )
+
+            capture(
+                engine,
+                request_id="curated-good",
+                content="ppmlx current memory is production context.",
+                project_id="ppmlx",
+            )
+            capture(
+                engine,
+                request_id="curated-noisy",
+                content="ppmlx current memory is noisy eval fixture.",
+                project_id="answer-quality-real-dogfood",
+            )
+            handoff = build_handoff_context(query="ppmlx current memory", max_items=20, store=store)
+            item_ids = {str(item.get("candidate_id") or "") for item in handoff.items}
+            noisy_ids = {
+                str(item.get("candidate_id") or "")
+                for item in store.query_candidates(status="active", project_id="answer-quality-real-dogfood")
+            }
+            good_ids = {
+                str(item.get("candidate_id") or "")
+                for item in store.query_candidates(status="active", project_id="ppmlx")
+                if item.get("object") == "current production memory"
+            }
+            metrics["curated_items"] = len(handoff.items)
+            checks["curated_retrieval_hides_noisy_eval_namespaces"] = bool(good_ids & item_ids) and not (noisy_ids & item_ids)
+
+            worker_store = MemoryStore(Path(temp_dir) / "worker.db")
+            queue_engine = MemoryEngine(store=worker_store, extractor=StaticExtractor(), enqueue_extraction=True)
+            worker_engine = MemoryEngine(store=worker_store, extractor=StaticExtractor())
+            jobs = 5
+            for index in range(jobs):
+                queue_engine.capture_chat(
+                    request_id=f"queued-{index}",
+                    endpoint="/v1/chat/completions",
+                    model_alias="graph-quality-fake",
+                    model_repo="local/fake",
+                    messages=[{"role": "user", "content": f"queued fake job {index}"}],
+                    response_text="ok",
+                    project_id="ppmlx",
+                )
+            worker_start = time.perf_counter()
+            worker_result = worker_engine.process_extraction_job(worker_id="eval-worker", once=False) or {}
+            worker_duration = max(time.perf_counter() - worker_start, 1e-9)
+            processed = int(worker_result.get("processed") or 0)
+            metrics["queued_jobs"] = jobs
+            metrics["processed_jobs"] = processed
+            metrics["jobs_per_second"] = round(processed / worker_duration, 3)
+            checks["async_worker_throughput"] = (
+                processed == jobs
+                and not worker_store.list_extraction_jobs(status="queued")
+                and metrics["jobs_per_second"] > 0
+            )
+    except Exception as exc:  # pragma: no cover - fail-closed guard for platform-specific sqlite issues
+        errors.append(f"{type(exc).__name__}: {exc}")
+
+    failure_count = sum(1 for passed in checks.values() if not passed) + len(errors)
+    return {
+        "passed": failure_count == 0,
+        "failure_count": failure_count,
+        "checks": checks,
+        "metrics": metrics,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "errors": errors,
     }
 
 
@@ -717,6 +958,7 @@ def _passes_thresholds(summary: dict[str, Any], thresholds: MemoryEvalThresholds
         and summary["bad_injection_rate"] <= thresholds.max_bad_injection_rate
         and summary["manual_review_burden"] <= thresholds.max_manual_review_burden
         and summary["contradiction_miss_count"] <= thresholds.max_contradiction_misses
+        and summary.get("graph_quality", {}).get("failure_count", 1) <= thresholds.max_graph_quality_failures
         and latency["validation_p95"] <= thresholds.max_validation_p95_ms
         and latency["retrieval_p95"] <= thresholds.max_retrieval_p95_ms
     )
