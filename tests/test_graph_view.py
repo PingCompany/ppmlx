@@ -9,6 +9,8 @@ def test_render_graph_html_uses_pinned_antv_g6() -> None:
 
     assert "https://cdn.jsdelivr.net/npm/@antv/g6@4.8.24/dist/g6.min.js" in html
     assert "new G6.Graph" in html
+    assert "container: 'graph'" in html
+    assert '<div id="graph-wrap"' in html
     assert "type: 'force'" in html
     assert "drag-canvas" in html
     assert "zoom-canvas" in html

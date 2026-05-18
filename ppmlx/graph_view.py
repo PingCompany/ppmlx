@@ -177,10 +177,10 @@ function render(data) {
 function renderGraph(data) {
   const container = $('graph');
   const message = $('graph-message');
+  if (graph) { graph.destroy(); graph = null; }
   container.innerHTML = '';
   message.hidden = true;
   message.className = 'graph-message';
-  if (graph) { graph.destroy(); graph = null; }
   const nodes = data.nodes || [], edges = data.edges || [];
   if (window.__ppmlxG6LoadError || typeof G6 === 'undefined') {
     message.textContent = 'Unable to load AntV G6 from the CDN. Check your network connection or content-blocking settings, then refresh.';
