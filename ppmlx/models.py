@@ -301,6 +301,16 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
     BLUE, GREEN, ORANGE, RED, WHITE = "blue", "green", "#d78700", "red", "white"
 
     bar = BarColumn(bar_width=None, complete_style=BLUE, finished_style=GREEN)
+    progress_lock = threading.RLock()
+    progress_state = {
+        "completed": 0.0,
+        "total": float(expected_total or 0),
+    }
+
+    def _display_total(completed: float, total: float) -> float | None:
+        current = max(total, float(expected_total or 0), completed)
+        return current or None
+
     with Progress(
         SpinnerColumn(style=WHITE),
         TextColumn("[bold blue]{task.description}"),
@@ -309,11 +319,18 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
         TransferSpeedColumn(),
         TimeRemainingColumn(),
         refresh_per_second=10,
+        auto_refresh=False,
     ) as progress:
         task = progress.add_task(f"↓ {alias_or_repo}", total=expected_total)
 
         class _RichTqdm:
-            """Small tqdm-compatible adapter used by HuggingFace Hub."""
+            """Small tqdm-compatible adapter used by HuggingFace Hub.
+
+            HF invokes tqdm callbacks from worker/Xet threads. Keep those
+            callbacks cheap and thread-safe; the main thread renders Rich at a
+            fixed cadence below so terminal refresh never depends on callback
+            timing or on Rich being called from background threads.
+            """
 
             _lock = threading.RLock()
 
@@ -339,8 +356,7 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
             ) -> None:
                 self.iterable = iterable
                 self.desc = desc or ""
-                self.total = total
-                self.n = initial or 0
+                self.n = float(initial or 0)
                 self.unit = unit
                 self.unit_scale = unit_scale
                 self.disable = disable
@@ -350,16 +366,24 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
                     or name == "huggingface_hub.snapshot_download"
                     or self.desc.startswith("Downloading")
                 )
-                if self._is_bytes:
-                    self.refresh()
+                self._total = float(total or 0)
+                self._sync_state()
 
-            def _display_total(self) -> int | float | None:
-                current = self.total or 0
-                if expected_total:
-                    current = max(current, expected_total)
-                if self.n > current:
-                    current = self.n
-                return current or None
+            @property
+            def total(self) -> float:
+                return self._total
+
+            @total.setter
+            def total(self, value: int | float | None) -> None:
+                self._total = float(value or 0)
+                self._sync_state()
+
+            def _sync_state(self) -> None:
+                if not self._is_bytes:
+                    return
+                with progress_lock:
+                    progress_state["completed"] = max(progress_state["completed"], self.n)
+                    progress_state["total"] = max(progress_state["total"], self._total)
 
             def __iter__(self):
                 if self.iterable is None:
@@ -378,22 +402,11 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
                 if n is None:
                     n = 1
                 with type(self)._lock:
-                    self.n += n
-                    if self._is_bytes:
-                        progress.update(
-                            task,
-                            completed=self.n,
-                            total=self._display_total(),
-                        )
+                    self.n += float(n)
+                    self._sync_state()
 
             def refresh(self, *args: object, **kwargs: object) -> None:
-                if self._is_bytes:
-                    with type(self)._lock:
-                        progress.update(
-                            task,
-                            completed=self.n,
-                            total=self._display_total(),
-                        )
+                self._sync_state()
 
             def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
                 self.desc = desc or ""
@@ -401,7 +414,7 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
                     self.refresh()
 
             def close(self) -> None:
-                pass
+                self._sync_state()
 
             def clear(self, *args: object, **kwargs: object) -> None:
                 pass
@@ -409,26 +422,63 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
             def display(self, *args: object, **kwargs: object) -> None:
                 pass
 
+        result: dict[str, object] = {}
+
+        def _bg_download() -> None:
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(local_path),
+                    token=token,
+                    ignore_patterns=_DOWNLOAD_IGNORE_PATTERNS,
+                    tqdm_class=_RichTqdm,
+                )
+            except BaseException as exc:
+                result["error"] = exc
+
+        dl_thread = threading.Thread(target=_bg_download, daemon=True)
+        dl_thread.start()
+
         try:
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=str(local_path),
-                token=token,
-                ignore_patterns=_DOWNLOAD_IGNORE_PATTERNS,
-                tqdm_class=_RichTqdm,
-            )
+            while dl_thread.is_alive():
+                with progress_lock:
+                    completed = progress_state["completed"]
+                    total = progress_state["total"]
+                progress.update(
+                    task,
+                    completed=completed,
+                    total=_display_total(completed, total),
+                )
+                progress.refresh()
+                dl_thread.join(timeout=0.1)
         except KeyboardInterrupt:
             bar.complete_style = ORANGE  # type: ignore[assignment]
             bar.finished_style = ORANGE  # type: ignore[assignment]
             progress.update(task, description=f"[bold {ORANGE}]✗ {alias_or_repo}")
+            progress.refresh()
             progress.stop()
             shutil.rmtree(local_path, ignore_errors=True)
             raise
-        except Exception as exc:
+
+        with progress_lock:
+            completed = progress_state["completed"]
+            total = progress_state["total"]
+        progress.update(
+            task,
+            completed=completed,
+            total=_display_total(completed, total),
+        )
+        progress.refresh()
+
+        exc = result.get("error")
+        if exc:
             bar.complete_style = RED  # type: ignore[assignment]
             bar.finished_style = RED  # type: ignore[assignment]
             progress.update(task, description=f"[bold {RED}]✗ {alias_or_repo}")
+            progress.refresh()
             shutil.rmtree(local_path, ignore_errors=True)
+            if isinstance(exc, KeyboardInterrupt):
+                raise exc
             raise ModelNotFoundError(
                 f"Failed to download '{repo_id}': {exc}"
             ) from exc
@@ -442,6 +492,7 @@ def download_model(alias_or_repo: str, token: str | None = None) -> Path:
             completed=final_total,
             description=f"[bold {GREEN}]✓ {alias_or_repo}",
         )
+        progress.refresh()
 
     return local_path
 

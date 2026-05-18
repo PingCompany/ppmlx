@@ -105,6 +105,66 @@ CREATE TABLE IF NOT EXISTS memory_compactions (
     latency_ms              REAL NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS memory_extraction_jobs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL UNIQUE,
+    source_event_id TEXT,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    priority        INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 3,
+    worker_id       TEXT,
+    payload_json    TEXT NOT NULL DEFAULT '{}',
+    result_json     TEXT,
+    error           TEXT,
+    valid_at        TEXT,
+    invalid_at      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    claimed_at      TEXT,
+    completed_at    TEXT,
+    failed_at       TEXT,
+    expired_at      TEXT,
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(source_event_id) REFERENCES memory_events(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_atoms (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    atom_id         TEXT NOT NULL UNIQUE,
+    source_event_id TEXT,
+    source_job_id   TEXT,
+    type            TEXT NOT NULL,
+    subject         TEXT NOT NULL,
+    predicate       TEXT NOT NULL,
+    object          TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    scope           TEXT NOT NULL DEFAULT 'global',
+    confidence      REAL NOT NULL DEFAULT 0,
+    valid_at        TEXT,
+    invalid_at      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    expired_at      TEXT,
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(source_event_id) REFERENCES memory_events(event_id),
+    FOREIGN KEY(source_job_id) REFERENCES memory_extraction_jobs(job_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_entity_aliases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias_id        TEXT NOT NULL UNIQUE,
+    entity_id       TEXT NOT NULL,
+    alias           TEXT NOT NULL,
+    type            TEXT NOT NULL DEFAULT 'concept',
+    scope           TEXT NOT NULL DEFAULT 'global',
+    confidence      REAL NOT NULL DEFAULT 1,
+    valid_at        TEXT,
+    invalid_at      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    expired_at      TEXT,
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(entity_id, alias, type, scope)
+);
+
 CREATE INDEX IF NOT EXISTS idx_memory_events_timestamp ON memory_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_memory_events_project ON memory_events(project_id);
 CREATE INDEX IF NOT EXISTS idx_memory_candidates_event ON memory_candidates(event_id);
@@ -115,6 +175,13 @@ CREATE INDEX IF NOT EXISTS idx_memory_edges_source ON memory_edges(source_candid
 CREATE INDEX IF NOT EXISTS idx_memory_edges_status ON memory_edges(status);
 CREATE INDEX IF NOT EXISTS idx_memory_compactions_timestamp ON memory_compactions(timestamp);
 CREATE INDEX IF NOT EXISTS idx_memory_compactions_project_session ON memory_compactions(project_id, session_id);
+CREATE INDEX IF NOT EXISTS idx_memory_extraction_jobs_status ON memory_extraction_jobs(status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_extraction_jobs_source_event ON memory_extraction_jobs(source_event_id);
+CREATE INDEX IF NOT EXISTS idx_memory_atoms_slot ON memory_atoms(type, subject, predicate, scope);
+CREATE INDEX IF NOT EXISTS idx_memory_atoms_source_event ON memory_atoms(source_event_id);
+CREATE INDEX IF NOT EXISTS idx_memory_atoms_valid ON memory_atoms(valid_at, invalid_at, expired_at);
+CREATE INDEX IF NOT EXISTS idx_memory_entity_aliases_alias ON memory_entity_aliases(alias, type, scope);
+CREATE INDEX IF NOT EXISTS idx_memory_entity_aliases_entity ON memory_entity_aliases(entity_id);
 """
 
 _FTS_SCHEMA = """
@@ -170,6 +237,299 @@ class MemoryStore:
                 ),
             )
             conn.commit()
+
+    def enqueue_extraction_job(
+        self,
+        payload: dict[str, Any],
+        *,
+        job_id: str | None = None,
+        source_event_id: str | None = None,
+        priority: int = 0,
+        max_attempts: int = 3,
+        valid_at: str | None = None,
+        expired_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create or replace a queued asynchronous memory extraction job."""
+        self.init()
+        resolved_job_id = job_id or self._job_id(source_event_id, payload)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_extraction_jobs (
+                    job_id, source_event_id, status, priority, attempts, max_attempts,
+                    worker_id, payload_json, result_json, error, valid_at, invalid_at,
+                    claimed_at, completed_at, failed_at, expired_at, metadata_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    resolved_job_id,
+                    source_event_id,
+                    "queued",
+                    int(priority),
+                    0,
+                    int(max_attempts),
+                    None,
+                    json.dumps(payload, ensure_ascii=False),
+                    None,
+                    None,
+                    valid_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    expired_at,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+        job = self.get_extraction_job(resolved_job_id)
+        if job is None:  # defensive; the insert above should always make this available.
+            raise RuntimeError(f"failed to enqueue extraction job {resolved_job_id}")
+        return job
+
+    def get_extraction_job(self, job_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM memory_extraction_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return self._row_to_extraction_job(row) if row else None
+
+    def list_extraction_jobs(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        self.init()
+        conditions: list[str] = []
+        params: list[Any] = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""SELECT * FROM memory_extraction_jobs{where}
+                    ORDER BY priority DESC, created_at ASC LIMIT ?""",
+                params,
+            ).fetchall()
+        return [self._row_to_extraction_job(row) for row in rows]
+
+    def claim_extraction_job(self, worker_id: str, *, include_expired: bool = False) -> dict[str, Any] | None:
+        """Atomically claim the next queued extraction job for a worker."""
+        self.init()
+        with self._lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            conditions = ["status = 'queued'", "attempts < max_attempts"]
+            if not include_expired:
+                conditions.append("(expired_at IS NULL OR expired_at > strftime('%Y-%m-%dT%H:%M:%f', 'now'))")
+            row = conn.execute(
+                f"""SELECT * FROM memory_extraction_jobs
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY priority DESC, created_at ASC LIMIT 1""",
+            ).fetchone()
+            if not row:
+                conn.commit()
+                return None
+            conn.execute(
+                """UPDATE memory_extraction_jobs
+                   SET status = 'claimed', worker_id = ?, attempts = attempts + 1,
+                       claimed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'), error = NULL
+                   WHERE job_id = ?""",
+                (worker_id, row["job_id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM memory_extraction_jobs WHERE job_id = ?",
+                (row["job_id"],),
+            ).fetchone()
+            conn.commit()
+        return self._row_to_extraction_job(updated) if updated else None
+
+    def complete_extraction_job(self, job_id: str, *, result: dict[str, Any] | None = None) -> bool:
+        self.init()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE memory_extraction_jobs
+                   SET status = 'completed', result_json = ?, error = NULL,
+                       completed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+                       invalid_at = COALESCE(invalid_at, strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+                   WHERE job_id = ?""",
+                (json.dumps(result or {}, ensure_ascii=False), job_id),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    def fail_extraction_job(self, job_id: str, error: str, *, retry: bool = False) -> bool:
+        self.init()
+        status_expr = "CASE WHEN ? AND attempts < max_attempts THEN 'queued' ELSE 'failed' END"
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                f"""UPDATE memory_extraction_jobs
+                   SET status = {status_expr}, error = ?, failed_at = strftime('%Y-%m-%dT%H:%M:%f', 'now'),
+                       invalid_at = CASE WHEN ? AND attempts < max_attempts THEN invalid_at
+                                         ELSE COALESCE(invalid_at, strftime('%Y-%m-%dT%H:%M:%f', 'now')) END
+                   WHERE job_id = ?""",
+                (1 if retry else 0, error, 1 if retry else 0, job_id),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    def store_atom(self, atom: dict[str, Any]) -> dict[str, Any]:
+        self.init()
+        atom_id = str(atom.get("atom_id") or self._atom_id(atom))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_atoms (
+                    atom_id, source_event_id, source_job_id, type, subject, predicate, object,
+                    text, scope, confidence, valid_at, invalid_at, expired_at, metadata_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    atom_id,
+                    atom.get("source_event_id"),
+                    atom.get("source_job_id"),
+                    atom["type"],
+                    atom["subject"],
+                    atom["predicate"],
+                    atom["object"],
+                    atom.get("text") or f"{atom['subject']} {atom['predicate']} {atom['object']}",
+                    atom.get("scope", "global"),
+                    float(atom.get("confidence", 0.0)),
+                    atom.get("valid_at"),
+                    atom.get("invalid_at"),
+                    atom.get("expired_at"),
+                    json.dumps(atom.get("metadata", {}), ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+        stored = self.get_atom(atom_id)
+        if stored is None:
+            raise RuntimeError(f"failed to store atom {atom_id}")
+        return stored
+
+    def get_atom(self, atom_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM memory_atoms WHERE atom_id = ?", (atom_id,)).fetchone()
+        return self._row_to_atom(row) if row else None
+
+    def query_atoms(
+        self,
+        *,
+        type: str | None = None,
+        subject: str | None = None,
+        predicate: str | None = None,
+        scope: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self.init()
+        conditions: list[str] = []
+        params: list[Any] = []
+        for column, value in (("type", type), ("subject", subject), ("predicate", predicate), ("scope", scope)):
+            if value:
+                conditions.append(f"{column} = ?")
+                params.append(value)
+        if active_only:
+            conditions.append("invalid_at IS NULL")
+            conditions.append("(expired_at IS NULL OR expired_at > strftime('%Y-%m-%dT%H:%M:%f', 'now'))")
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT * FROM memory_atoms{where} ORDER BY confidence DESC, created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._row_to_atom(row) for row in rows]
+
+    def store_alias(self, alias: dict[str, Any]) -> dict[str, Any]:
+        return self.store_entity_alias(alias)
+
+    def store_entity_alias(self, alias: dict[str, Any]) -> dict[str, Any]:
+        self.init()
+        alias_id = str(alias.get("alias_id") or self._alias_id(alias))
+        entity_id = str(alias.get("entity_id") or self._entity_id(alias["alias"], alias.get("type", "concept")))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_entity_aliases (
+                    alias_id, entity_id, alias, type, scope, confidence,
+                    valid_at, invalid_at, expired_at, metadata_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    alias_id,
+                    entity_id,
+                    alias["alias"],
+                    alias.get("type", "concept"),
+                    alias.get("scope", "global"),
+                    float(alias.get("confidence", 1.0)),
+                    alias.get("valid_at"),
+                    alias.get("invalid_at"),
+                    alias.get("expired_at"),
+                    json.dumps(alias.get("metadata", {}), ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+        stored = self.get_entity_alias(alias_id)
+        if stored is None:
+            raise RuntimeError(f"failed to store entity alias {alias_id}")
+        return stored
+
+    def get_entity_alias(self, alias_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM memory_entity_aliases WHERE alias_id = ?", (alias_id,)).fetchone()
+        return self._row_to_entity_alias(row) if row else None
+
+    def query_aliases(
+        self,
+        *,
+        entity_id: str | None = None,
+        alias: str | None = None,
+        type: str | None = None,
+        scope: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.query_entity_aliases(
+            entity_id=entity_id,
+            alias=alias,
+            type=type,
+            scope=scope,
+            active_only=active_only,
+            limit=limit,
+        )
+
+    def query_entity_aliases(
+        self,
+        *,
+        entity_id: str | None = None,
+        alias: str | None = None,
+        type: str | None = None,
+        scope: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self.init()
+        conditions: list[str] = []
+        params: list[Any] = []
+        for column, value in (("entity_id", entity_id), ("alias", alias), ("type", type), ("scope", scope)):
+            if value:
+                conditions.append(f"{column} = ?")
+                params.append(value)
+        if active_only:
+            conditions.append("invalid_at IS NULL")
+            conditions.append("(expired_at IS NULL OR expired_at > strftime('%Y-%m-%dT%H:%M:%f', 'now'))")
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT * FROM memory_entity_aliases{where} ORDER BY confidence DESC, created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._row_to_entity_alias(row) for row in rows]
 
     def query_events(
         self,
@@ -872,6 +1232,65 @@ class MemoryStore:
             except json.JSONDecodeError:
                 out[target] = [] if target in {"reasons", "invalidates"} else {}
         return out
+
+    @staticmethod
+    def _row_to_extraction_job(row: sqlite3.Row) -> dict[str, Any]:
+        out = dict(row)
+        for key in ("payload_json", "result_json", "metadata_json"):
+            raw = out.pop(key, None)
+            target = key.removesuffix("_json")
+            try:
+                out[target] = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                out[target] = {}
+        return out
+
+    @staticmethod
+    def _row_to_atom(row: sqlite3.Row) -> dict[str, Any]:
+        out = dict(row)
+        raw = out.pop("metadata_json", None)
+        try:
+            out["metadata"] = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            out["metadata"] = {}
+        return out
+
+    @staticmethod
+    def _row_to_entity_alias(row: sqlite3.Row) -> dict[str, Any]:
+        out = dict(row)
+        raw = out.pop("metadata_json", None)
+        try:
+            out["metadata"] = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            out["metadata"] = {}
+        return out
+
+    @staticmethod
+    def _job_id(source_event_id: str | None, payload: dict[str, Any]) -> str:
+        payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        digest = sha1(f"{source_event_id or ''}:{payload_json}".encode()).hexdigest()[:16]
+        return f"job_{digest}"
+
+    @staticmethod
+    def _atom_id(atom: dict[str, Any]) -> str:
+        parts = (
+            atom.get("source_event_id") or "",
+            atom.get("source_job_id") or "",
+            atom.get("type") or "",
+            atom.get("subject") or "",
+            atom.get("predicate") or "",
+            atom.get("object") or "",
+            atom.get("scope") or "global",
+        )
+        digest = sha1(":".join(_norm(str(part)) for part in parts).encode()).hexdigest()[:16]
+        return f"atom_{digest}"
+
+    @staticmethod
+    def _alias_id(alias: dict[str, Any]) -> str:
+        entity_id = alias.get("entity_id") or ""
+        parts = (entity_id, alias.get("alias") or "", alias.get("type") or "concept", alias.get("scope") or "global")
+        digest = sha1(":".join(_norm(str(part)) for part in parts).encode()).hexdigest()[:16]
+        return f"alias_{digest}"
 
     @staticmethod
     def _entity_id(name: str, entity_type: str) -> str:
