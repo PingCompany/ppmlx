@@ -791,6 +791,7 @@ class MemoryEngine:
                 "quarantined": int((sync_result or {}).get("quarantined") or 0),
                 "rejected": int((sync_result or {}).get("rejected") or 0),
                 "disputed": int((sync_result or {}).get("disputed") or 0),
+                "inferred": int((sync_result or {}).get("inferred") or 0),
                 "queued": 1,
                 "duration_ms": round(elapsed_ms, 3),
             }
@@ -892,6 +893,15 @@ class MemoryEngine:
             if validation.get("status") == STATUS_ACTIVE:
                 self.store.upsert_memory_edge(candidate.to_record())
             validations.append(validation)
+
+        # Run deterministic graph inference after new edges are written so
+        # transitive, co-occurrence, and temporal chains can be computed.
+        # Inference is best-effort: failures must never block extraction.
+        try:
+            inferred = self.store.run_inference()
+        except Exception:
+            inferred = {}
+
         elapsed_ms = (time.perf_counter() - start) * 1000
         return {
             "event_id": event_id,
@@ -900,6 +910,7 @@ class MemoryEngine:
             "quarantined": sum(1 for item in validations if item["status"] == STATUS_QUARANTINED),
             "rejected": sum(1 for item in validations if item["status"] == STATUS_REJECTED),
             "disputed": sum(1 for item in validations if item["status"] == STATUS_DISPUTED),
+            "inferred": sum(inferred.values()) if inferred else 0,
             "duration_ms": round(elapsed_ms, 3),
         }
 

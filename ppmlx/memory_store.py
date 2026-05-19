@@ -194,6 +194,28 @@ CREATE INDEX IF NOT EXISTS idx_memory_atoms_source_event ON memory_atoms(source_
 CREATE INDEX IF NOT EXISTS idx_memory_atoms_valid ON memory_atoms(valid_at, invalid_at, expired_at);
 CREATE INDEX IF NOT EXISTS idx_memory_entity_aliases_alias ON memory_entity_aliases(alias, type, scope);
 CREATE INDEX IF NOT EXISTS idx_memory_entity_aliases_entity ON memory_entity_aliases(entity_id);
+
+CREATE TABLE IF NOT EXISTS memory_inferred (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    inferred_id     TEXT NOT NULL UNIQUE,
+    from_entity_id  TEXT NOT NULL,
+    relation        TEXT NOT NULL,
+    to_entity_id    TEXT NOT NULL,
+    inference_method TEXT NOT NULL,
+    source_edge_ids TEXT NOT NULL DEFAULT '[]',
+    confidence      REAL NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    valid_from      TEXT,
+    valid_to        TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(from_entity_id) REFERENCES memory_entities(entity_id),
+    FOREIGN KEY(to_entity_id) REFERENCES memory_entities(entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_inferred_entities ON memory_inferred(from_entity_id, to_entity_id);
+CREATE INDEX IF NOT EXISTS idx_memory_inferred_method ON memory_inferred(inference_method);
+CREATE INDEX IF NOT EXISTS idx_memory_inferred_status ON memory_inferred(status);
 """
 
 _FTS_SCHEMA = """
@@ -831,12 +853,23 @@ class MemoryStore:
         if projection is None:
             return None
 
+        # Local partition search first (preserves project/session isolation for
+        # namespace-scoped entities).
         scoped_candidates = self._graph_resolution_candidates_conn(conn, namespace)
         match = _select_graph_entity_match(raw_name, projection, scoped_candidates)
         if match is not None:
             return match
 
         entity_id = self._entity_id(projection, "concept")
+
+        # Global alias fallback: if the projection text appears globally as an
+        # alias for an existing entity (from any partition), reuse that entity
+        # so cross-project mentions of the same real-world thing merge into one
+        # graph node instead of creating duplicate entities.
+        global_match = self._resolve_entity_by_alias_conn(conn, raw_name, projection, entity_id)
+        if global_match is not None:
+            return global_match
+
         return {"entity_id": entity_id, "name": projection}
 
     @staticmethod
@@ -924,6 +957,53 @@ class MemoryStore:
         for candidate in candidates:
             candidate["aliases"] = aliases_by_entity.get(candidate["entity_id"], [])
         return candidates
+
+    def _resolve_entity_by_alias_conn(
+        self,
+        conn: sqlite3.Connection,
+        raw_name: str,
+        projection: str,
+        entity_id: str,
+    ) -> dict[str, str] | None:
+        """Search globally for an existing entity that has *projection* as an alias.
+
+        When two different events mention the same real-world thing using different
+        names (e.g. "ppmlx" vs "the ppmlx project"), the deterministic entity_id
+        will differ.  This method checks whether *projection* is already an alias
+        for an existing entity from any partition so cross-project mentions merge
+        into a single graph node.
+        """
+        # Exact alias match: projection is a registered alias for another entity.
+        row = conn.execute(
+            """SELECT ea.entity_id, ent.name
+               FROM memory_entity_aliases ea
+               JOIN memory_entities ent ON ent.entity_id = ea.entity_id
+               WHERE ea.alias = ? AND ea.invalid_at IS NULL
+                 AND (ea.expired_at IS NULL OR ea.expired_at > strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+                 AND ea.entity_id != ?
+               LIMIT 1""",
+            (projection, entity_id),
+        ).fetchone()
+        if row is not None:
+            return {"entity_id": row["entity_id"], "name": row["name"]}
+
+        # Approximate match: search all active aliases globally for a fuzzy hit.
+        alias_rows = conn.execute(
+            """SELECT ea.entity_id, ea.alias, ent.name
+               FROM memory_entity_aliases ea
+               JOIN memory_entities ent ON ent.entity_id = ea.entity_id
+               WHERE ea.invalid_at IS NULL
+                 AND (ea.expired_at IS NULL OR ea.expired_at > strftime('%Y-%m-%dT%H:%M:%f', 'now'))
+                 AND ea.entity_id != ?""",
+            (entity_id,),
+        ).fetchall()
+        if not alias_rows:
+            return None
+        candidates = [
+            {"entity_id": row["entity_id"], "name": row["name"], "aliases": [row["alias"]]}
+            for row in alias_rows
+        ]
+        return _select_graph_entity_match(raw_name, projection, candidates)
 
     def rebuild_graph_projection(
         self,
@@ -1585,6 +1665,10 @@ class MemoryStore:
             jobs_by_status = conn.execute(
                 "SELECT status, COUNT(*) FROM memory_extraction_jobs GROUP BY status ORDER BY status"
             ).fetchall()
+            inferred = conn.execute("SELECT COUNT(*) FROM memory_inferred").fetchone()[0]
+            inferred_by_method = conn.execute(
+                "SELECT inference_method, COUNT(*) FROM memory_inferred GROUP BY inference_method"
+            ).fetchall()
         return {
             "path": str(self.path),
             "events": events,
@@ -1594,9 +1678,207 @@ class MemoryStore:
             "atoms": atoms,
             "compactions": compactions,
             "extraction_jobs": extraction_jobs,
+            "inferred": inferred,
             "by_status": {row[0]: row[1] for row in by_status},
             "jobs_by_status": {row[0]: row[1] for row in jobs_by_status},
+            "inferred_by_method": {row[0]: row[1] for row in inferred_by_method},
         }
+
+    # ------------------------------------------------------------------
+    # Graph inference (L3): deterministic rule-based edge inference that
+    # connects isolated triples into a richer graph without model calls.
+    # ------------------------------------------------------------------
+
+    def run_inference(self, *, scope: str | None = None) -> dict[str, int]:
+        """Run all deterministic graph inference rules.
+
+        Returns counts of inferred edges by method.  Safe to call repeatedly;
+        each run upserts inferred edges so deduplication is automatic.
+        """
+        self.init()
+        result: dict[str, int] = {}
+        with self._lock, self._connect() as conn:
+            result["transitive"] = self._infer_transitive_edges_conn(conn, scope=scope)
+            result["cooccurrence"] = self._infer_cooccurrence_edges_conn(conn, scope=scope)
+            result["temporal"] = self._infer_temporal_chains_conn(conn, scope=scope)
+            conn.commit()
+        return result
+
+    def query_inferred(
+        self,
+        *,
+        status: str | None = "active",
+        method: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return inferred edges with resolved entity names."""
+        self.init()
+        conditions: list[str] = []
+        params: list[Any] = []
+        if status:
+            conditions.append("inf.status = ?")
+            params.append(status)
+        if method:
+            conditions.append("inf.inference_method = ?")
+            params.append(method)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""SELECT inf.*, ef.name AS from_name, et.name AS to_name
+                    FROM memory_inferred inf
+                    JOIN memory_entities ef ON ef.entity_id = inf.from_entity_id
+                    JOIN memory_entities et ON et.entity_id = inf.to_entity_id
+                    {where}
+                    ORDER BY inf.confidence DESC, inf.created_at DESC
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _infer_transitive_edges_conn(
+        self, conn: sqlite3.Connection, *, scope: str | None = None
+    ) -> int:
+        """A → R1 → B  +  B → R2 → C  ⇒  A → (via B) → C.
+
+        Combines two active edges that share a middle entity.  Confidence is
+        min(c1, c2) × 0.8 so inferred edges never outrank direct ones.
+        """
+        conn.row_factory = sqlite3.Row
+        conditions = ["e1.status = 'active'", "e2.status = 'active'"]
+        params: list[Any] = []
+        if scope:
+            conditions.append("c1.scope = ? AND c2.scope = ?")
+            params.extend([scope, scope])
+        where = " AND ".join(conditions)
+        rows = conn.execute(
+            f"""SELECT e1.from_entity_id, e1.relation AS rel1, e1.to_entity_id AS mid_entity,
+                       e2.relation AS rel2, e2.to_entity_id AS to_entity,
+                       MIN(e1.confidence, e2.confidence) * 0.8 AS conf,
+                       e1.edge_id AS src1, e2.edge_id AS src2
+                FROM memory_edges e1
+                JOIN memory_edges e2 ON e2.from_entity_id = e1.to_entity_id
+                JOIN memory_candidates c1 ON c1.candidate_id = e1.source_candidate_id
+                JOIN memory_candidates c2 ON c2.candidate_id = e2.source_candidate_id
+                WHERE {where}
+                  AND e1.from_entity_id != e2.to_entity_id""",
+            params,
+        ).fetchall()
+        count = 0
+        for row in rows:
+            relation = f"{row['rel1']} › {row['rel2']}"
+            inferred_id = self._inferred_id(row["from_entity_id"], relation, row["to_entity"], "transitive")
+            source_ids = json.dumps([row["src1"], row["src2"]], ensure_ascii=False)
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_inferred (
+                    inferred_id, from_entity_id, relation, to_entity_id,
+                    inference_method, source_edge_ids, confidence
+                ) VALUES (?,?,?,?,?,?,?)""",
+                (inferred_id, row["from_entity_id"], relation, row["to_entity"],
+                 "transitive", source_ids, round(row["conf"], 4)),
+            )
+            count += 1
+        return count
+
+    def _infer_cooccurrence_edges_conn(
+        self, conn: sqlite3.Connection, *, scope: str | None = None
+    ) -> int:
+        """Entity pairs appearing in ≥3 co-scoped candidates get a co_occurs_with edge."""
+        conn.row_factory = sqlite3.Row
+        conditions = ["c.status = 'active'"]
+        params: list[Any] = []
+        if scope:
+            conditions.append("c.scope = ?")
+            params.append(scope)
+        where = " AND ".join(conditions)
+        # Build co-occurrence from edges sharing the same scope: entities that
+        # appear as from_entity in edges from the same scope's candidates.
+        rows = conn.execute(
+            f"""SELECT e1.from_entity_id AS ent_a, e2.from_entity_id AS ent_b,
+                       COUNT(DISTINCT c.candidate_id) AS cnt
+                FROM memory_candidates c
+                JOIN memory_edges e1 ON e1.source_candidate_id = c.candidate_id
+                JOIN memory_edges e2 ON e2.source_candidate_id = c.candidate_id
+                WHERE {where}
+                  AND e1.from_entity_id < e2.from_entity_id
+                GROUP BY 1, 2
+                HAVING cnt >= 3""",
+            params,
+        ).fetchall()
+        count = 0
+        for row in rows:
+            inferred_id = self._inferred_id(row["ent_a"], "co_occurs_with", row["ent_b"], "cooccurrence")
+            confidence = min(1.0, round(row["cnt"] * 0.15, 4))
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_inferred (
+                    inferred_id, from_entity_id, relation, to_entity_id,
+                    inference_method, source_edge_ids, confidence
+                ) VALUES (?,?,?,?,?,?,?)""",
+                (inferred_id, row["ent_a"], "co_occurs_with", row["ent_b"],
+                 "cooccurrence", "[]", confidence),
+            )
+            count += 1
+        return count
+
+    def _infer_temporal_chains_conn(
+        self, conn: sqlite3.Connection, *, scope: str | None = None
+    ) -> int:
+        """Link sequential candidates in the same session with _precedes_ edges.
+
+        Candidates from the same session ordered by created_at form a temporal
+        DAG.  We project each candidate's from_entity as a proxy and chain them.
+        """
+        conn.row_factory = sqlite3.Row
+        conditions = ["c1.status = 'active'", "c2.status = 'active'",
+                      "ev1.session_id IS NOT NULL", "ev1.session_id = ev2.session_id"]
+        params: list[Any] = []
+        if scope:
+            conditions.append("c1.scope = ? AND c2.scope = ?")
+            params.extend([scope, scope])
+        where = " AND ".join(conditions)
+        # Self-join candidates on same session; pick the immediate predecessor.
+        rows = conn.execute(
+            f"""SELECT e1.from_entity_id AS from_ent, e2.from_entity_id AS to_ent,
+                       c1.candidate_id AS prev_cid, c2.candidate_id AS curr_cid
+                FROM memory_candidates c1
+                JOIN memory_candidates c2 ON c2.created_at > c1.created_at
+                JOIN memory_events ev1 ON ev1.event_id = c1.event_id
+                JOIN memory_events ev2 ON ev2.event_id = c2.event_id
+                JOIN memory_edges e1 ON e1.source_candidate_id = c1.candidate_id
+                JOIN memory_edges e2 ON e2.source_candidate_id = c2.candidate_id
+                WHERE {where}
+                  AND e1.from_entity_id != e2.from_entity_id
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory_candidates c3
+                    JOIN memory_events ev3 ON ev3.event_id = c3.event_id
+                    WHERE ev3.session_id = ev1.session_id
+                      AND c3.created_at > c1.created_at
+                      AND c3.created_at < c2.created_at
+                  )
+                ORDER BY c1.created_at
+                LIMIT 500""",
+            params,
+        ).fetchall()
+        count = 0
+        for row in rows:
+            inferred_id = self._inferred_id(row["from_ent"], "precedes", row["to_ent"], "temporal")
+            source_ids = json.dumps([row["prev_cid"], row["curr_cid"]], ensure_ascii=False)
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_inferred (
+                    inferred_id, from_entity_id, relation, to_entity_id,
+                    inference_method, source_edge_ids, confidence
+                ) VALUES (?,?,?,?,?,?,?)""",
+                (inferred_id, row["from_ent"], "precedes", row["to_ent"],
+                 "temporal", source_ids, 0.7),
+            )
+            count += 1
+        return count
+
+    @staticmethod
+    def _inferred_id(from_entity_id: str, relation: str, to_entity_id: str, method: str) -> str:
+        digest = sha1(f"{from_entity_id}:{_norm(relation)}:{to_entity_id}:{method}".encode()).hexdigest()[:16]
+        return f"inf_{digest}"
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(str(self.path))

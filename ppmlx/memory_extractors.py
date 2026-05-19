@@ -22,7 +22,11 @@ DEFAULT_GEMMA_MEMORY_MODEL = DEFAULT_MEMORY_EXTRACTION_MODEL  # backward-compati
 MODEL_MEMORY_JSON_EXTRACTOR = "model_memory_json_v1"
 LLM_STRICT_JSON_EXTRACTOR = MODEL_MEMORY_JSON_EXTRACTOR  # backward-compatible alias
 GEMMA_STRICT_JSON_EXTRACTOR = MODEL_MEMORY_JSON_EXTRACTOR  # backward-compatible alias
+MODEL_MEMORY_PIPE_EXTRACTOR = "model_memory_pipe_v1"
 _ALLOWED_SCOPES = {"global", "project", "session"}
+
+# Pipe-delimited field order (must match prompt and parser).
+_PIPE_FIELDS = ["type", "subject", "predicate", "object", "text", "scope", "confidence", "salience", "source_quote"]
 
 GenerationFn = Callable[[str, list[dict[str, str]], int, float], str]
 _LOCAL_GENERATION_LOCK = threading.Lock()
@@ -53,38 +57,43 @@ class ModelMemoryJsonExtractor:
         self.last_prompt: str | None = None
 
     def build_prompt(self, event: dict[str, Any]) -> str:
-        """Build an explicit strict-JSON prompt for the memory extraction task."""
+        """Build a token-efficient pipe-delimited prompt for memory extraction."""
         project_id = event.get("project_id") or ""
         session_id = event.get("session_id") or ""
         source = event_source_text(event)
         allowed_types = ", ".join(sorted(ALLOWED_TYPES))
+        header = "|".join(_PIPE_FIELDS)
         return f"""You are a high-precision memory extraction function.
-Return ONLY strict JSON. Do not use markdown, comments, prose, or trailing commas.
+Return ONLY pipe-delimited rows. No markdown, no json, no code fences, no prose.
+If there are no safe candidates, return nothing (empty).
 
 Task: extract at most {self.max_candidates} small durable memory candidates from the evidence.
-Only include facts that are explicitly supported by a source_quote copied verbatim from the evidence.
-Prefer precision over recall. If there are no safe candidates, return {{"candidates": []}}.
+Only include facts explicitly supported by a source_quote copied verbatim from the evidence.
 
-Allowed candidate types: {allowed_types}
+Allowed types: {allowed_types}
 Allowed scopes: global, project, session
 Project id, if relevant: {project_id}
 Session id, if relevant: {session_id}
 
-Each candidate object must use this exact shape:
-{{
-  "type": "fact|preference|decision|todo|constraint|entity_note|instruction|relationship",
-  "subject": "short stable subject",
-  "predicate": "short relation/action",
-  "object": "small atomic value",
-  "text": "one concise sentence describing the memory",
-  "scope": "global|project|session",
-  "confidence": 0.0,
-  "salience": 0.0,
-  "source_quote": "verbatim quote from evidence"
-}}
+Format (one row per candidate):
+{header}
 
-Drop candidates that are speculative, unsupported, sensitive secrets, merely conversational, or missing verbatim evidence.
-Return schema exactly: {{"candidates": [candidate, ...]}}
+Examples (format demonstration only — the evidence starts after EVIDENCE):
+fact|alice|has_pet|golden retriever|Alice has a golden retriever.|global|0.95|0.9|"Alice has a golden retriever"
+preference|bob|prefers|dark mode|Bob prefers dark mode for reading.|global|0.88|0.8|"Bob prefers dark mode"
+
+Rules:
+  type = one of: {allowed_types}
+  subject = short stable subject (single concept, not a sentence)
+  predicate = short relation/action (verb phrase)
+  object = small atomic value
+  text = one concise sentence
+  scope = global | project | session
+  confidence = 0.0 to 1.0 (how certain the fact is)
+  salience = 0.0 to 1.0 (how important/durable this memory is)
+  source_quote = verbatim quote from the EVIDENCE section below (wrap in double-quotes if it contains "|")
+
+Drop speculative, unsupported, sensitive, or merely conversational candidates.
 
 Evidence:
 <<<EVIDENCE
@@ -101,16 +110,32 @@ EVIDENCE
             self.max_tokens,
             self.temperature,
         )
-        payload = parse_strict_json_payload(raw)
         source_text = event_source_text(event)
-        candidates = _candidate_items(payload)
 
+        # Primary: pipe-delimited format (compact, fewer tokens).
+        pipe_dicts = parse_pipe_delimited_payload(raw)
+        if pipe_dicts:
+            return self._coerce_and_dedupe(pipe_dicts, source_text, extractor_tag=MODEL_MEMORY_PIPE_EXTRACTOR)
+
+        # Fallback: strict JSON (backward compatible with older models).
+        payload = parse_strict_json_payload(raw)
+        json_items = _candidate_items(payload)
+        return self._coerce_and_dedupe(json_items, source_text, extractor_tag=MODEL_MEMORY_JSON_EXTRACTOR)
+
+    def _coerce_and_dedupe(
+        self,
+        items: list[Any],
+        source_text: str,
+        *,
+        extractor_tag: str,
+    ) -> list[ShadowMemoryCandidate]:
         out: list[ShadowMemoryCandidate] = []
         seen: set[tuple[str, str, str, str, str]] = set()
-        for item in candidates:
+        for item in items:
             candidate = self._coerce_candidate(item, source_text)
             if candidate is None:
                 continue
+            candidate.metadata["extractor"] = extractor_tag
             key = (
                 _norm(candidate.type),
                 _norm(candidate.subject),
@@ -151,7 +176,6 @@ EVIDENCE
 
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         metadata = dict(metadata)
-        metadata["extractor"] = MODEL_MEMORY_JSON_EXTRACTOR
         metadata["extraction_model"] = self.model_name
 
         return ShadowMemoryCandidate(
@@ -235,6 +259,60 @@ def _balanced_json_slice(text: str, open_char: str, close_char: str) -> str | No
             if depth == 0:
                 return text[start : idx + 1]
     return None
+
+
+def parse_pipe_delimited_payload(text: str) -> list[dict[str, Any]]:
+    """Parse pipe-delimited memory candidate rows from model output.
+
+    Each line is a pipe-separated row. Fields containing the pipe character
+    must be double-quoted. The header row is auto-detected and skipped.
+    """
+    if not text or not text.strip():
+        return []
+    lines = text.strip().split("\n")
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = _split_pipe_row(line)
+        # Skip header rows (field count matches and first field is "type").
+        if len(fields) >= 8 and _norm(fields[0]) == "type":
+            continue
+        if len(fields) < 8:
+            continue
+        try:
+            out.append({
+                "type": fields[0].strip(),
+                "subject": fields[1].strip(),
+                "predicate": fields[2].strip(),
+                "object": fields[3].strip(),
+                "text": fields[4].strip(),
+                "scope": fields[5].strip(),
+                "confidence": float(fields[6].strip()),
+                "salience": float(fields[7].strip()),
+                "source_quote": fields[8].strip().strip('"') if len(fields) > 8 else "",
+            })
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def _split_pipe_row(line: str) -> list[str]:
+    """Split a pipe-delimited row, respecting double-quoted fields."""
+    fields: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    for char in line:
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == "|" and not in_quotes:
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    fields.append("".join(current))
+    return fields
 
 
 def _candidate_items(payload: Any) -> list[Any]:

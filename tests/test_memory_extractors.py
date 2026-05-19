@@ -67,8 +67,8 @@ def test_model_memory_json_extractor_builds_strict_json_prompt_and_uses_default_
     assert calls[0][0] == DEFAULT_MEMORY_EXTRACTION_MODEL
     assert DEFAULT_GEMMA_MEMORY_MODEL == DEFAULT_MEMORY_EXTRACTION_MODEL
     prompt = calls[0][1][0]["content"]
-    assert "Return ONLY strict JSON" in prompt
-    assert 'Return schema exactly: {"candidates": [candidate, ...]}' in prompt
+    assert "pipe-delimited rows" in prompt
+    assert "type|subject|predicate|object|text|scope|confidence|salience|source_quote" in prompt
     assert "source_quote copied verbatim" in prompt
     assert "I prefer concise answers." in prompt
 
